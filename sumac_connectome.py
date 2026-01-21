@@ -24,7 +24,7 @@ if __name__ == '__main__':
     parser.add_argument('--float64', action='store_true', help='use torch.float64 (default use float32)')
     #parser.add_argument('--dist', action='store_true', help='use distributed version') [Depreciated] - buggy
     #parser.add_argument('--factor_init', action='store_true', help='use factor-specific scaling at init') [Depreciated] - default to True!
-    parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['sumac','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
+    parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['ALS','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--optim', type=str, default='adam', choices=['adam','sgd', 'adamw'], help='diffenrent optimizer for GD')
 
