@@ -9,7 +9,7 @@ import random
 from torch.nn.utils import clip_grad_norm_
 import contextlib
 
-from _sumac.dataset import block_span, RowBlockDataset
+from _sumac.dataset import block_span
 
 # ---------- config (uses num_blocks) ----------
 @dataclass
@@ -28,113 +28,28 @@ class TrainConfig:
     eval_errZ_interval: int = 5 #eval errZ every 5 epochs
     optim: str = "adam"
     SGD_mom: float = 0.7
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
     precondition: bool = False #precondition
     prec_eps: float = 1e-6
+    muon_momentum: float = 0.95
 
 
 #ablate the choice of optimizer
-def make_optimizer(name, params, lr, weight_decay=0.0, SGD_momentum=0.0):
+def make_optimizer(name, params, lr, weight_decay=0.0, SGD_momentum=0.0, adam_betas=(0.9, 0.999), adam_eps=1e-8, muon_momentum=0.95):
     name = name.lower()
     if name == "adam": 
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
     elif name == "adamw":
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
     elif name == "sgd":
         return torch.optim.SGD(params, lr=lr, momentum=SGD_momentum, weight_decay=weight_decay)
+    elif name == "muon":
+        return torch.optim.Muon(params, lr=lr, weight_decay=weight_decay, 
+                                momentum=muon_momentum, adjust_lr_fn="match_rms_adamw")
     else:
         raise ValueError(f"Unknown optimizer: {name}")
-
-
-#main training loop; update [A,B] per block
-def block_loss_and_pred(
-    A: torch.Tensor,                 # (m, d)
-    B: torch.Tensor,                 # (n, d)
-    block_id: int,
-    num_blocks: int,
-    m: int,
-    n: int,
-    S_index: torch.LongTensor,       # (2, nnz)
-    S_value: torch.Tensor,           # (nnz,)
-    edge_idx: torch.Tensor,          # indices into S_index/S_value for this block
-    errZ_obj: bool = False,          # whether use objective to min ||Z - L|| instead of ||S - Sr||
-):
-    """
-    - Builds full block prediction Sr_I = ReLU(A_I @ B^T) (shape b x n).
-    - Target is zero everywhere, except at observed entries (from edge_idx).
-    - Loss: RMSE over the entire b*n matrix (sqrt of mean squared error) — used for backprop.
-    - Metrics: returns scalar rmse (same as loss) and 1-Jaccard on the block.
-    """
-    start, end = block_span(block_id, m, num_blocks)
-    b = end - start
-    assert b > 0, "Empty block span"
-
-    # 1) Dense prediction for the block vs all columns (all-zero negatives)
-    A_block = A[start:end, :]                # (b, d)
-    L = A_block @ B.T
-    Sr_block = torch.clamp(L, min=0.0)   # (b, n)
-    sumSr_block = Sr_block.sum() #float(Sr_block.sum().item())
-
-    # 2) Sparse prediction for the block (at the edge index)
-    target = Sr_block.new_zeros((b, n))      # (b, n)
-    rows_all = S_index[0][edge_idx]         # global rows in [start, end)
-    cols_all = S_index[1][edge_idx]         # global cols
-    vals_all = S_value[edge_idx]            # (E_b,)
-    local_r = rows_all - start              # shift to [0, b)
-    target[local_r, cols_all] = vals_all
-
-    # 3) MSE/jacc numerator over *all* entries in the block (loss used for backprop)
-    mse_full = F.mse_loss(Sr_block, target, reduction="sum")  # sum over all b*n -> dense compute
-    Sr_obs = Sr_block[local_r, cols_all]
-    # ssqS_block = (vals_all * vals_all).sum()
-    # mse_full = ssqS_block + ssqSr_block - 2.0 * (vals_all * Sr_obs).sum() #this turns out to be slightly slower
-    jacc_num_block = torch.minimum(vals_all, Sr_obs).sum()
-    errZ_num_block = None
-    if errZ_obj: #make equivalent errZ objective; TODO: faster?
-        # L at observed (local) coordinates
-        L_obs = L[local_r, cols_all]              # (E_b,)
-        neg_mask_pos = L_obs < 0                  # only entries that were clamped in Sr
-        if neg_mask_pos.any():
-            S_obs = vals_all[neg_mask_pos]        # S_{ij} at those coords
-            L_neg = L_obs[neg_mask_pos]           # L_{ij} (negative values)
-            # sum of (L^2 - 2 S L) over the intersection (observed & L<0)
-            errZ_num_block = mse_full + (L_neg*L_neg - 2.0*S_obs*L_neg).sum()
-   
-    return mse_full, sumSr_block, jacc_num_block, errZ_num_block
-
-##main eval code; reusing block_loss_and_pred() to compute metric
-@torch.no_grad()
-def eval(
-    A, B, S_index, S_value,
-    m, n, num_blocks,
-    full_block_loader,   # yields (block_id, edge_idx) once per block_id
-    device=None,
-):
-    ssqe = torch.zeros((), device=device, dtype=A.dtype)
-    sumSr = torch.zeros((), device=device, dtype=A.dtype)
-    num_j = torch.zeros((), device=device, dtype=A.dtype)
-    errZ_num = torch.zeros((), device=device, dtype=A.dtype)
-
-    for block in full_block_loader:  
-        for (block_id, edge_idx) in block:
-            edge_idx = edge_idx.to(device).view(-1)
-            block_id = int(block_id)
-            ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
-                A, B, block_id, num_blocks, m, n,
-                S_index, S_value, edge_idx
-            )
-            ssqe += ssqe_b
-            sumSr += sumSr_b
-            num_j += num_j_b
-            errZ_num += errZ_b if errZ_b is not None else ssqe_b 
-    
-    sumSr = float(sumSr.item())
-    S_norm = torch.norm(S_value)
-    rmse = torch.sqrt(ssqe) / (S_norm + 1e-16)
-    denom = S_value.sum() + sumSr - num_j
-    jacc = 1.0 - num_j / (denom + 1e-16)
-    errZ = torch.sqrt(errZ_num) / (S_norm + 1e-16)
-
-    return float(rmse.item()), float(jacc.item()), float(errZ.item())
 
 ###Helpers for GD_loop
 def select_devices(cfg, device: torch.device):
@@ -207,7 +122,8 @@ def compute_backward_on_device(
         S_idx_d = S_index_devs[di]
         S_val_d = S_value_devs[di]
 
-        for (block_id, edge_idx) in shard:
+        #for (block_id, edge_idx) in shard:
+        for (block_id, edge_idx, row_indices) in shard:
             block_id = int(block_id)
             edge_idx = edge_idx.to(dev).view(-1)
 
@@ -215,7 +131,7 @@ def compute_backward_on_device(
                 A_d, B_d,
                 block_id=block_id, num_blocks=cfg.num_blocks, m=m, n=n,
                 S_index=S_idx_d, S_value=S_val_d, edge_idx=edge_idx,
-                errZ_obj=GD_latent,
+                row_indices=row_indices, errZ_obj=GD_latent,
             )
             loss_block = errZ_block if errZ_block is not None else mse_block
             loss = loss + loss_block

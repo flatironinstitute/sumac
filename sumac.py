@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,18 +16,21 @@ from torch.nn.utils import clip_grad_norm_
 import pickle
 from typing import Tuple
 
-from _sumac.dataset import block_span, RowBlockDataset, collate_blocks
-from _sumac.train_gd import TrainConfig, make_optimizer, block_loss_and_pred, eval, \
-                            select_devices, setup_replicas, shard_blocks, \
+from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset
+from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
                             zero_replica_grads, compute_backward_on_device, sync_all, wait_streams_before_reduce, \
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
+from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
 from _sumac.train_als import least_squares_update_fast, least_squares_update, refactor
-
+from _sumac.train_salsa import update_factor_salsa
+from _sumac.eval import block_loss_and_pred, eval
 
 def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
           test_flag=False, dtype=torch.float32, opts=None, 
-          mom=0.7, fast_flag=True, use_GD=False, lr=1e-1, factor_init=False,
-          save_path=None, GD_latent=False, optim="adam", precondition=False):
+          mom=0.7, method='GD', lr=1e-1, factor_init=False,
+          save_path=None, GD_latent=False, optim="adam", precondition=False,
+          adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, muon_momentum=0.95,
+          multi_gpu=True):
     """
     PyTorch version of sumac algorithm driver function.
 
@@ -38,12 +42,13 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
       test_flag: if true, run the test case for debugging
       dtype: default to torch.float32, accept torch.float64
       opts : (optional) dict of options; missing keys will be filled with defaults
-      fast_flag: default True, use the fast alternating least squares
-      use_GD: default False, use (block) gradient descent
-      factor_init: default False, use per factor (A, B) specific scaling at initialiation
-      GD_latent: default False. If true, correct the GD MSE object to align with ALS
+      method: optimization routines, choices = ["GD", "SALSA", "ALS"]
+      factor_init: default False, use per factor (A, B) specific scaling at initialiation for method="ALS"
+      GD_latent: default False. If true, correct the GD MSE object to align with SALSA/ALS
       precondition: default False. If true, precondition the gradient of factors by A.grad = A.grad @ (B^T B)^{-1}
-    Returns:
+      optimizer args: adam_, muon_
+      multi_gpu: If true, launch multiple streams, each per device
+    Saved Artifacts:
       A, B    : factors (torch.Tensors)
       costs   : list or tensor of cost history
       opts    : dict of options used
@@ -55,20 +60,22 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
 
     # default options / user-provided opts
     opts_default = {
-        'time_limit': float('inf'),
-        'tol_abs': 1e-2,
-        'tol_rel': 1e-4,
-        'tol_window': 20,
-        'seed': random.randint(0, 2**31 - 1),
-        'display': 1,
-        'cache_MB': 5000,
-        'exaggerate': mom, #0.7,
-        'momentum_start_iter': 10,
-        'refactor_interval': 25,
-        'optim': optim, #default adam, can try sgd, adamw etc
         'max_iterate': max_iterate,
         'dtype': dtype,
-        'factor_init': factor_init #if True: A,B specific initialization 
+        'method': method,
+        'seed': random.randint(0, 2**31 - 1),
+        'display': 1,
+        'cache_MB': 5000,  
+        'time_limit': float('inf'), #ALS early stopping
+        'tol_abs': 1e-2, #ALS early stopping
+        'tol_rel': 1e-4, #ALS early stopping
+        'tol_window': 20, #ALS early stopping
+        'exaggerate': mom, #momentum for SALSA or ALS
+        'momentum_start_iter': 10, #ALS 
+        'refactor_interval': 25, #ALS
+        'eval_interval': 10, #evaluation per interval for SALSA or ALS
+        'factor_init': factor_init, #ALS; if True: A,B specific initialization
+        'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
     }
 
     if opts is None:
@@ -110,17 +117,22 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
 
     # call the core SUMAC loop 
     S_value = S_value.to(dtype)
-    if use_GD:
+    if method == 'GD':
         cfg = TrainConfig(d, num_blocks=num_blocks, epochs=max_iterate, lr=lr,
-                          optim=optim, SGD_mom=mom, precondition=precondition)
+                          optim=optim, SGD_mom=mom, precondition=precondition,
+                          adam_beta1=adam_beta1, adam_beta2=adam_beta2, adam_eps=adam_eps,
+                          muon_momentum=muon_momentum)
         ## NEW: for multi-gpus, scale batch blocks and lr automatically
         if torch.cuda.device_count() > 1:
             cfg.batch_blocks = torch.cuda.device_count()
             cfg.lr = cfg.lr * torch.cuda.device_count() * 0.75 #TODO: test / better heuristic 
         A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent)
-    
+    elif method == 'SALSA':
+        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
+    elif method == 'ALS':
+        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
     else:
-        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag, fast_flag)
+        raise NotImplementedError("method must be chosen from GD_ or SALSA or ALS")
 
     # NEW: restore zero rows and columns
     if row_mask is not None:
@@ -140,6 +152,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         pickle.dump(opts, open(f"{save_path}/opts.pkl", "wb"))
     print(f'finish for {max_iterate} iterations!')
 
+
 def GD_loop(
     S_index: torch.LongTensor,
     S_value: torch.Tensor,
@@ -149,7 +162,7 @@ def GD_loop(
     GD_latent: bool = False,
 ):
     torch.manual_seed(cfg.seed)
-    device = torch.device(cfg.device) #cfg.device = "cuda:0" by default, aka the master device
+    device = torch.device(cfg.device) 
 
     # Move base data to master device first (replicas created later)
     S_index = S_index.to(device)
@@ -159,10 +172,12 @@ def GD_loop(
     scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.d)
     A = torch.nn.Parameter(torch.rand(m, cfg.d, device=device) * scale)
     B = torch.nn.Parameter(torch.rand(n, cfg.d, device=device) * scale)
-    opt = make_optimizer(cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom)
+    opt = make_optimizer(cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom,
+                         adam_betas=(cfg.adam_beta1, cfg.adam_beta2), adam_eps=cfg.adam_eps,
+                         muon_momentum=cfg.muon_momentum)
 
     # DataLoader
-    ds = RowBlockDataset(S_index, S_value, m=m, num_blocks=cfg.num_blocks)
+    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks) 
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_blocks,
@@ -210,15 +225,11 @@ def GD_loop(
                 sumSrs.append(sumSr_d)
                 numjs.append(numj_d)
         
-            #sync_all(devices)
-            # ### CHANGED: replace device-wide synchronize with per-stream wait
             wait_streams_before_reduce(devices, streams)
-
             # reduce grads to master and step on master
             reduce_grads_to_master(A, B, A_devs, B_devs, master, average=True)
             apply_precondition(A, B, cfg, master)
             apply_clip_and_step(opt, A, B, cfg)
-
             # broadcast updated params
             broadcast_params_from_master(A, B, A_devs, B_devs, devices)
 
@@ -241,240 +252,11 @@ def GD_loop(
 
     rmse, jacc, errZ = eval(A, B, S_index, S_value,
                             m, n, num_blocks=cfg.num_blocks,
-                            full_block_loader=loader, device=A.device)
+                            full_block_loader=loader, device=A.device, errZ_obj=True)
     print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
 
     return A.detach(), B.detach(), history
 
-### OLD
-# def GD_loop(
-#     S_index: torch.LongTensor,
-#     S_value: torch.Tensor,
-#     m: int,
-#     n: int,
-#     cfg: TrainConfig,
-#     GD_latent: bool = False,
-# ):
-#     torch.manual_seed(cfg.seed)
-#     device = torch.device(cfg.device)
-
-#     S_index = S_index.to(device)
-#     S_value = S_value.to(device)
-
-#     # Parameters
-#     scale = 0.5*math.sqrt(S_value.mean()/cfg.d)
-#     A = torch.nn.Parameter(torch.rand(m, cfg.d, device=device) * scale)
-#     B = torch.nn.Parameter(torch.rand(n, cfg.d, device=device) * scale)
-#     opt = make_optimizer(cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom)
-#     #opt = torch.optim.Adam([A, B], lr=cfg.lr) #TODO: can change to SGD? AdamW?
-
-#     ds = RowBlockDataset(S_index, S_value, m=m, num_blocks=cfg.num_blocks)
-#     loader = DataLoader(
-#         ds,
-#         batch_size=cfg.batch_blocks,
-#         shuffle=cfg.shuffle_blocks,
-#         collate_fn=collate_blocks
-#     )
-#     history = []
-#     t0 = time.time()
-#     for epoch in range(1, cfg.epochs + 1):
-#         total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
-
-#         t_start = time.time()
-
-#         for blocks in loader:
-#             loss = torch.tensor(0.0, device=device)
-#             for (block_id, edge_idx) in blocks:
-#                 block_id = int(block_id)
-#                 edge_idx = edge_idx.to(device).view(-1)
-
-#                 mse_block, sumSr_block, jacc_num_block, errZ_block = block_loss_and_pred(
-#                     A, B,
-#                     block_id=block_id, num_blocks=cfg.num_blocks, m=m, n=n,
-#                     S_index=S_index, S_value=S_value, edge_idx=edge_idx,
-#                     errZ_obj = GD_latent,
-#                 )
-#                 loss_block = errZ_block if errZ_block is not None else mse_block 
-#                 loss = loss + loss_block
-#                 sumSr   += sumSr_block
-#                 num_jacc += jacc_num_block
-
-#             opt.zero_grad(set_to_none=True)
-#             loss.backward()
-#             #right precondition the gradisnt
-#             if cfg.precondition:
-#                 # Build Gram matrices with a small jitter; keep everything on-device/dtype
-#                 with torch.no_grad():
-#                     I = torch.eye(cfg.d, device=device, dtype=A.dtype)
-#                     # for nuemrical stability
-#                     G_B = B.T @ B + cfg.prec_eps * I
-#                     G_A = A.T @ A + cfg.prec_eps * I
-
-#                     # Cholesky factors (SPD by construction with eps)
-#                     L_B = torch.linalg.cholesky(G_B)  # G_B = L_B @ L_B.T
-#                     L_A = torch.linalg.cholesky(G_A)
-#                     # We want: A.grad ← A.grad @ G_B^{-1}
-#                     # Use cholesky_solve: (A.grad @ G_B^{-1}) = (G_B^{-1} @ A.grad^T)^T
-#                     #    i.e., L_B L_B.T X = A_grad.T => X = (L_B L_B.T)^{-1} A_grad.T => transposing
-#                     if A.grad is not None:
-#                         A.grad.copy_(torch.cholesky_solve(A.grad.T.contiguous(), L_B).T)
-#                     # And: B.grad ← B.grad @ G_A^{-1}
-#                     if B.grad is not None:
-#                         B.grad.copy_(torch.cholesky_solve(B.grad.T.contiguous(), L_A).T)
-
-#             # SGD hacks: gradient clipping
-#             if cfg.optim.lower() == 'sgd':
-#                 clip_grad_norm_([A,B], max_norm=1.0)
-#             opt.step()
-#             total_loss += float(loss.item())
-        
-#         time_step = time.time() - t_start
-#         #metrics
-#         denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
-#         jacc = 1.0 - num_jacc / denom_jacc
-#         S_norm = float(torch.norm(S_value).item())
-#         rmse = math.sqrt(total_loss) / (S_norm + 1e-16)   
-#         log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
-#         print(log)
-#         history.append(log)
-
-#     # 7) final timing display
-#     total = time.time() - t0
-#     print(f"\nTotal elapsed time: {total:.2f} sec")
-#     rmse, jacc, errZ = eval(A, B, S_index, S_value, 
-#                             m, n, num_blocks=cfg.num_blocks, 
-#                             full_block_loader=loader, device=A.device)
-#     print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
-
-#     return A.detach(), B.detach(), history
-
-def _init_factors_testcase(
-    m: int, d: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Init (A,B) deterministically for test purpose
-    """
-    np.random.seed(0)
-    A = torch.FloatTensor(np.random.random((m, d)))
-    B = -A
-    return A, B
-
-def _init_factors_factor_specific(
-    S_index: torch.LongTensor,
-    S_value: torch.Tensor,
-    m: int,
-    n: int,
-    d: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Factor-specific init based on row/col marginals of S.
-    Produces A (m,d), B (n,d), then refactor().
-    """
-    # column sums
-    sum1 = torch.zeros(n, dtype=S_value.dtype, device=S_value.device)
-    sum1.index_add_(0, S_index[1], S_value)
-    sum1 = sum1.reshape(-1, 1)  # (n,1)
-
-    # row sums
-    sum2 = torch.zeros(m, dtype=S_value.dtype, device=S_value.device)
-    sum2.index_add_(0, S_index[0], S_value)
-    sum2 = sum2.reshape(-1, 1)  # (m,1)
-
-    # global sum
-    sumS = S_value.sum()
-    scaleA = torch.sqrt(n * sum2 / sumS)   # (m,1)
-    scaleB = torch.sqrt(m * sum1 / sumS)   # (n,1)
-    A = scaleA * (1 + torch.rand((m, d), dtype=torch.float32, device=S_value.device) / d) / 2
-    B = -scaleB * (1 + torch.rand((n, d), dtype=torch.float32, device=S_value.device) / d) / 2
-    A, B = refactor(A, B)
-    return A, B
-
-
-def _init_factors_factor_agnostic(
-    S_value: torch.Tensor,
-    m: int,
-    n: int,
-    d: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Factor-agnostic init with your improved scaling (keeps your exact math).
-    Produces A (m,d), B (n,d), then refactor().
-    """
-    scale = 0.5 * math.sqrt(S_value.mean() / d)
-    A = (torch.rand((m, d), device=S_value.device) * scale)
-    B = (-torch.rand((n, d), device=S_value.device) * scale)
-    A, B = refactor(A, B)
-    return A, B
-
-
-def als_init_factors(
-    S_index: torch.LongTensor,
-    S_value: torch.Tensor,
-    m: int,
-    n: int,
-    d: int,
-    opts: dict,
-    test_flag: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Single entry point for init. Chooses:
-      - testcase init if test_flag=True
-      - factor-specific init if opts['factor_init']=True
-      - factor-agnostic init otherwise
-    """
-    if test_flag:
-        return _init_factors_testcase(m, d)
-    if opts["factor_init"]:
-        return _init_factors_factor_specific(S_index, S_value, m, n, d)
-    else:
-        return _init_factors_factor_agnostic(S_value, m, n, d)
-
-def als_post_process_factors(
-    rmse: float,
-    it: int,
-    rmse_hist: list,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    dA: torch.Tensor,
-    dB: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    1) if rmse > 1.0: shrink weights, refactor, reset momentum buffers
-     2) if it > 1 and rmse > rmse_hist[-2]: reset momentum buffers
-    """
-    if rmse > 1.0:
-        A = 0.5 * A
-        B = 0.5 * B
-        A, B = refactor(A, B)
-        dA = torch.zeros_like(A)
-        dB = torch.zeros_like(B)
-    if it > 1 and rmse > rmse_hist[-2]:
-        dA = torch.zeros_like(A)
-        dB = torch.zeros_like(B)
-
-    return A, B, dA, dB
-
-def als_early_stop(
-    it: int,
-    elapsed: float,
-    jacc: float,
-    jacc_hist: list,
-    opts: dict,
-) -> bool:
-    """
-    Early stopping criteria, identical to your existing logic.
-    """
-    if elapsed > opts["time_limit"]:
-        return True
-    if jacc < opts["tol_abs"]:
-        return True
-    if it >= 2 * opts["tol_window"]:
-        w = opts["tol_window"]
-        m1 = sum(jacc_hist[-w:]) / w
-        m2 = sum(jacc_hist[-2 * w : -w]) / w
-        if (m2 - m1) / m2 < opts["tol_rel"]:
-            return True
-    return False
 
 def sumac_loop(S_index: torch.LongTensor,
                S_value: torch.Tensor,
@@ -484,7 +266,7 @@ def sumac_loop(S_index: torch.LongTensor,
                opts: dict,
                test_flag: bool = False):
     """
-    PyTorch version of the main sumac loop, that solves nonlinear low-rank factorization
+    ALS subroutine to solve the nonlinear low-rank factorization
     S \approx max(0, A B^T) where A is of shape (m, r), B is of shape (n, r)
     - S: sparse matrix of shape (m, n)
     - d: the chosen rank
@@ -565,12 +347,115 @@ def sumac_loop(S_index: torch.LongTensor,
 
     return A, B, costs
 
-##testing
+
+def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
+    """
+    Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
+    """
+    dtype = opts['dtype']
+    device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
+    S_index = S_index.to(device)
+    S_value = S_value.to(device)
+    
+    # Initialization using sumac helper
+    random.seed(opts['seed'])
+    torch.manual_seed(opts['seed'])
+    A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+
+    dA = torch.zeros_like(A)
+    dB = torch.zeros_like(B)
+
+    # Datasets for row and column blocks
+    #ds_rows = RowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    S_index_T = S_index[[1, 0], :]
+    #ds_cols = RowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+
+    ##init evaluation
+    eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+    rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
+                            eval_loader, device=device, errZ_obj=True)
+    print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
+
+    rmse_hist = []
+    jacc_hist = []
+    time_hist = []
+    
+    t_start_loop = time.time()
+    # --- PERSISTENT CUDA INFRASTRUCTURE (eliminates launch overhead) ---
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    multi_gpu_internal = (num_gpus > 1) 
+    
+    if num_gpus > 0:
+        devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+        streams = [torch.cuda.Stream(device=d) for d in devices]
+        row_map_buffers = [torch.zeros(m, dtype=torch.long, device=d) for d in devices]
+        col_map_buffers = [torch.zeros(n, dtype=torch.long, device=d) for d in devices]
+    else:
+        streams, row_map_buffers, col_map_buffers = None, None, None
+
+    for iter_idx in range(1, opts['max_iterate'] + 1):
+        t_start = time.time()
+        # Truly stochastic sampling: reshuffle partitions every epoch
+        ds_rows.reshuffle()
+        ds_cols.reshuffle()
+        block_order = list(range(opts['num_blocks']))
+        #random.shuffle(block_order) -- only used for deterministic minibatch
+        
+        for mb_idx, block_id in enumerate(block_order):
+            stepnum = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
+            # --- Update B ---
+            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, opts, stepnum,
+                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=row_map_buffers)
+            # --- Update A ---
+            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, opts, stepnum,
+                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=col_map_buffers)
+
+        # Metrics and Reporting
+        if iter_idx % opts['eval_interval'] == 0:
+            eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+            rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
+                                    eval_loader, device=device, errZ_obj=True)
+            
+            torch.cuda.synchronize() ##timing on gpu
+            elapsed = time.time() - t_start
+            rmse_hist.append(rmse)
+            jacc_hist.append(jacc)
+            time_hist.append(elapsed)
+            
+            if opts['display']:
+                print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
+
+    # WRAP UP
+    A, B = refactor(A, B)
+    
+    costs = {
+        'rmse': rmse_hist,
+        'jacc': jacc_hist,
+        'time': time_hist
+    }
+
+    if opts['display']:
+        total = time.time() - t_start_loop
+        print(f"\nTotal elapsed time: {total:.2f} sec")
+
+    return A, B, costs
+
+
+#testing
 # m = 100
 # r = 8
 # S_dense = torch.eye(m) #torch.eye(100)
 # S_index, S_value = dense_to_sparse(S_dense)
+# print(f"running SALSA")
 # sumac(S_index, S_value, m=m, n=m, d=r, test_flag=True, 
-#       max_iterate=30, mom=0.7, use_GD=True, num_blocks=2)
+#       max_iterate=30, mom=0.7, method='SALSA', num_blocks=2)
+# print(f"running GD...")
+# sumac(S_index, S_value, m=m, n=m, d=r, test_flag=True, 
+#       max_iterate=30, mom=0.7, method='GD', num_blocks=2)
+# print(f"running ALS...")
+# sumac(S_index, S_value, m=m, n=m, d=r, test_flag=True, 
+#       max_iterate=30, mom=0.7, method='ALS', num_blocks=1)
 # sumac(S_index, S_value, m=m, n=m, d=r, test_flag=True, 
 #       max_iterate=30, mom=0.7, use_GD=False, num_blocks=1)
