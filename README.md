@@ -8,6 +8,12 @@ We offer three major routines (all of which support CPU/Single GPU/Multi-GPU):
 - Stochastic Alternating Least Squares Algorithm (sumac-SALSA): similar to ALS to update factors alternatively, but only use a random subset of the other factor (and its associated subset of edges). Preferred to ALS for faster convergence in large $S$.
 
 ### Setup and Overview
+Create a Python virtual environment and activate it
+```
+python -m venv .venv
+source .venv/bin/activate
+```
+Then install the dependencies
 ```
 pip install -r requirements.txt
 ```
