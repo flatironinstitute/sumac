@@ -418,7 +418,8 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
                                     eval_loader, device=device, errZ_obj=True)
             
-            torch.cuda.synchronize() ##timing on gpu
+            if num_gpus > 0:
+                torch.cuda.synchronize() ##timing on gpu
             elapsed = time.time() - t_start
             rmse_hist.append(rmse)
             jacc_hist.append(jacc)
