@@ -3,7 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 import math
-
+ 
+@torch.compile #if we compile this, we can get kernel fusion of the matmuls and clamp. Standalone clamp is expensive and entirely bandwidth bound
+def block_dense(A, B_blk, pinvA_trans):
+    Y = torch.relu(A @ B_blk.T)
+    sumY = Y.sum()
+    ssqY = (Y * Y).sum()
+    dB = -(Y.T @ pinvA_trans)   
+    return dB, sumY, ssqY
 
 def least_squares_update_fast(
     S_idx: torch.LongTensor, #shape (2, nmz)
@@ -73,14 +80,30 @@ def least_squares_update_fast(
         pinvA_trans_dev = pinvA_trans_devs[dev_idx]
         B_blk_dev = B_devs[dev_idx][start:end] #(block_size, r) ##OLD
 
-        # 1) reconstruct full block and immediately sparsify
-        dense_Sr = torch.clamp(A_dev @ B_blk_dev.T, min=0.0)      # (m, block_size)
-        Sr = dense_Sr.to_sparse_coo().coalesce()          # keep only >0 entries
-        # 2) compute the first term -Sr
-        sumSr_devs[dev_idx] += Sr.sum()
-        ssqSr_devs[dev_idx] += (Sr * Sr).sum()
-        dB_block = torch.sparse.mm(-Sr.transpose(0,1), pinvA_trans_dev) # (block_size, r)
+
+        dB_block, sumSr_blk, ssqSr_blk = block_dense(A_dev, B_blk_dev, pinvA_trans_dev) #block_dense is jit-compiled version of the snippet below
+
+        # # 1) reconstruct full block and immediately sparsify
+        # torch.cuda.nvtx.range_push("torch.clamp")
+        # dense_Sr = torch.clamp(A_dev @ B_blk_dev.T, min=0.0)      # (m, block_size)
+        # torch.cuda.nvtx.range_pop()
+
+        # torch.cuda.nvtx.range_push("coalesce")
+        # Sr = dense_Sr.to_sparse_coo().coalesce()          # keep only >0 entries
+        # torch.cuda.nvtx.range_pop()
+        # # 2) compute the first term -Sr
+        # torch.cuda.nvtx.range_push("sumSr ssqSr")
+        # sumSr_devs[dev_idx] += Sr.sum()
+        # ssqSr_devs[dev_idx] += (Sr * Sr).sum()
+        # torch.cuda.nvtx.range_pop()
+
+        sumSr_devs[dev_idx] += sumSr_blk
+        ssqSr_devs[dev_idx] += ssqSr_blk
+
+        torch.cuda.nvtx.range_push("torch.sparse.mm")
+       # dB_block = torch.sparse.mm(-Sr.transpose(0,1), pinvA_trans_dev) # (block_size, r)
         dB[start:end] = dB_block.to(dB.device) ##OLD
+        torch.cuda.nvtx.range_pop()
     torch.cuda.nvtx.range_pop()
     #compute the second term, correction (S - ABt + Sr)[S>0]
     torch.cuda.nvtx.range_push("compute correction term")
