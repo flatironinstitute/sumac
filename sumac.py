@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
+
 import math
 import time
 import random
@@ -117,6 +118,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
 
     # call the core SUMAC loop 
     S_value = S_value.to(dtype)
+    torch.cuda.nvtx.range_push("core SUMAC loop")
     if method == 'GD':
         cfg = TrainConfig(d, num_blocks=num_blocks, epochs=max_iterate, lr=lr,
                           optim=optim, SGD_mom=mom, precondition=precondition,
@@ -133,7 +135,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
     else:
         raise NotImplementedError("method must be chosen from GD_ or SALSA or ALS")
-
+    torch.cuda.nvtx.range_pop()
     # NEW: restore zero rows and columns
     if row_mask is not None:
         A_ori = torch.zeros((m, d), dtype=A.dtype, device=A.device)
@@ -295,20 +297,30 @@ def sumac_loop(S_index: torch.LongTensor,
     # 4) main loop: every 2 iterations finish update both factors A,B
     t0 = time.time()
     for it in range(max_iter): #range(1, max_iter+1):
+        torch.cuda.nvtx.range_push("Iteration " + str(it) + " start")
         t_start = time.time()
         # update A or B 
         if it % 2 == 1:
+            torch.cuda.nvtx.range_push("Least Square Update B")
             ## TODO: wrap it into a function, input arg - update A or B
             nextB, rmse, jacc = least_squares_update_fast(S_index, S_value, A, B, 
                                                      num_blocks, opts['cols_per_block'])
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("apply momentum")
             dB = (nextB - B) + dB * opts['exaggerate']  * (it > opts['momentum_start_iter']) #apply momentum after 10 iterations
             B  = B + dB
+            torch.cuda.nvtx.range_pop()
         else:
+            torch.cuda.nvtx.range_push("Least Square Update A")
             nextA, rmse, jacc = least_squares_update_fast(S_index[[1,0],:], S_value, B, A, 
                                                   num_blocks, opts['cols_per_block'])
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("apply momentum")
             dA = (nextA - A) + dA * opts['exaggerate'] * (it > opts['momentum_start_iter']) #apply momentum after 10 iterations
             A  = A + dA
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("record costs")
         # record costs
         torch.cuda.synchronize() ##timing on gpu
         time_step = time.time() - t_start
@@ -316,16 +328,20 @@ def sumac_loop(S_index: torch.LongTensor,
         rmse_hist.append(rmse)
         jacc_hist.append(jacc)
         time_hist.append(elapsed)
-
+        torch.cuda.nvtx.range_pop()
         # display progress
         if opts['display']:
             print(f"iter = {it:04d}, rmse = {rmse:.6f},  jacc = {jacc:.6f},  factor_step = {time_step:6.4f}")
-        
+
         # post-processing and early stopping
+        torch.cuda.nvtx.range_push("post_process_and_stop")
         A, B, dA, dB = als_post_process_factors(rmse, it, rmse_hist, A, B, dA, dB)
+        torch.cuda.nvtx.range_pop()
+
         if als_early_stop(it, elapsed, jacc, jacc_hist, opts):
             break
 
+        torch.cuda.nvtx.range_pop()
     # 5) undo the partial update on break, so that the cost (precomputed before update) matches the same model
     if it % 2 == 1:
         # last update was on B
