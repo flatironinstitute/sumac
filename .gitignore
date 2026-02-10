@@ -1,0 +1,10 @@
+# Virtual environment
+.venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# sumac temps
+_sumac/
+connectome/
