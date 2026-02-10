@@ -6,4 +6,5 @@ __pycache__/
 *.py[cod]
 
 # sumac temps
+_sumac/__pycache__/
 connectome/
