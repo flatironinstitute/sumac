@@ -10,6 +10,7 @@ from torch.nn.utils import clip_grad_norm_
 import contextlib
 
 from _sumac.dataset import block_span
+from _sumac.eval import block_loss_and_pred, eval
 
 # ---------- config (uses num_blocks) ----------
 @dataclass
