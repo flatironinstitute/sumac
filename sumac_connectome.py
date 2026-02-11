@@ -14,6 +14,7 @@ import sys
 from utils import _ensure_nccl_env
 
 if __name__ == '__main__':
+    torch.set_float32_matmul_precision('high')
     parser = argparse.ArgumentParser()
     parser.add_argument('--d', type=int, default=16)
     parser.add_argument('--iters', type=int, default=50)

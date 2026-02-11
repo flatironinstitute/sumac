@@ -203,6 +203,7 @@ def GD_loop(
     t0 = time.time()
 
     for epoch in range(1, cfg.epochs + 1):
+        torch.cuda.nvtx.range_push("epoch: " + str(epoch))
         total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
         t_start = time.time()
 
@@ -248,7 +249,7 @@ def GD_loop(
         log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
         print(log)
         history.append(log)
-
+        torch.cuda.nvtx.range_pop()
     total = time.time() - t0
     print(f"\nTotal elapsed time: {total:.2f} sec")
 
@@ -376,24 +377,31 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     # Initialization using sumac helper
     random.seed(opts['seed'])
     torch.manual_seed(opts['seed'])
+    
+    torch.cuda.nvtx.range_push("als_init_factors")
     A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+    torch.cuda.nvtx.range_pop()
 
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
 
     # Datasets for row and column blocks
     #ds_rows = RowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    torch.cuda.nvtx.range_push("StochasitcRowBlockDataset rows")
     ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'])
     S_index_T = S_index[[1, 0], :]
     #ds_cols = RowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+    torch.cuda.nvtx.range_pop()
+    torch.cuda.nvtx.range_push("StochasticRowBlockDataset cols")
     ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
-
+    torch.cuda.nvtx.range_pop()
     ##init evaluation
+    torch.cuda.nvtx.range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
                             eval_loader, device=device, errZ_obj=True)
     print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
-
+    torch.cuda.nvtx.range_pop()
     rmse_hist = []
     jacc_hist = []
     time_hist = []
@@ -412,21 +420,30 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
         streams, row_map_buffers, col_map_buffers = None, None, None
 
     for iter_idx in range(1, opts['max_iterate'] + 1):
+        torch.cuda.nvtx.range_push("Iteration " + str(iter_idx))
         t_start = time.time()
         # Truly stochastic sampling: reshuffle partitions every epoch
+        torch.cuda.nvtx.range_push("reshuffle")
         ds_rows.reshuffle()
         ds_cols.reshuffle()
         block_order = list(range(opts['num_blocks']))
+        torch.cuda.nvtx.range_pop()
         #random.shuffle(block_order) -- only used for deterministic minibatch
         
         for mb_idx, block_id in enumerate(block_order):
             stepnum = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
+
+            torch.cuda.nvtx.range_push("update_factor_salsa B")
             # --- Update B ---
             B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, opts, stepnum,
                                         multi_gpu=multi_gpu_internal, streams=streams, map_buffers=row_map_buffers)
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("update_factor_salsa A")
             # --- Update A ---
             A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, opts, stepnum,
                                         multi_gpu=multi_gpu_internal, streams=streams, map_buffers=col_map_buffers)
+            torch.cuda.nvtx.range_pop()
 
         # Metrics and Reporting
         if iter_idx % opts['eval_interval'] == 0:
@@ -443,7 +460,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             
             if opts['display']:
                 print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
-
+        torch.cuda.nvtx.range_pop()
     # WRAP UP
     A, B = refactor(A, B)
     
