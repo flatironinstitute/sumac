@@ -384,7 +384,15 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
 
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
-
+    # print(f"A.device = {A.device}")
+    # print(f"A.shape = {A.shape}")
+    # print(f"dA.device = {dA.device}")
+    # print(f"dA.shape = {dA.shape}")
+    # print(f"B.device = {B.device}")
+    # print(f"B.shape = {B.shape}")
+    # print(f"dB.device = {dB.device}")
+    # print(f"dB.shape = {dB.shape}")
+    
     # Datasets for row and column blocks
     #ds_rows = RowBlockDataset(S_index, S_value, m, opts['num_blocks'])
     torch.cuda.nvtx.range_push("StochasitcRowBlockDataset rows")
