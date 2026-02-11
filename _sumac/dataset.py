@@ -78,15 +78,15 @@ class StochasticRowBlockDataset(Dataset):
         Vectorized reshuffle: Re-partitions rows into blocks in a single go.
         """
         # 1. Randomly permute rows
-        perm = torch.randperm(self.m)
+        dev = self.S_value.device #
+        perm = torch.randperm(self.m, device=dev)
         perm_inv = torch.empty_like(perm)
-        perm_inv[perm] = torch.arange(self.m)
+        perm_inv[perm] = torch.arange(self.m, device=dev)
         
         # 2. Determine block for each edge based on its row's position in perm
         block_size = (self.m + self.num_blocks - 1) // self.num_blocks
         
-        # We do this calculation on CPU to keep dataset memory light
-        edge_rows = self.S_index[0].detach().cpu()
+        edge_rows = self.S_index[0]
         edge_block_ids = perm_inv[edge_rows] // block_size
         
         # 3. Sort edge indices by their block_id
@@ -94,7 +94,7 @@ class StochasticRowBlockDataset(Dataset):
         
         # 4. Find boundaries and slice
         counts = torch.bincount(edge_block_ids, minlength=self.num_blocks)
-        offsets = torch.zeros(self.num_blocks + 1, dtype=torch.long)
+        offsets = torch.zeros(self.num_blocks + 1, dtype=torch.long, device=dev)
         torch.cumsum(counts, dim=0, out=offsets[1:])
         
         self.block_edge_idx = []
