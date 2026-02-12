@@ -89,7 +89,7 @@ def batch_update_multi_gpu(
     # Pre-calculate pseudoinverse. We slice Factor_fixed first.
     torch.cuda.nvtx.range_push("pseudo-inverse")
     # print(f"Factor_fixed is on {Factor_fixed.device}") Var names are confusing, this is already sitting on the GPU
-    Ar_cpu = Factor_fixed[row_indices_cpu, :].to(device_cpu, non_blocking=True)
+    Ar_cpu = Factor_fixed[row_indices_cpu, :]#.to(device_cpu, non_blocking=True)
     GramA = Ar_cpu.T @ Ar_cpu #dxd - should probably not even solve this on the GPU
     pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d)
     
