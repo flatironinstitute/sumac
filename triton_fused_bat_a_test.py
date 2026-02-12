@@ -74,7 +74,7 @@ def relu_bat_a_fused(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return Y
 
 
-
+@torch.compile(mode='max-autotune-no-cudagraphs')
 def torch_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.relu(B @ A.T) @ A
 
@@ -84,7 +84,7 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", iters=
     B = torch.randn((M, D), device=device, dtype=dtype)
 
     # Warm up + correctness check 
-    ref = torch_impl(A.float(), B.float())
+    ref = torch_impl(A, B)
     out = relu_bat_a_fused(A, B)  
     max_err = (out - ref).abs().max().item()
 
