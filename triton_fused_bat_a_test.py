@@ -6,12 +6,22 @@ os.environ["MPLBACKEND"] = "Agg"
 
 @triton.autotune(
     configs=[
-        triton.Config({"BM": 16, "BN": 128}, num_warps=2),
-        triton.Config({"BM": 16, "BN": 256}, num_warps=4),
+        triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=4),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=2),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=4),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=2),
+        triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=4),
+        triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=4),
         triton.Config({"BM": 32, "BN": 128}, num_warps=4),
         triton.Config({"BM": 32, "BN": 256}, num_warps=8)
     ],
-    key=["M", "N"],
+    key=["M", "N", "D"],
 )
 
 # Fused Triton kernel for: Y = relu(B @ A.T) @ A
@@ -151,7 +161,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    r = bench_one(M=65536, N=4096, D=16, dtype=torch.float16)
+    r = bench_one(M=65536, N=4096, D=16, dtype=torch.float32)
     print(r)
 
     benchmark.run(print_data=True, show_plots=True, save_path="triton_bench")

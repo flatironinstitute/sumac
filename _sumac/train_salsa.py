@@ -4,6 +4,116 @@ import torch.nn.functional as F
 import contextlib
 from contextlib import nullcontext
 from _sumac.dataset import block_span, RowBlockDataset
+import triton
+import triton.language as tl
+
+# @triton.autotune(
+#     configs=[
+#         triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=1),
+#         triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=2),
+#         triton.Config({"BM": 16, "BN": 64}, num_warps=2, num_stages=4),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=1),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=2),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=1, num_stages=4),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=1),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=2),
+#         triton.Config({"BM": 16, "BN": 128}, num_warps=2, num_stages=4),
+#         triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=1),
+#         triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=2),
+#         triton.Config({"BM": 16, "BN": 256}, num_warps=4, num_stages=4),
+#         triton.Config({"BM": 32, "BN": 128}, num_warps=4),
+#         triton.Config({"BM": 32, "BN": 256}, num_warps=8)
+#     ],
+#     key=["M", "N", "D"],
+# ) Best config from autotuning runs BM: 16, BN: 128, num_warps: 1, num_ctas: 1, num_stages: 2, maxnreg: None
+
+# Fused Triton kernel for: Y = relu(B @ A.T) @ A
+@triton.jit
+def relu_bat_a_fused_kernel(
+    A_ptr, B_ptr, Y_ptr,
+    N, M, D: tl.constexpr,
+    stride_an: tl.constexpr, stride_ad: tl.constexpr,
+    stride_bm: tl.constexpr, stride_bd: tl.constexpr,
+    stride_ym: tl.constexpr, stride_yd: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    m = pid_m * BM + tl.arange(0, BM)
+    d = tl.arange(0, D)
+
+    b_ptrs = B_ptr + m[:, None] * stride_bm + d[None, :] * stride_bd
+    b = tl.load(b_ptrs, mask=(m[:, None] < M), other=0.0).to(tl.float32)
+
+    y = tl.zeros((BM, D), dtype=tl.float32)
+
+    for n0 in tl.range(0, N, BN):
+        n = n0 + tl.arange(0, BN)
+
+        a_ptrs = A_ptr + n[:, None] * stride_an + d[None, :] * stride_ad
+        a = tl.load(a_ptrs, mask=(n[:, None] < N), other=0.0).to(tl.float32)
+
+        # Force IEEE fp32 precision for dot
+        s = tl.dot(b, tl.trans(a), input_precision="ieee")
+        s = tl.maximum(s, 0.0)
+
+        y += tl.dot(s, a, input_precision="ieee")
+
+    y_ptrs = Y_ptr + m[:, None] * stride_ym + d[None, :] * stride_yd
+    tl.store(y_ptrs, y, mask=(m[:, None] < M))
+
+
+def relu_bat_a_fused(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    if not (A.is_cuda and B.is_cuda):
+        raise ValueError("A and B must be CUDA tensors.")
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("A and B must be 2D.")
+    if A.shape[1] != B.shape[1]:
+        raise ValueError("Feature dims must match.")
+    A = A.contiguous()
+    B = B.contiguous()
+
+    N, D = A.shape
+    M, _ = B.shape
+    Y = torch.empty((M, D), device=A.device, dtype=torch.float32)
+
+    grid = lambda META: (triton.cdiv(M, META["BM"]),)
+    relu_bat_a_fused_kernel[grid](
+        A, B, Y,
+        N=N, M=M, D=D,
+        stride_an=A.stride(0), stride_ad=A.stride(1),
+        stride_bm=B.stride(0), stride_bd=B.stride(1),
+        stride_ym=Y.stride(0), stride_yd=Y.stride(1),
+        BM=16, BN=128,      # Hard coding autotuning results here
+        num_warps=1,
+        num_stages=2,
+    )
+    return Y
+
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, AtAinv, stepM_blk, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
+    #Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
+    #stepM_blk = -Mt_blk @ pinvAt_dev
+    stepM_blk = -stepM_blk @ AtAinv
+
+    Lij_blk = torch.sum(Ar_dev[blk_idx[0], :] * B_blk_dev[blk_idx[1], :], dim=1)
+    Mij_blk = torch.relu(Lij_blk)
+
+    Ct_vals = blk_vals - Lij_blk + Mij_blk
+
+    bs = B_blk_dev.shape[0]
+    r = B_blk_dev.shape[1]
+
+    stepC_blk = torch.zeros((bs, r), device=B_blk_dev.device, dtype=B_blk_dev.dtype)
+
+    stepC_blk.index_add_(
+        0,
+        blk_idx[1],
+        Ct_vals[:, None] * pinvAt_dev[blk_idx[0], :]
+    )
+    lsqB_blk = B_blk_dev + stepM_blk + stepC_blk
+
+    dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
+    return B_blk_dev + dB_blk_new / unbias, dB_blk_new
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
@@ -39,7 +149,14 @@ def matmul_relu_fused(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, momentum, unbia
 
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
     return B_blk_dev + dB_blk_new / unbias, dB_blk_new
-    
+
+# @torch.compile(mode='max-autotune-no-cudagraphs')
+# def prepare_invs(Ar_cpu):
+#     GramA = Ar_cpu.T @ Ar_cpu
+#     AtAinv = torch.linalg.pinv(GramA, hermitian=True)
+#     pinvAt_cpu = Ar_cpu @ AtAinv
+#     return AtAinv, pinvAt_cpu
+
 def update_factor_salsa(S_idx_full, S_val_full, dataset, block_id, Factor_fixed, Factor_update, dFactor, opts, stepnum, multi_gpu=True, streams=None, map_buffers=None):
     """
     Directly aligns with Matlab: [B,dB] = batch_update(Sr,A(rowsA,:),B,dB,opts,stepnum);
@@ -89,10 +206,12 @@ def batch_update_multi_gpu(
     # Pre-calculate pseudoinverse. We slice Factor_fixed first.
     torch.cuda.nvtx.range_push("pseudo-inverse")
     # print(f"Factor_fixed is on {Factor_fixed.device}") Var names are confusing, this is already sitting on the GPU
-    Ar_cpu = Factor_fixed[row_indices_cpu, :]#.to(device_cpu, non_blocking=True)
+    Ar_cpu = Factor_fixed[row_indices_cpu, :].to(device_cpu, non_blocking=True)
     GramA = Ar_cpu.T @ Ar_cpu #dxd - should probably not even solve this on the GPU
-    pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d)
-    
+    #pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d) = A (A.T A)^(-1)
+    AtAinv = torch.linalg.pinv(GramA, hermitian=True)
+    pinvAt_cpu = Ar_cpu @ AtAinv
+    #AtAinv, pinvAt_cpu = prepare_invs(Ar_cpu) - not worth it
     torch.cuda.nvtx.range_pop()
 
     momentum = opts.get('exaggerate', 0.7)
@@ -111,6 +230,7 @@ def batch_update_multi_gpu(
         with ctx:
             # 1. Transfers (async on GPU, normal copies on CPU)
             torch.cuda.nvtx.range_push("H2D")
+            AtAinv_dev = AtAinv.to(dev, non_blocking=use_cuda)
             Ar_dev = Ar_cpu.to(dev, non_blocking=use_cuda)
             row_idx_dev = row_indices_cpu.to(dev, non_blocking=use_cuda)
             pinvAt_dev = pinvAt_cpu.to(dev, non_blocking=use_cuda)
@@ -138,7 +258,9 @@ def batch_update_multi_gpu(
                 # 3. LSQ Update
 
                 torch.cuda.nvtx.range_push("lsq_update")
-                B_blk_new, dB_blk_new = lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
+                tmp = relu_bat_a_fused(Ar_dev, B_blk_dev)
+                B_blk_new, dB_blk_new = lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, AtAinv_dev, tmp, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
+                #B_blk_new, dB_blk_new = lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
                 torch.cuda.nvtx.range_pop()
             else:
                 
