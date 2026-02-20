@@ -100,11 +100,13 @@ def eval(
         for (block_id, edge_idx, row_indices) in block:
             edge_idx = edge_idx.to(device).view(-1)
             block_id = int(block_id)
+            torch.cuda.nvtx.range_push("block_loss_and_pred")
             ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
                 A, B, block_id, num_blocks, m, n,
                 S_index, S_value, edge_idx, 
                 row_indices=row_indices, errZ_obj=errZ_obj
             )
+            torch.cuda.nvtx.range_pop()
             ssqe += ssqe_b
             sumSr += sumSr_b
             num_j += num_j_b
