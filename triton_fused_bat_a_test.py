@@ -11,6 +11,8 @@ import cupy as cp
 
 import numpy as np
 from numba import cuda, float32
+import pandas as pd
+pd.set_option('display.max_columns', None)
 
 D = 16
 
@@ -280,6 +282,7 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
         "triton_TFLOPs":  float(ms_to_tflops(M, N, D, t_triton)),
         "cuda_TFLOPs":   float(ms_to_tflops(M,N,D, t_cuda)),
         "speedup_triton":  float(t_torch / t_triton),
+        "speedup_cuda":   float(t_torch/t_cuda),
     }
 
 
@@ -288,9 +291,9 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
         x_names=["M"],  
         x_vals=[4096, 8192, 16384, 32768, 65536, 131072],
         line_arg="provider",
-        line_vals=["torch", "triton"],
-        line_names=["Torch TFLOP/s", "Triton fused TFLOP/s"],
-        styles=[("r", "-"), ("b", "-")],
+        line_vals=["torch", "triton", "cuda", "roofline"],
+        line_names=["Torch TFLOP/s", "Triton fused TFLOP/s", "CUDA fused TFLOP/s", "Roofline model TFLOP/s"],
+        styles=[("tab:blue", "-"), ("tab:orange", "-"), ("tab:green", "-"), ("tab:red","--")],
         ylabel="TFLOP/s",
         plot_name="relu_bat_a_fused",
         args={"N": 1392, "D": 16, "dtype": torch.float32},
@@ -298,15 +301,20 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
 )
 def benchmark(M, N, D, dtype, provider, wm_iters=25, iters=200):
    
-    
     device = "cuda"
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
 
     if provider == "torch":
         fn = lambda: torch_impl(A, B)
-    else:
+    elif provider == "triton":
         fn = lambda: relu_bat_a_fused_triton(A, B)
+    elif provider == "cuda":
+        fn = lambda: relu_bat_a_fused_cuda(A, B)
+    else:
+        return perf_roofline(FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4), BW_GBs=960, peak_TFLOP=91.1)
+    
+        
     ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
     return ms_to_tflops(M, N, D, ms)
 
@@ -318,6 +326,8 @@ if __name__ == "__main__":
                         help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=200,
                         help="Number of benchmark iterations")
+    parser.add_argument("--sweep", action='store_true', default=False)
+
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -326,24 +336,27 @@ if __name__ == "__main__":
     r = bench_one(M=139255, N=1392, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
 
-    # df = benchmark.run(print_data=False, show_plots=True, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
+    if(args.sweep):
+        df = benchmark.run(print_data=False, show_plots=True, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
 
-    # FPB_fused = lambda M: flop_per_byte_fused(M=M, N=1392, D=16,wordsize=4) 
-    # FPB_2kernel = lambda M: flop_per_byte_2kernels(M=M, N=1392, D=16, wordsize=4)
+        FPB_fused = lambda M: flop_per_byte_fused(M=M, N=1392, D=16,wordsize=4) 
+        FPB_2kernel = lambda M: flop_per_byte_2kernels(M=M, N=1392, D=16, wordsize=4)
 
-    # kernel_roofline = lambda Flop_per_Byte: perf_roofline(FLOP_per_Byte=Flop_per_Byte, BW_GBs=960, peak_TFLOP=91.1)
+        kernel_roofline = lambda Flop_per_Byte: perf_roofline(FLOP_per_Byte=Flop_per_Byte, BW_GBs=960, peak_TFLOP=91.1)
 
-    # df["Torch [FLOP/Byte]"] = df["M"].apply(FPB_2kernel)
-    # df["Triton fused [FLOP/Byte]"] = df["M"].apply(FPB_fused)
-    # df["Torch DRAM roofline TFLOP/s"] = df["Torch [FLOP/Byte]"].apply(kernel_roofline)
+        df["Torch [FLOP/Byte]"] = df["M"].apply(FPB_2kernel)
+        df["Triton fused [FLOP/Byte]"] = df["M"].apply(FPB_fused)
+        df["Torch DRAM roofline TFLOP/s"] = df["Torch [FLOP/Byte]"].apply(kernel_roofline)
 
-    # df["Triton fused DRAM roofline TFLOP/s"] = df["Triton fused [FLOP/Byte]"].apply(kernel_roofline)
+        df["Triton fused DRAM roofline TFLOP/s"] = df["Triton fused [FLOP/Byte]"].apply(kernel_roofline)
 
-    # df["Torch % peak achieved"] = df["Torch TFLOP/s"]/df["Torch DRAM roofline TFLOP/s"]*100
+        df["Torch % peak achieved"] = df["Torch TFLOP/s"]/df["Torch DRAM roofline TFLOP/s"]*100
 
-    # df["Triton fused % peak achieved"] = df["Triton fused TFLOP/s"]/df["Triton fused DRAM roofline TFLOP/s"]*100
+        df["Triton fused % peak achieved"] = df["Triton fused TFLOP/s"]/df["Triton fused DRAM roofline TFLOP/s"]*100
 
-    # print(df)
+        df["CUDA % peak achieved"] = df["CUDA fused TFLOP/s"]/df["Triton fused DRAM roofline TFLOP/s"]*100
+
+        print(df)
 
 
 # Fused kernel traffic:
@@ -353,5 +366,4 @@ if __name__ == "__main__":
 # Two matmul kernels traffic:
 # Read A, Read B, Write BA.T, Read BA.T, Read A, Write C
 # (m*d + n*d + m*n)*sizeof(word) + (m*n+m*d+n*d)*sizeof(word) min DRAM traffic 
-
 

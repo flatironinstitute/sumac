@@ -81,8 +81,8 @@ __global__ void relu_bat_a_fused_kernel(
   auto issue_tile = [&](int stage, int n0) {
     const int tile_elems = BK * (D / 4);
     for (int idx = tid; idx < tile_elems; idx += BM) {
-      const int k  = idx / (D / 4);          // 0..BK-1
-      const int dv = idx - k * (D / 4);      // 0..3
+      const int k  = idx / (D / 4);          
+      const int dv = idx - k * (D / 4);      
       const int n  = n0 + k;
 
       float4* smem_ptr = &As4[stage][k][dv];
@@ -96,7 +96,6 @@ __global__ void relu_bat_a_fused_kernel(
     }
   };
 
-  // prefetch tile 0 into stage 0
   int n0 = 0;
   if (n0 < N) {
     issue_tile(0, n0);
@@ -111,26 +110,136 @@ __global__ void relu_bat_a_fused_kernel(
     const int next_stage = cur_stage ^ 1;
     const int n1 = n0 + BK;
 
-    // Prefetch next tile while computing current
     if (n1 < N) {
       issue_tile(next_stage, n1);
       cp_async_commit();
     }
 
-    // Preload k=0
     float4 a0_0 = As4[cur_stage][0][0];
     float4 a0_1 = As4[cur_stage][0][1];
     float4 a0_2 = As4[cur_stage][0][2];
     float4 a0_3 = As4[cur_stage][0][3];
 
-#pragma unroll
-    for (int k = 0; k < BK - 1; ++k) {
-      // Prefetch next k+1 early
-      float4 a1_0 = As4[cur_stage][k + 1][0];
-      float4 a1_1 = As4[cur_stage][k + 1][1];
-      float4 a1_2 = As4[cur_stage][k + 1][2];
-      float4 a1_3 = As4[cur_stage][k + 1][3];
 
+    float4 a1_0 = As4[cur_stage][1][0];
+    float4 a1_1 = As4[cur_stage][1][1];
+    float4 a1_2 = As4[cur_stage][1][2];
+    float4 a1_3 = As4[cur_stage][1][3];
+
+#pragma unroll
+    for (int k = 0; k < BK - 2; k+=2) {
+      float4 a2_0 = As4[cur_stage][k + 2][0];
+      float4 a2_1 = As4[cur_stage][k + 2][1];
+      float4 a2_2 = As4[cur_stage][k + 2][2];
+      float4 a2_3 = As4[cur_stage][k + 2][3];
+
+      float4 a3_0 = As4[cur_stage][k + 3][0];
+      float4 a3_1 = As4[cur_stage][k + 3][1];
+      float4 a3_2 = As4[cur_stage][k + 3][2];
+      float4 a3_3 = As4[cur_stage][k + 3][3];
+
+      {
+        float acc = 0.f;
+        float acc0 = 0.f;
+        float acc1 = 0.f;
+
+        acc0 = fmaf(b0.x, a0_0.x, acc0); 
+        acc0 = fmaf(b0.y, a0_0.y, acc0);
+        acc0 = fmaf(b0.z, a0_0.z, acc0); 
+        acc0 = fmaf(b0.w, a0_0.w, acc0);
+
+        acc1 = fmaf(b1.x, a0_1.x, acc1); 
+        acc1 = fmaf(b1.y, a0_1.y, acc1);
+        acc1 = fmaf(b1.z, a0_1.z, acc1); 
+        acc1 = fmaf(b1.w, a0_1.w, acc1);
+
+        acc0 = fmaf(b2.x, a0_2.x, acc0); 
+        acc0 = fmaf(b2.y, a0_2.y, acc0);
+        acc0 = fmaf(b2.z, a0_2.z, acc0); 
+        acc0 = fmaf(b2.w, a0_2.w, acc0);
+
+        acc1 = fmaf(b3.x, a0_3.x, acc1); 
+        acc1 = fmaf(b3.y, a0_3.y, acc1);
+        acc1 = fmaf(b3.z, a0_3.z, acc1); 
+        acc1 = fmaf(b3.w, a0_3.w, acc1);
+
+        acc = fmaxf(acc0 + acc1, 0.f);
+
+        // y += Dot(ReLU(B A.T),A)
+        y0.x = fmaf(acc, a0_0.x, y0.x); 
+        y0.y = fmaf(acc, a0_0.y, y0.y);
+        y0.z = fmaf(acc, a0_0.z, y0.z); 
+        y0.w = fmaf(acc, a0_0.w, y0.w);
+
+        y1.x = fmaf(acc, a0_1.x, y1.x); 
+        y1.y = fmaf(acc, a0_1.y, y1.y);
+        y1.z = fmaf(acc, a0_1.z, y1.z); 
+        y1.w = fmaf(acc, a0_1.w, y1.w);
+
+        y2.x = fmaf(acc, a0_2.x, y2.x); 
+        y2.y = fmaf(acc, a0_2.y, y2.y);
+        y2.z = fmaf(acc, a0_2.z, y2.z); 
+        y2.w = fmaf(acc, a0_2.w, y2.w);
+
+        y3.x = fmaf(acc, a0_3.x, y3.x); 
+        y3.y = fmaf(acc, a0_3.y, y3.y);
+        y3.z = fmaf(acc, a0_3.z, y3.z); 
+        y3.w = fmaf(acc, a0_3.w, y3.w);
+      }
+      {
+        float acc = 0.f;
+        float acc0 = 0.f;
+        float acc1 = 0.f;
+
+        acc0 = fmaf(b0.x, a1_0.x, acc0); 
+        acc0 = fmaf(b0.y, a1_0.y, acc0);
+        acc0 = fmaf(b0.z, a1_0.z, acc0); 
+        acc0 = fmaf(b0.w, a1_0.w, acc0);
+
+        acc1 = fmaf(b1.x, a1_1.x, acc1); 
+        acc1 = fmaf(b1.y, a1_1.y, acc1);
+        acc1 = fmaf(b1.z, a1_1.z, acc1); 
+        acc1 = fmaf(b1.w, a1_1.w, acc1);
+
+        acc0 = fmaf(b2.x, a1_2.x, acc0); 
+        acc0 = fmaf(b2.y, a1_2.y, acc0);
+        acc0 = fmaf(b2.z, a1_2.z, acc0); 
+        acc0 = fmaf(b2.w, a1_2.w, acc0);
+
+        acc1 = fmaf(b3.x, a1_3.x, acc1); 
+        acc1 = fmaf(b3.y, a1_3.y, acc1);
+        acc1 = fmaf(b3.z, a1_3.z, acc1); 
+        acc1 = fmaf(b3.w, a1_3.w, acc1);
+
+        acc = fmaxf(acc0 + acc1, 0.f);
+
+        // y += Dot(ReLU(B A.T),A)
+        y0.x = fmaf(acc, a1_0.x, y0.x); 
+        y0.y = fmaf(acc, a1_0.y, y0.y);
+        y0.z = fmaf(acc, a1_0.z, y0.z); 
+        y0.w = fmaf(acc, a1_0.w, y0.w);
+
+        y1.x = fmaf(acc, a1_1.x, y1.x); 
+        y1.y = fmaf(acc, a1_1.y, y1.y);
+        y1.z = fmaf(acc, a1_1.z, y1.z); 
+        y1.w = fmaf(acc, a1_1.w, y1.w);
+
+        y2.x = fmaf(acc, a1_2.x, y2.x); 
+        y2.y = fmaf(acc, a1_2.y, y2.y);
+        y2.z = fmaf(acc, a1_2.z, y2.z); 
+        y2.w = fmaf(acc, a1_2.w, y2.w);
+
+        y3.x = fmaf(acc, a1_3.x, y3.x); 
+        y3.y = fmaf(acc, a1_3.y, y3.y);
+        y3.z = fmaf(acc, a1_3.z, y3.z); 
+        y3.w = fmaf(acc, a1_3.w, y3.w);
+      }
+      // a0_0 = a1_0; a0_1 = a1_1; a0_2 = a1_2; a0_3 = a1_3;
+      a0_0 = a2_0; a0_1 = a2_1; a0_2 = a2_2; a0_3 = a2_3;
+      a1_0 = a3_0; a1_1 = a3_1; a1_2 = a3_2; a1_3 = a3_3;
+    }
+
+    {
       float acc = 0.f;
       float acc0 = 0.f;
       float acc1 = 0.f;
@@ -157,7 +266,6 @@ __global__ void relu_bat_a_fused_kernel(
 
       acc = fmaxf(acc0 + acc1, 0.f);
 
-      // y += Dot(ReLU(B A.T),A)
       y0.x = fmaf(acc, a0_0.x, y0.x); 
       y0.y = fmaf(acc, a0_0.y, y0.y);
       y0.z = fmaf(acc, a0_0.z, y0.z); 
@@ -177,43 +285,55 @@ __global__ void relu_bat_a_fused_kernel(
       y3.y = fmaf(acc, a0_3.y, y3.y);
       y3.z = fmaf(acc, a0_3.z, y3.z); 
       y3.w = fmaf(acc, a0_3.w, y3.w);
-
-      // Advance pipeline
-      a0_0 = a1_0; a0_1 = a1_1; a0_2 = a1_2; a0_3 = a1_3;
     }
-
-    // Final iteration
     {
       float acc = 0.f;
+      float acc0 = 0.f;
+      float acc1 = 0.f;
 
-      acc = fmaf(b0.x, a0_0.x, acc); acc = fmaf(b0.y, a0_0.y, acc);
-      acc = fmaf(b0.z, a0_0.z, acc); acc = fmaf(b0.w, a0_0.w, acc);
+      acc0 = fmaf(b0.x, a1_0.x, acc0); 
+      acc0 = fmaf(b0.y, a1_0.y, acc0);
+      acc0 = fmaf(b0.z, a1_0.z, acc0); 
+      acc0 = fmaf(b0.w, a1_0.w, acc0);
 
-      acc = fmaf(b1.x, a0_1.x, acc); acc = fmaf(b1.y, a0_1.y, acc);
-      acc = fmaf(b1.z, a0_1.z, acc); acc = fmaf(b1.w, a0_1.w, acc);
+      acc1 = fmaf(b1.x, a1_1.x, acc1); 
+      acc1 = fmaf(b1.y, a1_1.y, acc1);
+      acc1 = fmaf(b1.z, a1_1.z, acc1); 
+      acc1 = fmaf(b1.w, a1_1.w, acc1);
 
-      acc = fmaf(b2.x, a0_2.x, acc); acc = fmaf(b2.y, a0_2.y, acc);
-      acc = fmaf(b2.z, a0_2.z, acc); acc = fmaf(b2.w, a0_2.w, acc);
+      acc0 = fmaf(b2.x, a1_2.x, acc0); 
+      acc0 = fmaf(b2.y, a1_2.y, acc0);
+      acc0 = fmaf(b2.z, a1_2.z, acc0); 
+      acc0 = fmaf(b2.w, a1_2.w, acc0);
 
-      acc = fmaf(b3.x, a0_3.x, acc); acc = fmaf(b3.y, a0_3.y, acc);
-      acc = fmaf(b3.z, a0_3.z, acc); acc = fmaf(b3.w, a0_3.w, acc);
+      acc1 = fmaf(b3.x, a1_3.x, acc1); 
+      acc1 = fmaf(b3.y, a1_3.y, acc1);
+      acc1 = fmaf(b3.z, a1_3.z, acc1); 
+      acc1 = fmaf(b3.w, a1_3.w, acc1);
 
-      acc = max(acc, 0.f);
+      acc = fmaxf(acc0 + acc1, 0.f);
 
-      y0.x = fmaf(acc, a0_0.x, y0.x); y0.y = fmaf(acc, a0_0.y, y0.y);
-      y0.z = fmaf(acc, a0_0.z, y0.z); y0.w = fmaf(acc, a0_0.w, y0.w);
+      y0.x = fmaf(acc, a1_0.x, y0.x); 
+      y0.y = fmaf(acc, a1_0.y, y0.y);
+      y0.z = fmaf(acc, a1_0.z, y0.z); 
+      y0.w = fmaf(acc, a1_0.w, y0.w);
 
-      y1.x = fmaf(acc, a0_1.x, y1.x); y1.y = fmaf(acc, a0_1.y, y1.y);
-      y1.z = fmaf(acc, a0_1.z, y1.z); y1.w = fmaf(acc, a0_1.w, y1.w);
+      y1.x = fmaf(acc, a1_1.x, y1.x); 
+      y1.y = fmaf(acc, a1_1.y, y1.y);
+      y1.z = fmaf(acc, a1_1.z, y1.z); 
+      y1.w = fmaf(acc, a1_1.w, y1.w);
 
-      y2.x = fmaf(acc, a0_2.x, y2.x); y2.y = fmaf(acc, a0_2.y, y2.y);
-      y2.z = fmaf(acc, a0_2.z, y2.z); y2.w = fmaf(acc, a0_2.w, y2.w);
+      y2.x = fmaf(acc, a1_2.x, y2.x); 
+      y2.y = fmaf(acc, a1_2.y, y2.y);
+      y2.z = fmaf(acc, a1_2.z, y2.z); 
+      y2.w = fmaf(acc, a1_2.w, y2.w);
 
-      y3.x = fmaf(acc, a0_3.x, y3.x); y3.y = fmaf(acc, a0_3.y, y3.y);
-      y3.z = fmaf(acc, a0_3.z, y3.z); y3.w = fmaf(acc, a0_3.w, y3.w);
+      y3.x = fmaf(acc, a1_3.x, y3.x); 
+      y3.y = fmaf(acc, a1_3.y, y3.y);
+      y3.z = fmaf(acc, a1_3.z, y3.z); 
+      y3.w = fmaf(acc, a1_3.w, y3.w);
     }
 
-    // Sync next tile before the next iteration reads it
     if (n1 < N) {
       cp_async_wait_all();
       __syncthreads();
