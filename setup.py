@@ -1,6 +1,7 @@
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-
+import os
+os.environ["TORCH_CUDA_ARCH_LIST"]="7.0;8.0;8.9;9.0"
 setup(
     name="relu_bat_a_fused_cuda",
     ext_modules=[

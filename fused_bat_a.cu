@@ -131,37 +131,52 @@ __global__ void relu_bat_a_fused_kernel(
       float4 a1_2 = As4[cur_stage][k + 1][2];
       float4 a1_3 = As4[cur_stage][k + 1][3];
 
-      // Dot(B, A.T)
+      float acc = 0.f;
       float acc0 = 0.f;
       float acc1 = 0.f;
-      float acc = 0.f;
 
-      acc0 = fmaf(b0.x, a0_0.x, acc0); acc0 = fmaf(b0.y, a0_0.y, acc0);
-      acc0 = fmaf(b0.z, a0_0.z, acc0); acc0 = fmaf(b0.w, a0_0.w, acc0);
+      acc0 = fmaf(b0.x, a0_0.x, acc0); 
+      acc0 = fmaf(b0.y, a0_0.y, acc0);
+      acc0 = fmaf(b0.z, a0_0.z, acc0); 
+      acc0 = fmaf(b0.w, a0_0.w, acc0);
 
-      acc0 = fmaf(b1.x, a0_1.x, acc0); acc0 = fmaf(b1.y, a0_1.y, acc0);
-      acc0 = fmaf(b1.z, a0_1.z, acc0); acc0 = fmaf(b1.w, a0_1.w, acc0);
+      acc1 = fmaf(b1.x, a0_1.x, acc1); 
+      acc1 = fmaf(b1.y, a0_1.y, acc1);
+      acc1 = fmaf(b1.z, a0_1.z, acc1); 
+      acc1 = fmaf(b1.w, a0_1.w, acc1);
 
-      acc1 = fmaf(b2.x, a0_2.x, acc1); acc1 = fmaf(b2.y, a0_2.y, acc1);
-      acc1 = fmaf(b2.z, a0_2.z, acc1); acc1 = fmaf(b2.w, a0_2.w, acc1);
+      acc0 = fmaf(b2.x, a0_2.x, acc0); 
+      acc0 = fmaf(b2.y, a0_2.y, acc0);
+      acc0 = fmaf(b2.z, a0_2.z, acc0); 
+      acc0 = fmaf(b2.w, a0_2.w, acc0);
 
-      acc1 = fmaf(b3.x, a0_3.x, acc1); acc1 = fmaf(b3.y, a0_3.y, acc1);
-      acc1 = fmaf(b3.z, a0_3.z, acc1); acc1 = fmaf(b3.w, a0_3.w, acc1);
+      acc1 = fmaf(b3.x, a0_3.x, acc1); 
+      acc1 = fmaf(b3.y, a0_3.y, acc1);
+      acc1 = fmaf(b3.z, a0_3.z, acc1); 
+      acc1 = fmaf(b3.w, a0_3.w, acc1);
 
-      acc = fmaxf(acc0+acc1, 0.f);
+      acc = fmaxf(acc0 + acc1, 0.f);
 
       // y += Dot(ReLU(B A.T),A)
-      y0.x = fmaf(acc, a0_0.x, y0.x); y0.y = fmaf(acc, a0_0.y, y0.y);
-      y0.z = fmaf(acc, a0_0.z, y0.z); y0.w = fmaf(acc, a0_0.w, y0.w);
+      y0.x = fmaf(acc, a0_0.x, y0.x); 
+      y0.y = fmaf(acc, a0_0.y, y0.y);
+      y0.z = fmaf(acc, a0_0.z, y0.z); 
+      y0.w = fmaf(acc, a0_0.w, y0.w);
 
-      y1.x = fmaf(acc, a0_1.x, y1.x); y1.y = fmaf(acc, a0_1.y, y1.y);
-      y1.z = fmaf(acc, a0_1.z, y1.z); y1.w = fmaf(acc, a0_1.w, y1.w);
+      y1.x = fmaf(acc, a0_1.x, y1.x); 
+      y1.y = fmaf(acc, a0_1.y, y1.y);
+      y1.z = fmaf(acc, a0_1.z, y1.z); 
+      y1.w = fmaf(acc, a0_1.w, y1.w);
 
-      y2.x = fmaf(acc, a0_2.x, y2.x); y2.y = fmaf(acc, a0_2.y, y2.y);
-      y2.z = fmaf(acc, a0_2.z, y2.z); y2.w = fmaf(acc, a0_2.w, y2.w);
+      y2.x = fmaf(acc, a0_2.x, y2.x); 
+      y2.y = fmaf(acc, a0_2.y, y2.y);
+      y2.z = fmaf(acc, a0_2.z, y2.z); 
+      y2.w = fmaf(acc, a0_2.w, y2.w);
 
-      y3.x = fmaf(acc, a0_3.x, y3.x); y3.y = fmaf(acc, a0_3.y, y3.y);
-      y3.z = fmaf(acc, a0_3.z, y3.z); y3.w = fmaf(acc, a0_3.w, y3.w);
+      y3.x = fmaf(acc, a0_3.x, y3.x); 
+      y3.y = fmaf(acc, a0_3.y, y3.y);
+      y3.z = fmaf(acc, a0_3.z, y3.z); 
+      y3.w = fmaf(acc, a0_3.w, y3.w);
 
       // Advance pipeline
       a0_0 = a1_0; a0_1 = a1_1; a0_2 = a1_2; a0_3 = a1_3;
@@ -228,12 +243,12 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B) {
 
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 
-  const int BM = 64;
+  const int BM = 256;
   TORCH_CHECK(BM % 32 == 0, "BM must be multiple of 32");
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, BM));
 
-  relu_bat_a_fused_kernel<16,16><<<grid, block, 0>>>(
+  relu_bat_a_fused_kernel<64,16><<<grid, block, 0>>>(
       (const float*)A.data_ptr<float>(),
       (const float*)B.data_ptr<float>(),
       (float*)Y.data_ptr<float>(),
