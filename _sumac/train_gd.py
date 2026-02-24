@@ -55,8 +55,11 @@ def make_optimizer(name, params, lr, weight_decay=0.0, SGD_momentum=0.0, adam_be
 ###Helpers for GD_loop
 def select_devices(cfg, device: torch.device):
     """Return list of devices to use (master first). No DDP."""
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and device.type == "cuda":
-        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    if torch.cuda.is_available() and device.type == "cuda":
+        if torch.cuda.device_count() > 1:
+            return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+        else:
+            return [torch.device(f"cuda:0")]
     return [device]
 
 def setup_replicas(A, B, S_index, S_value, devices):
@@ -64,7 +67,6 @@ def setup_replicas(A, B, S_index, S_value, devices):
     Create per-device parameter replicas and per-device copies of S_index/S_value.
     Master params are the original A,B (tied to optimizer).
     """
-    master = devices[0]
     S_index_devs = [S_index.to(dev, non_blocking=True) for dev in devices]
     S_value_devs = [S_value.to(dev, non_blocking=True) for dev in devices]
 
@@ -123,7 +125,6 @@ def compute_backward_on_device(
         S_idx_d = S_index_devs[di]
         S_val_d = S_value_devs[di]
 
-        #for (block_id, edge_idx) in shard:
         for (block_id, edge_idx, row_indices) in shard:
             block_id = int(block_id)
             edge_idx = edge_idx.to(dev).view(-1)
@@ -193,12 +194,10 @@ def reduce_grads_to_master(A, B, A_devs, B_devs, master: torch.device, average: 
         gB = B_devs[di].grad
         if gA is None and gB is None:
             continue
-
         if gA is not None:
-            A.grad.add_(gA.detach().to(master, non_blocking=False))
+            A.grad.add_(gA.detach().to(master))
         if gB is not None:
-            B.grad.add_(gB.detach().to(master, non_blocking=False))
-
+            B.grad.add_(gB.detach().to(master))
         contrib += 1
 
     # Average over contributing devices (not necessarily len(A_devs) if some shards empty)
@@ -211,6 +210,7 @@ def reduce_grads_to_master(A, B, A_devs, B_devs, master: torch.device, average: 
 @torch.no_grad()
 def broadcast_params_from_master(A, B, A_devs, B_devs, devices):
     """Copy updated master params to replicas."""
+    # Broadcast A and B in coalesced buckets to reduce memcpy calls
     for di in range(1, len(devices)):
         A_devs[di].copy_(A.detach().to(devices[di]))
         B_devs[di].copy_(B.detach().to(devices[di]))

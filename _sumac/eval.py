@@ -3,14 +3,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
-import math
-import time
-import random
 from torch.nn.utils import clip_grad_norm_
-import contextlib
 
 from _sumac.dataset import block_span
 
+#jit helper function for speed up
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def relu_AB(A: torch.Tensor, B: torch.Tensor):
+    return torch.relu(A @ B.T)
+
+@torch.compile(mode="max-autotune-no-cudagraphs")
+def relu_AB_with_Lobs(A: torch.Tensor, B: torch.Tensor,
+                     local_r: torch.LongTensor,
+                     cols_all: torch.LongTensor):
+    L = A @ B.T
+    Sr_block = torch.relu(L)
+    L_obs = L[local_r, cols_all]
+    return Sr_block, L_obs
 
 #main training loop; update [A,B] per block
 def block_loss_and_pred(
@@ -33,6 +42,7 @@ def block_loss_and_pred(
     - Metrics: returns scalar rmse (same as loss) and 1-Jaccard on the block.
     """
     # 1) Dense prediction for the block vs all columns (all-zero negatives)
+    torch.cuda.nvtx.range_push("get factor block")
     if row_indices is not None:
         A_block = A[row_indices, :]
         b = len(row_indices)
@@ -43,12 +53,9 @@ def block_loss_and_pred(
         A_block = A[start:end, :]
 
     assert b > 0, "Empty block span"
-    L = A_block @ B.T
-    Sr_block = torch.clamp(L, min=0.0)   # (b, n)
-    sumSr_block = Sr_block.sum() #float(Sr_block.sum().item())
+    torch.cuda.nvtx.range_pop()
 
-    # 2) Sparse prediction for the block (at the edge index)
-    target = Sr_block.new_zeros((b, n))      # (b, n)
+    torch.cuda.nvtx.range_push("map idx to local block")
     rows_all = S_index[0][edge_idx]         # global rows
     cols_all = S_index[1][edge_idx]         # global cols
     vals_all = S_value[edge_idx]            # (E_b,)
@@ -60,26 +67,37 @@ def block_loss_and_pred(
         local_r = local_map[rows_all]
     else:
         local_r = rows_all - start
-        
-    target[local_r, cols_all] = vals_all
+    torch.cuda.nvtx.range_pop()
+    
+    torch.cuda.nvtx.range_push("compute pred and target")
+    if errZ_obj:
+        Sr_block, L_obs = relu_AB_with_Lobs(A_block, B, local_r, cols_all)
+    else:
+        Sr_block = relu_AB(A_block, B)
+    sumSr_block = Sr_block.sum()
 
-    # 3) MSE/jacc numerator over *all* entries in the block (loss used for backprop)
+    target = Sr_block.new_zeros((b, n))      # (b, n)    
+    target[local_r, cols_all] = vals_all
+    torch.cuda.nvtx.range_pop()
+
+    # MSE/jacc numerator over *all* entries in the block (loss used for backprop)
+    torch.cuda.nvtx.range_push("compute losses")
     mse_full = F.mse_loss(Sr_block, target, reduction="sum")  # sum over all b*n -> dense compute
     Sr_obs = Sr_block[local_r, cols_all]
     # ssqS_block = (vals_all * vals_all).sum()
     # mse_full = ssqS_block + ssqSr_block - 2.0 * (vals_all * Sr_obs).sum() #this turns out to be slightly slower
     jacc_num_block = torch.minimum(vals_all, Sr_obs).sum()
     errZ_num_block = None
-    if errZ_obj: #make equivalent errZ objective; TODO: faster?
+    if errZ_obj: #make equivalent errZ objective;
         # L at observed (local) coordinates
-        L_obs = L[local_r, cols_all]              # (E_b,)
         neg_mask_pos = L_obs < 0                  # only entries that were clamped in Sr
         if neg_mask_pos.any():
             S_obs = vals_all[neg_mask_pos]        # S_{ij} at those coords
             L_neg = L_obs[neg_mask_pos]           # L_{ij} (negative values)
             # sum of (L^2 - 2 S L) over the intersection (observed & L<0)
             errZ_num_block = mse_full + (L_neg*L_neg - 2.0*S_obs*L_neg).sum()
-   
+    torch.cuda.nvtx.range_pop()
+    
     return mse_full, sumSr_block, jacc_num_block, errZ_num_block
 
 ##main eval code; reusing block_loss_and_pred() to compute metric

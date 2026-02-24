@@ -1,5 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
+from typing import List, Tuple
+
 
 # ---------- helpers ----------
 def block_span(block_id: int, m: int, num_blocks: int):
@@ -54,8 +56,8 @@ class StochasticRowBlockDataset(Dataset):
     """
     def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
                  m: int, num_blocks: int):
-        self.S_index = S_index
-        self.S_value = S_value
+        self.S_index = S_index #.detach().cpu() #NEW: force CPU
+        self.S_value = S_value # .detach().cpu() #NEW: force CPU
         self.m = m
         self.num_blocks = num_blocks
         
@@ -77,7 +79,8 @@ class StochasticRowBlockDataset(Dataset):
         Vectorized reshuffle: Re-partitions rows into blocks in a single go.
         """
         # 1. Randomly permute rows
-        perm = torch.randperm(self.m)
+        dev = self.S_value.device # NEW - change default to cpu torch.device("cpu") # 
+        perm = torch.randperm(self.m, device=dev)
         perm_inv = torch.empty_like(perm)
         perm_inv[perm] = torch.arange(self.m)
         
@@ -108,3 +111,169 @@ class StochasticRowBlockDataset(Dataset):
     def __getitem__(self, block_id):
         bid = int(block_id)
         return bid, self.block_edge_idx[bid], self.block_row_indices[bid]
+
+class MultiGPUStochasticRowBlockDataset(Dataset):
+    """
+    Minimal multi-GPU analogue of StochasticRowBlockDataset.
+
+    - Shards edges by ROW across devices once
+    - Each device keeps (S_index_shard, S_value_shard) resident on that GPU
+    - reshuffle() is local within each shard (permutes only local rows)
+    - __getitem__ returns per-device block info:
+        (bid, edge_idx_local, row_indices_global, S_index_shard, S_value_shard)
+      so your per-device compute can index into that shard without cross-GPU transfers.
+    """
+    def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
+                 m: int, num_blocks: int, devices: List[torch.device]):
+        self.m = int(m)
+        self.num_blocks = int(num_blocks)
+        self.devices = list(devices)
+        self.num_devices = len(self.devices)
+
+        # Shard from CPU (recommended; avoids parking full S on one GPU)
+        S_index_cpu = S_index.detach().cpu()
+        S_value_cpu = S_value.detach().cpu()
+        rows = S_index_cpu[0]
+
+        # NEW: balanced span  #TODO: clean-up
+        # spans = nnz_balanced_row_spans(rows, self.m, self.num_devices)
+
+        self.shards = []
+        for di, dev in enumerate(self.devices):
+            row_start, row_end = block_span(di, self.m, self.num_devices) 
+            # row_start, row_end = spans[di]
+            mask = (rows >= row_start) & (rows < row_end)
+
+            shard = {
+                "device": dev,
+                "row_start": int(row_start),
+                "row_end": int(row_end),
+                "m_local": int(row_end - row_start),
+                "S_index": S_index_cpu[:, mask].to(dev, non_blocking=True),
+                "S_value": S_value_cpu[mask].to(dev, non_blocking=True),
+                "block_edge_idx": None,
+                "block_row_indices": None,
+            }
+            self.shards.append(shard)
+
+        # Ensure all asynchronous transfers to GPUs are complete before reshuffling
+        for dev in self.devices:
+            torch.cuda.synchronize(dev)
+        self.reshuffle()
+
+    def reshuffle(self):
+        """
+        Local reshuffle per device: partitions ONLY local rows into num_blocks.
+        """
+        for shard in self.shards:
+            dev = shard["device"]
+            m_local = shard["m_local"]
+            row_start = shard["row_start"]
+
+            # 1) permute local rows [0, m_local)
+            perm = torch.randperm(m_local, device=dev)
+            perm_inv = torch.empty_like(perm)
+            perm_inv[perm] = torch.arange(m_local, device=dev)
+
+            # 2) map edges to blocks using local perm order
+            block_size = (m_local + self.num_blocks - 1) // self.num_blocks
+
+            edge_rows_global = shard["S_index"][0]           # in [row_start, row_end)
+            edge_rows_local = edge_rows_global - row_start   # in [0, m_local)
+            edge_block_ids = perm_inv[edge_rows_local] // block_size
+            edge_block_ids.clamp_(max=self.num_blocks - 1)
+
+            # 3) sort edges by block id + offsets
+            sorted_edge_indices = torch.argsort(edge_block_ids)
+            counts = torch.bincount(edge_block_ids, minlength=self.num_blocks)
+            offsets = torch.zeros(self.num_blocks + 1, dtype=torch.long, device=dev)
+            torch.cumsum(counts, dim=0, out=offsets[1:])
+
+            # 4) materialize per-block edge idx + per-block (GLOBAL) row indices
+            block_edge_idx = []
+            block_row_indices = []
+            for b in range(self.num_blocks):
+                block_edge_idx.append(sorted_edge_indices[offsets[b]:offsets[b+1]])
+
+                lp0 = b * block_size
+                lp1 = min(m_local, (b + 1) * block_size)
+                # perm[lp0:lp1] are local row ids; convert to global row ids
+                block_row_indices.append(perm[lp0:lp1] + row_start)
+
+            shard["block_edge_idx"] = block_edge_idx
+            shard["block_row_indices"] = block_row_indices
+
+    def __len__(self):
+        return self.num_blocks
+
+    def __getitem__(self, block_id: int):
+        bid = int(block_id)
+        # Return per-device block payloads
+        return [
+            (bid,
+             shard["block_edge_idx"][bid],
+             shard["block_row_indices"][bid],
+             shard["S_index"],
+             shard["S_value"])
+            for shard in self.shards
+        ]
+
+
+def get_sharded_ds(ds, devices, batch_block_ids):
+    shards_per_device = [[] for _ in range(len(devices))]
+    for di, shard in enumerate(ds.shards):
+        # shard-local tensors (already on correct device)
+        for bid in batch_block_ids:
+            bid = int(bid)
+            shards_per_device[di].append(
+                (bid,
+                    shard["block_edge_idx"][bid],
+                    shard["block_row_indices"][bid])
+            )
+    return shards_per_device
+
+
+### OLD: balanced sharded partition
+def nnz_balanced_row_spans(rows_cpu: torch.LongTensor, m: int, num_devices: int) -> List[Tuple[int, int]]:
+    """
+    Partition rows [0, m) into contiguous spans with approximately equal nnz per span.
+    rows_cpu: S_index[0] on CPU (shape: nnz,)
+    Returns list of (row_start, row_end) for each device, length=num_devices.
+    """
+    # nnz per row
+    row_nnz = torch.bincount(rows_cpu, minlength=m)          # (m,)
+    cum = torch.cumsum(row_nnz, dim=0)                       # (m,)
+    total = int(cum[-1].item()) if m > 0 else 0
+
+    # If matrix has no edges, fall back to equal row counts
+    if total == 0:
+        spans = []
+        base = m // num_devices
+        rem = m % num_devices
+        start = 0
+        for i in range(num_devices):
+            end = start + base + (1 if i < rem else 0)
+            spans.append((start, end))
+            start = end
+        return spans
+
+    # target cumulative nnz boundaries
+    # (avoid putting a cut at row 0 unless needed)
+    targets = [total * (i + 1) // num_devices for i in range(num_devices - 1)]
+    cuts = torch.searchsorted(cum, torch.tensor(targets, dtype=cum.dtype), right=False).tolist()
+
+    # ensure non-decreasing and within [0, m]
+    cuts = [max(0, min(m, int(c))) for c in cuts]
+    # enforce monotonicity
+    for i in range(1, len(cuts)):
+        if cuts[i] < cuts[i - 1]:
+            cuts[i] = cuts[i - 1]
+
+    # build spans
+    spans = []
+    start = 0
+    for c in cuts:
+        spans.append((start, c))
+        start = c
+    spans.append((start, m))
+    return spans

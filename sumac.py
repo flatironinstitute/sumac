@@ -15,8 +15,10 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 import pickle
 from typing import Tuple
+from concurrent.futures import ThreadPoolExecutor
 
-from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset
+from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset, \
+                            MultiGPUStochasticRowBlockDataset, get_sharded_ds
 from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
                             zero_replica_grads, compute_backward_on_device, sync_all, wait_streams_before_reduce, \
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
@@ -124,7 +126,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
                           muon_momentum=muon_momentum)
         ## NEW: for multi-gpus, scale batch blocks and lr automatically
         if torch.cuda.device_count() > 1:
-            cfg.batch_blocks = torch.cuda.device_count()
+            cfg.batch_blocks = torch.cuda.device_count() #max(torch.cuda.device_count() * 4, 8) #
             cfg.lr = cfg.lr * torch.cuda.device_count() * 0.75 #TODO: test / better heuristic 
         A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent)
     elif method == 'SALSA':
@@ -152,7 +154,6 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         pickle.dump(opts, open(f"{save_path}/opts.pkl", "wb"))
     print(f'finish for {max_iterate} iterations!')
 
-
 def GD_loop(
     S_index: torch.LongTensor,
     S_value: torch.Tensor,
@@ -162,101 +163,168 @@ def GD_loop(
     GD_latent: bool = False,
 ):
     torch.manual_seed(cfg.seed)
-    device = torch.device(cfg.device) 
-
-    # Move base data to master device first (replicas created later)
-    S_index = S_index.to(device)
-    S_value = S_value.to(device)
-
-    # Parameters on master
-    scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.d)
-    A = torch.nn.Parameter(torch.rand(m, cfg.d, device=device) * scale)
-    B = torch.nn.Parameter(torch.rand(n, cfg.d, device=device) * scale)
-    opt = make_optimizer(cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom,
-                         adam_betas=(cfg.adam_beta1, cfg.adam_beta2), adam_eps=cfg.adam_eps,
-                         muon_momentum=cfg.muon_momentum)
-
-    # DataLoader
-    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks) 
-    loader = DataLoader(
-        ds,
-        batch_size=cfg.batch_blocks,
-        shuffle=cfg.shuffle_blocks,
-        collate_fn=collate_blocks
-    )
+    base_device = torch.device(cfg.device)
 
     # Multi-GPU setup (manual DP, no DDP)
-    devices = select_devices(cfg, device)
+    devices = select_devices(cfg, base_device)
     master = devices[0]
-    if master != device:
-        # keep master consistent
-        A.data = A.data.to(master)
-        B.data = B.data.to(master)
-        S_index = S_index.to(master)
-        S_value = S_value.to(master)
 
-    A_devs, B_devs, S_index_devs, S_value_devs, streams = setup_replicas(A, B, S_index, S_value, devices)
+    # Keep S on CPU for sharding (avoid parking full S on master GPU)
+    S_index_cpu = S_index.detach().cpu()
+    S_value_cpu = S_value.detach().cpu()
+
+    # Parameters on master
+    torch.cuda.nvtx.range_push("Declare params and optimizer")
+    scale = 0.5 * math.sqrt(S_value_cpu.mean().item() / cfg.d)
+    A = torch.nn.Parameter(torch.rand(m, cfg.d, device=master) * scale)
+    B = torch.nn.Parameter(torch.rand(n, cfg.d, device=master) * scale)
+    opt = make_optimizer(
+        cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom,
+        adam_betas=(cfg.adam_beta1, cfg.adam_beta2), adam_eps=cfg.adam_eps,
+        muon_momentum=cfg.muon_momentum
+    )
+    torch.cuda.nvtx.range_pop()
+
+    # Dataset (row-sharded; each shard pinned to its device)
+    torch.cuda.nvtx.range_push("MultiGPUStochasticRowBlockDataset init")
+    ds = MultiGPUStochasticRowBlockDataset(S_index_cpu, S_value_cpu, m, cfg.num_blocks, devices)
+    torch.cuda.nvtx.range_pop()
+
+    # Replicate params
+    torch.cuda.nvtx.range_push("Multi-GPU setup replicas")
+    A_devs = []
+    B_devs = []
+    streams = []
+    for dev in devices:
+        streams.append(torch.cuda.Stream(device=dev))
+        if dev == master:
+            A_devs.append(A)
+            B_devs.append(B)
+        else:
+            A_devs.append(A.detach().to(dev).requires_grad_(True))
+            B_devs.append(B.detach().to(dev).requires_grad_(True))
+    # Per-device S tensors from dataset shards
+    S_index_devs = [sh["S_index"] for sh in ds.shards]
+    S_value_devs = [sh["S_value"] for sh in ds.shards]
+    torch.cuda.nvtx.range_pop()
+
 
     history = []
     t0 = time.time()
 
+    all_block_ids = list(range(cfg.num_blocks))
+    batch_blocks = int(cfg.batch_blocks)
+    # Use ThreadPoolExecutor for concurrent CPU dispatch [speedup]
+    executor = ThreadPoolExecutor(max_workers=len(devices))
+
     for epoch in range(1, cfg.epochs + 1):
-        total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
+        torch.cuda.nvtx.range_push(f"epoch: {epoch}")
+        # reshuffle within each local shard 
+        ds.reshuffle()
+        # Sync worker streams with default streams to ensure reshuffle is complete
+        for di, dev in enumerate(devices):
+            if streams[di] is not None:
+                streams[di].wait_stream(torch.cuda.default_stream(dev))
+
+        # Use per-device tensors for metric accumulation to avoid cross-device sync issues
+        total_loss_devs = [torch.tensor(0.0, device=d) for d in devices]
+        sumSr_devs = [torch.tensor(0.0, device=d) for d in devices]
+        num_jacc_devs = [torch.tensor(0.0, device=d) for d in devices]
+
         t_start = time.time()
 
-        for blocks in loader:
-            shards = shard_blocks(blocks, len(devices))
-            zero_replica_grads(opt, A_devs, B_devs)
+        # manual block order (CPU) 
+        if cfg.shuffle_blocks:
+            order = torch.randperm(cfg.num_blocks).tolist()
+            block_order = [all_block_ids[i] for i in order]
+        else:
+            block_order = all_block_ids
 
-            # compute+backward on each device
-            losses = []
-            sumSrs = []
-            numjs  = []
-            for di, dev in enumerate(devices):
-                loss_d, sumSr_d, numj_d = compute_backward_on_device(
-                    di, dev, shards[di],
-                    A_devs, B_devs, S_index_devs, S_value_devs,
-                    streams,
-                    cfg, m, n,
-                    GD_latent,
-                    block_loss_and_pred,
-                )
-                losses.append(loss_d)
-                sumSrs.append(sumSr_d)
-                numjs.append(numj_d)
-        
+        for k in range(0, cfg.num_blocks, batch_blocks):
+            torch.cuda.nvtx.range_push("shared blocks and zero grads")
+            batch_block_ids = block_order[k:k + batch_blocks]
+            # Build shards_per_device in the exact structure compute_backward_on_device expects:
+            # list over devices, each is list of block tuples.
+            shards_per_device = get_sharded_ds(ds, devices, batch_block_ids)
+            zero_replica_grads(opt, A_devs, B_devs)
+            torch.cuda.nvtx.range_pop()
+
+            # compute+backward on each device (parallel CPU thread [speedup])
+            torch.cuda.nvtx.range_push("compute_loss_and_grad")
+            def device_job(di, dev):
+                # Critical: Set the active device for the current thread
+                torch.cuda.set_device(dev)
+                # Each thread manages its own CUDA stream context
+                with torch.cuda.stream(streams[di]):
+                    loss_d, sumSr_d, numj_d = compute_backward_on_device(
+                        di, dev, shards_per_device[di],
+                        A_devs, B_devs, S_index_devs, S_value_devs,
+                        streams,
+                        cfg, m, n,
+                        GD_latent,
+                        block_loss_and_pred,
+                    )
+                    total_loss_devs[di].add_(loss_d.detach())
+                    sumSr_devs[di].add_(sumSr_d.detach())
+                    num_jacc_devs[di].add_(numj_d.detach())
+            
+            # Launch jobs concurrently to hide CPU-side launch overhead
+            futures = [executor.submit(device_job, di, dev) for di, dev in enumerate(devices)]
+            for f in futures:
+                f.result() # Wait for CPU-side dispatch to finish
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("wait streams and reduce to master")
             wait_streams_before_reduce(devices, streams)
-            # reduce grads to master and step on master
             reduce_grads_to_master(A, B, A_devs, B_devs, master, average=True)
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("apply post processing")
             apply_precondition(A, B, cfg, master)
             apply_clip_and_step(opt, A, B, cfg)
-            # broadcast updated params
+            torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("broadcast from master to device")
             broadcast_params_from_master(A, B, A_devs, B_devs, devices)
-
-            # logging accumulators (sum per-device scalars onto master)
-            total_loss += float(sum(ld.detach().to(master) for ld in losses).item())
-            sumSr      += float(sum(sd.detach().to(master) for sd in sumSrs).item())
-            num_jacc   += float(sum(nd.detach().to(master) for nd in numjs).item())
-
+            #  Ensure worker streams don't race ahead of broadcast copies (otherwise CUDA error with 3,4 devices)
+            for di, dev in enumerate(devices):
+                streams[di].wait_stream(torch.cuda.default_stream(dev))
+            torch.cuda.nvtx.range_pop()
+            
         time_step = time.time() - t_start
-        denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
+        # Sum across devices only at the end of the epoch
+        total_loss = sum(t.item() for t in total_loss_devs)
+        sumSr = sum(t.item() for t in sumSr_devs)
+        num_jacc = sum(t.item() for t in num_jacc_devs)
+
+        denom_jacc = float(torch.sum(S_value_cpu).item()) + sumSr - num_jacc
         jacc = 1.0 - num_jacc / denom_jacc
-        S_norm = float(torch.norm(S_value).item())
+        S_norm = float(torch.norm(S_value_cpu).item())
         rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
         log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
         print(log)
         history.append(log)
 
+        torch.cuda.nvtx.range_pop()
+    
+    executor.shutdown()
     total = time.time() - t0
     print(f"\nTotal elapsed time: {total:.2f} sec")
 
-    rmse, jacc, errZ = eval(A, B, S_index, S_value,
-                            m, n, num_blocks=cfg.num_blocks,
-                            full_block_loader=loader, device=A.device, errZ_obj=True)
+    # Eval: TODO (faster eval)
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks)
+    eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+    S_index_master = S_index_cpu.to(master, non_blocking=True)
+    S_value_master = S_value_cpu.to(master, non_blocking=True)
+
+    rmse, jacc, errZ = eval(
+        A, B, S_index_master, S_value_master,
+        m, n, num_blocks=cfg.num_blocks,
+        full_block_loader=eval_loader, device=A.device, errZ_obj=True
+    )
     print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
 
     return A.detach(), B.detach(), history
-
 
 def sumac_loop(S_index: torch.LongTensor,
                S_value: torch.Tensor,
