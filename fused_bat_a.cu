@@ -59,12 +59,11 @@ __device__ __forceinline__ void static_for(F&& f) {
   static_for_impl(std::make_integer_sequence<int, N>{}, (F&&)f);
 }
 
-
-template<int BK, int V>
+template<int BK, int V, int STAGES>
 __device__ __forceinline__ void issue_tile(
     cuda::pipeline<cuda::thread_scope_thread>& pipe,
-    float4 As4[2][BK][V],        
-    const float4* __restrict__ A4,        
+    float4 As4[STAGES][BK][V],
+    const float4* __restrict__ A4,
     int tid, int BM,
     int stage, int n0, int N,
     int D4_full)
@@ -78,26 +77,34 @@ __device__ __forceinline__ void issue_tile(
     float4* smem_ptr = &As4[stage][k][dv];
     if (n < N) {
       const float4* gmem_ptr = &A4[n * D4_full + dv];
-      cuda::memcpy_async(smem_ptr, gmem_ptr, cuda::aligned_size_t<16>(sizeof(float4)), pipe);
+      cuda::memcpy_async(
+          smem_ptr, gmem_ptr,
+          cuda::aligned_size_t<16>(sizeof(float4)),
+          pipe);
     } else {
-      *smem_ptr = make_float4(0.f,0.f,0.f,0.f);
+      *smem_ptr = make_float4(0.f, 0.f, 0.f, 0.f);
     }
   }
 }
 
 
-template<int BK, int V>
+
+template<int BK, int V, int STAGES>
 __global__ void relu_bat_a_fused_kernel(
     const float* __restrict__ A, 
     const float* __restrict__ B, 
     float* __restrict__ Y,       
     int N, int M, int D)
 {
+
+  static_assert(STAGES >= 2, "STAGES must be >= 2");
+
   const int BM  = (int)blockDim.x;
   const int tid = (int)threadIdx.x;
   const int m   = (int)(blockIdx.x * BM + tid);
+  
 
-  __shared__ alignas(16) float4 As4[2][BK][V];
+  __shared__ alignas(16) float4 As4[STAGES][BK][V];
 
   const float4* __restrict__ A4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(A, 16));
   const float4* __restrict__ B4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(B, 16));
@@ -115,20 +122,22 @@ __global__ void relu_bat_a_fused_kernel(
 
   auto pipe = cuda::make_pipeline();
 
-  pipe.producer_acquire();
-  issue_tile<BK, V>(pipe, As4, A4, tid, BM, 0, 0, N, D / 4);
-  pipe.producer_commit();
+  const int warm = (N + BK - 1) / BK;              
+  const int prefetch_tiles = (warm < STAGES) ? warm : STAGES;
 
-  if (BK < N) {
-    pipe.producer_acquire();
-    issue_tile<BK, V>(pipe, As4, A4, tid, BM, 1, BK, N, D / 4);
-    pipe.producer_commit();
+  for (int t = 0; t < STAGES; ++t) {
+    const int n0 = t * BK;
+    if (t < prefetch_tiles) {
+      pipe.producer_acquire();
+      issue_tile<BK, V, STAGES>(pipe, As4, A4, tid, BM, t, n0, N, D / 4);
+      pipe.producer_commit();
+    }
   }
   
-  for (int n0 = 0; n0 < N; n0 += BK) {
-    const int tile = n0 / BK;
-    const int cur_stage = tile & 1;
-    const int n_prefetch = n0 + 2 * BK;
+  for (int tile = 0, n0 = 0; n0 < N; ++tile, n0 += BK) {
+    
+    const int cur_stage = tile % STAGES;
+    const int n_prefetch = n0 + STAGES * BK;
 
     pipe.consumer_wait();
     __syncthreads();
@@ -146,12 +155,14 @@ __global__ void relu_bat_a_fused_kernel(
       }
 
       float acc0 = 0.f; float acc1 = 0.f;
-      static_for<V/2>([&](auto I) {
-        acc0 = dot_float4(b.template get<I>(), a0.template get<I>(), acc0);
-      });
-      static_for<V/2>([&](auto I) {
-        acc1 = dot_float4(b.template get<I+V/2>(), a0.template get<I+V/2>(), acc1);
-      });
+      {
+        static_for<V/2>([&](auto I) {
+          acc0 = dot_float4(b.template get<I>(), a0.template get<I>(), acc0);
+        });
+        static_for<V/2>([&](auto I) {
+          acc1 = dot_float4(b.template get<I+V/2>(), a0.template get<I+V/2>(), acc1);
+        });
+      }
       const float acc = fmaxf(acc0 + acc1, 0.f);
 
       static_for<V>([&](auto I) {
@@ -167,7 +178,7 @@ __global__ void relu_bat_a_fused_kernel(
 
     if (n_prefetch < N) {
       pipe.producer_acquire();
-      issue_tile<BK, V>(pipe, As4, A4, tid, BM, cur_stage, n_prefetch, N, D/4);
+      issue_tile<BK, V, STAGES>(pipe, As4, A4, tid, BM, cur_stage, n_prefetch, N, D/4);
       pipe.producer_commit();
     }
   }
@@ -179,8 +190,12 @@ __global__ void relu_bat_a_fused_kernel(
   }
 }
 
+// 4 Float4 Y's
+// 4 Float4 B's
+// 2x4 Float4 A's -> 4*4+4*4+2*4*4 = 64 registers minimum
 
-torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B) {
+
+torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM, int64_t BK, int64_t num_stages) {
   CHECK_CUDA(A); CHECK_CUDA(B);
   CHECK_F32(A);  CHECK_F32(B);
   CHECK_CONTIGUOUS(A);
@@ -195,16 +210,76 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B) {
 
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 
-  const int BM = 256;
   TORCH_CHECK(BM % 32 == 0, "BM must be multiple of 32");
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, BM));
   
-  relu_bat_a_fused_kernel<64,4><<<grid, block, 0>>>(
-      (const float*)A.data_ptr<float>(),
-      (const float*)B.data_ptr<float>(), 
-      (float*)Y.data_ptr<float>(),
-      N, M, D);
+  switch (num_stages) {
+    case 2:
+      switch (BK) {
+        case 16:
+          relu_bat_a_fused_kernel<16,4,2><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 32:
+          relu_bat_a_fused_kernel<32,4,2><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 64:
+          relu_bat_a_fused_kernel<64,4,2><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 128:
+          relu_bat_a_fused_kernel<128,4,2><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+    } break;
+    case 3:
+      switch (BK) {
+        case 16:
+          relu_bat_a_fused_kernel<16,4,3><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 32:
+          relu_bat_a_fused_kernel<32,4,3><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 64:
+          relu_bat_a_fused_kernel<64,4,3><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+        case 128:
+          relu_bat_a_fused_kernel<128,4,3><<<grid, block, 0>>>(
+          (const float*)A.data_ptr<float>(),
+          (const float*)B.data_ptr<float>(), 
+          (float*)Y.data_ptr<float>(),
+          N, M, D); 
+          break;
+    } break;
+  }
+  
+  
 
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));

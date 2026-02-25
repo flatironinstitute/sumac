@@ -242,19 +242,19 @@ def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
         return min(peak_TFLOP,(BW_GBs * FLOP_per_Byte)/1e3) #/1e3 to get to TFLOP/s
 
 @torch.no_grad()
-def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
+def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
 
     ref = torch_impl(A, B)
 
     out_triton = relu_bat_a_fused_triton(A, B)
-    out_cuda = relu_bat_a_fused_cuda(A,B)
+    out_cuda = relu_bat_a_fused_cuda(A,B, BM, BK, num_stages)
     err_triton = (out_triton - ref).abs().max().item()
     err_cuda = (out_cuda - ref).abs().max().item()
-    print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
-    print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
-    print(f"  cuda fused (1D)             max_abs_err vs torch: {err_cuda:.6e}")    
+    # print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
+    # print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
+    # print(f"  cuda fused (1D)             max_abs_err vs torch: {err_cuda:.6e}")    
     def torch_run():
         return torch_impl(A, B)
 
@@ -262,7 +262,7 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
         return relu_bat_a_fused_triton(A, B)
     
     def cuda_run():
-        return relu_bat_a_fused_cuda(A, B)
+        return relu_bat_a_fused_cuda(A, B, BM, BK, num_stages)
 
     torch.cuda.synchronize()
 
@@ -271,13 +271,12 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
     t_cuda = triton.testing.do_bench(cuda_run,  warmup=wm_iters, rep=iters)
 
     return {
-        "M": M, "N": N, "D": D, "dtype": str(dtype).replace("torch.", ""),
+        "BM": BM, "BK": BK, "num_stages": num_stages,
+        #"max_abs_err_triton":  float(err_triton),
 
-        "max_abs_err_triton":  float(err_triton),
-
-        "torch_ms":   float(t_torch),
-        "triton_ms":  float(t_triton),
-        "cuda_ms": float(t_cuda),
+        #"torch_ms":   float(t_torch),
+        #"triton_ms":  float(t_triton),
+        #"cuda_ms": float(t_cuda),
         "torch_TFLOPs":   float(ms_to_tflops(M, N, D, t_torch)),
         "triton_TFLOPs":  float(ms_to_tflops(M, N, D, t_triton)),
         "cuda_TFLOPs":   float(ms_to_tflops(M,N,D, t_cuda)),
@@ -310,7 +309,7 @@ def benchmark(M, N, D, dtype, provider, wm_iters=25, iters=200):
     elif provider == "triton":
         fn = lambda: relu_bat_a_fused_triton(A, B)
     elif provider == "cuda":
-        fn = lambda: relu_bat_a_fused_cuda(A, B)
+        fn = lambda: relu_bat_a_fused_cuda(A, B, 256, 64, 2)
     else:
         return perf_roofline(FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4), BW_GBs=960, peak_TFLOP=91.1)
     
@@ -333,8 +332,12 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    r = bench_one(M=139255, N=1392, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
+    for BM in [32, 64, 128, 128+32, 128+64, 128+96, 256, 512]:
+        for BK in [16, 32, 64, 128]:
+            for num_stages in [2, 3]:
+                r = bench_one(M=139255, N=1392, D=16, BM=BM, BK=BK, num_stages=num_stages, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+                print(r)
+
 
     if(args.sweep):
         df = benchmark.run(print_data=False, show_plots=True, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
