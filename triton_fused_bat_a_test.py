@@ -227,8 +227,8 @@ def benchmark_sweep(M, N, D, dtype, provider, wm_iters=25, iters=200):
     ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
     return ms_to_tflops(M, N, D, ms)
 
-Ms = [4096, 8192, 16384, 32768, 65536, 131072]
-Ds = [16, 32, 64]
+Ms = [65536*20]
+Ds = [4, 6, 8, 15, 16]
 x_vals = [(M, D) for M in Ms for D in Ds]
 
 @triton.testing.perf_report(
@@ -236,9 +236,9 @@ x_vals = [(M, D) for M in Ms for D in Ds]
         x_names=["M", "D"],
         x_vals=x_vals,
         line_arg="provider",
-        line_vals=["torch", "triton", "cuda"],
-        line_names=["Torch TFLOP/s", "Triton fused TFLOP/s", "CUDA fused TFLOP/s"],
-        styles=[("tab:blue", "-"), ("tab:orange", "-"), ("tab:green", "-")],
+        line_vals=["torch", "cuda"],
+        line_names=["Torch TFLOP/s", "CUDA fused TFLOP/s"],
+        styles=[("tab:blue", "-"), ("tab:green", "-")],
         ylabel="TFLOP/s",
         plot_name="relu_bat_a_fused_sweep_MD",
         args={"N": 1392, "dtype": torch.float32},
@@ -254,13 +254,11 @@ def benchmark_sweep_D(M, D, N, dtype, provider, wm_iters=25, iters=200):
         ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
         tflops = ms_to_tflops(M, N, D, ms)
 
-    elif provider == "triton":
-        fn = lambda: relu_bat_a_fused_triton(A, B)
-        ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
-        tflops = ms_to_tflops(M, N, D, ms)
-
     elif provider == "cuda":
-        fn = lambda: relu_bat_a_fused_cuda(A, B, 256, 64, 2)
+        if D < 15:
+            fn = lambda: relu_bat_a_fused_cuda(A, B, 512, 128, 2)
+        else:
+            fn = lambda: relu_bat_a_fused_cuda(A, B, 256, 64, 2)
         ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
         tflops = ms_to_tflops(M, N, D, ms)
 
@@ -282,11 +280,8 @@ def correctness_sweep_D(N, dtype):
 
             ref = torch_impl(A, B)
             out_cuda = relu_bat_a_fused_cuda(A, B, 256, 64, 2)
-            out_triton = relu_bat_a_fused_triton(A, B)
         
             err_cuda = (out_cuda - ref).abs().max().item()
-            err_triton = (out_triton - ref).abs().max().item()
-            print(f" D={D} triton fused max_abs_err: {err_triton:.6e}")
             print(f" D={D} cuda fused max_abs_err: {err_cuda:.6e}")  
 
 
@@ -316,7 +311,7 @@ if __name__ == "__main__":
         print(r)
 
     if args.minimal:
-        for D in [16, 32, 64]:
+        for D in [4, 5, 6, 8, 12, 13, 15, 16]:
             for BM in [128, 256, 512]:
                 for BK in [64, 128]:
                     for num_stages in [2, 3]:
@@ -349,7 +344,7 @@ if __name__ == "__main__":
         df = benchmark_sweep_D.run(print_data=False, show_plots=False, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
 
         print(df)
-        correctness_sweep_D(N=1392, dtype=torch.float32)
+        #correctness_sweep_D(N=1392, dtype=torch.float32)
 
 
 # Fused kernel traffic:
