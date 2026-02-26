@@ -16,114 +16,6 @@ pd.set_option('display.max_columns', None)
 
 D = 16
 
-#This cannot issue vectorized loads for some reason... LSU pipeline pressure kills perf
-@cuda.jit
-def relu_bat_a_fused_fp32_numba(A, B, Y, N):
-    
-    BM = cuda.blockDim.x
-    BK = 32  
-
-    
-    As = cuda.shared.array(shape=(32, D), dtype=float32)  # BK=32
-    m0 = cuda.blockIdx.x * BM
-    m = cuda.blockIdx.x * BM + cuda.threadIdx.x
-    M = B.shape[0]
-    Ys = cuda.shared.array((8, D, 32), float32)
-    
-    b0 = b1 = b2 = b3 = b4 = b5 = b6 = b7 = float32(0.0)
-    b8 = b9 = b10 = b11 = b12 = b13 = b14 = b15 = float32(0.0)
-    if m < M:
-        b0  = B[m, 0];  b1  = B[m, 1];  b2  = B[m, 2];  b3  = B[m, 3]
-        b4  = B[m, 4];  b5  = B[m, 5];  b6  = B[m, 6];  b7  = B[m, 7]
-        b8  = B[m, 8];  b9  = B[m, 9];  b10 = B[m,10];  b11 = B[m,11]
-        b12 = B[m,12];  b13 = B[m,13];  b14 = B[m,14];  b15 = B[m,15]
-
-    
-    y0 = y1 = y2 = y3 = y4 = y5 = y6 = y7 = float32(0.0)
-    y8 = y9 = y10 = y11 = y12 = y13 = y14 = y15 = float32(0.0)
-
-    tid = cuda.threadIdx.x
-    warp = tid >> 5                         
-    lane = tid & 31   
-
-    n0 = 0
-    while n0 < N:
-        idx = tid
-        while idx < BK * D:
-            k = idx // D
-            d = idx - k * D
-            n = n0 + k
-            As[k, d] = A[n, d] if n < N else 0.0
-            idx += BM
-
-        cuda.syncthreads()
-
-        k = 0
-        while k < BK:
-            acc = float32(0.0)
-            acc = cuda.fma(b0,  As[k, 0],  acc); acc = cuda.fma(b1,  As[k, 1],  acc)
-            acc = cuda.fma(b2,  As[k, 2],  acc); acc = cuda.fma(b3,  As[k, 3],  acc)
-            acc = cuda.fma(b4,  As[k, 4],  acc); acc = cuda.fma(b5,  As[k, 5],  acc)
-            acc = cuda.fma(b6,  As[k, 6],  acc); acc = cuda.fma(b7,  As[k, 7],  acc)
-            acc = cuda.fma(b8,  As[k, 8],  acc); acc = cuda.fma(b9,  As[k, 9],  acc)
-            acc = cuda.fma(b10, As[k,10],  acc); acc = cuda.fma(b11, As[k,11],  acc)
-            acc = cuda.fma(b12, As[k,12],  acc); acc = cuda.fma(b13, As[k,13],  acc)
-            acc = cuda.fma(b14, As[k,14],  acc); acc = cuda.fma(b15, As[k,15],  acc)
-
-            # ReLU
-            if acc < float32(0.0):
-                acc = float32(0.0)
-
-            y0  = cuda.fma(acc, As[k, 0],  y0);   y1  = cuda.fma(acc, As[k, 1],  y1)
-            y2  = cuda.fma(acc, As[k, 2],  y2);   y3  = cuda.fma(acc, As[k, 3],  y3)
-            y4  = cuda.fma(acc, As[k, 4],  y4);   y5  = cuda.fma(acc, As[k, 5],  y5)
-            y6  = cuda.fma(acc, As[k, 6],  y6);   y7  = cuda.fma(acc, As[k, 7],  y7)
-            y8  = cuda.fma(acc, As[k, 8],  y8);   y9  = cuda.fma(acc, As[k, 9],  y9)
-            y10 = cuda.fma(acc, As[k,10],  y10);  y11 = cuda.fma(acc, As[k,11],  y11)
-            y12 = cuda.fma(acc, As[k,12],  y12);  y13 = cuda.fma(acc, As[k,13],  y13)
-            y14 = cuda.fma(acc, As[k,14],  y14);  y15 = cuda.fma(acc, As[k,15],  y15)
-
-            k += 1
-
-        cuda.syncthreads()
-        n0 += BK
-
-        Ys[warp, 0, lane]  = y0;  Ys[warp, 1, lane]  = y1;  Ys[warp, 2, lane]  = y2;  Ys[warp,  3, lane]  = y3
-        Ys[warp, 4, lane]  = y4;  Ys[warp, 5, lane]  = y5;  Ys[warp, 6, lane]  = y6;  Ys[warp,  7, lane]  = y7
-        Ys[warp, 8, lane]  = y8;  Ys[warp, 9, lane]  = y9;  Ys[warp,10, lane]  = y10; Ys[warp, 11, lane]  = y11
-        Ys[warp,12, lane]  = y12; Ys[warp,13, lane]  = y13; Ys[warp,14, lane]  = y14; Ys[warp, 15, lane]  = y15
-
-        cuda.syncthreads()
-    
-    base_row = m0 + warp * 32
-    if lane < 16:
-        d = lane
-        for r in range(16):
-            mr = base_row + r
-            if mr < M:
-                Y[mr, d] = Ys[warp, d, r]
-    else:
-        d = lane - 16
-        for r in range(16, 32):
-            mr = base_row + r
-            if mr < M:
-                Y[mr, d] = Ys[warp, d, r]
-
-def relu_bat_a_numba(A_torch, B_torch, BM=128):
-    assert A_torch.is_cuda and B_torch.is_cuda
-    assert A_torch.dtype == torch.float32 and B_torch.dtype == torch.float32
-    assert A_torch.is_contiguous() and B_torch.is_contiguous()
-    assert A_torch.shape[1] == 16 and B_torch.shape[1] == 16
-
-    A = cp.from_dlpack(torch.utils.dlpack.to_dlpack(A_torch))
-    B = cp.from_dlpack(torch.utils.dlpack.to_dlpack(B_torch))
-    Y = cp.empty((B.shape[0], 16), dtype=cp.float32)
-
-    grid = ((B.shape[0] + BM - 1) // BM,)
-    block = (BM,)
-    relu_bat_a_fused_fp32_numba[grid, block](A, B, Y, np.int32(A.shape[0]))
-    return torch.utils.dlpack.from_dlpack(Y.toDlpack())
-
 @triton.jit
 def round_f32_to_tf32_rn(x):
     # Round-to-nearest-even to TF32 precision by rounding FP32 mantissa
@@ -136,10 +28,10 @@ def round_f32_to_tf32_rn(x):
 @triton.autotune(
 configs=[
         triton.Config({"BM": 16*m, "BN": 16*n}, num_warps=w, num_stages=s)
-        for m in [2, 4]
-        for n in [2, 4]
-        for w in [1]
-        for s in [1]
+        for m in [2, 4, 8]
+        for n in [2, 4, 8]
+        for w in [1, 2, 4]
+        for s in [1, 2, 3]
     ],
     key=["M", "N", "D"],
     cache_results=True
@@ -252,9 +144,9 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
     out_cuda = relu_bat_a_fused_cuda(A,B, BM, BK, num_stages)
     err_triton = (out_triton - ref).abs().max().item()
     err_cuda = (out_cuda - ref).abs().max().item()
-    # print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
-    # print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
-    # print(f"  cuda fused (1D)             max_abs_err vs torch: {err_cuda:.6e}")    
+    print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
+    print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
+    print(f"  cuda fused (1D)             max_abs_err vs torch: {err_cuda:.6e}")    
     def torch_run():
         return torch_impl(A, B)
 
@@ -274,9 +166,9 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
         "BM": BM, "BK": BK, "num_stages": num_stages,
         #"max_abs_err_triton":  float(err_triton),
 
-        #"torch_ms":   float(t_torch),
-        #"triton_ms":  float(t_triton),
-        #"cuda_ms": float(t_cuda),
+        "torch_ms":   float(t_torch),
+        "triton_ms":  float(t_triton),
+        "cuda_ms": float(t_cuda),
         "torch_TFLOPs":   float(ms_to_tflops(M, N, D, t_torch)),
         "triton_TFLOPs":  float(ms_to_tflops(M, N, D, t_triton)),
         "cuda_TFLOPs":   float(ms_to_tflops(M,N,D, t_cuda)),
@@ -284,6 +176,24 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
         "speedup_cuda":   float(t_torch/t_cuda),
     }
 
+
+@torch.no_grad()
+def bench_minimal(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
+    A = torch.randn((N, D), device=device, dtype=dtype)
+    B = torch.randn((M, D), device=device, dtype=dtype)
+    
+    def cuda_run():
+        return relu_bat_a_fused_cuda(A, B, BM, BK, num_stages)
+
+    torch.cuda.synchronize()
+
+    t_cuda = triton.testing.do_bench(cuda_run,  warmup=wm_iters, rep=iters)
+
+    return {
+        "BM": BM, "BK": BK, "D": D,"num_stages": num_stages,
+        "ms": float(t_cuda),
+        "TFLOPs":   float(ms_to_tflops(M,N,D, t_cuda)),
+    }
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -298,7 +208,7 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
         args={"N": 1392, "D": 16, "dtype": torch.float32},
     )
 )
-def benchmark(M, N, D, dtype, provider, wm_iters=25, iters=200):
+def benchmark_sweep(M, N, D, dtype, provider, wm_iters=25, iters=200):
    
     device = "cuda"
     A = torch.randn((N, D), device=device, dtype=dtype)
@@ -317,6 +227,68 @@ def benchmark(M, N, D, dtype, provider, wm_iters=25, iters=200):
     ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
     return ms_to_tflops(M, N, D, ms)
 
+Ms = [4096, 8192, 16384, 32768, 65536, 131072]
+Ds = [16, 32, 64]
+x_vals = [(M, D) for M in Ms for D in Ds]
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["M", "D"],
+        x_vals=x_vals,
+        line_arg="provider",
+        line_vals=["torch", "triton", "cuda"],
+        line_names=["Torch TFLOP/s", "Triton fused TFLOP/s", "CUDA fused TFLOP/s"],
+        styles=[("tab:blue", "-"), ("tab:orange", "-"), ("tab:green", "-")],
+        ylabel="TFLOP/s",
+        plot_name="relu_bat_a_fused_sweep_MD",
+        args={"N": 1392, "dtype": torch.float32},
+    )
+)
+def benchmark_sweep_D(M, D, N, dtype, provider, wm_iters=25, iters=200):
+    device = "cuda"
+    A = torch.randn((N, D), device=device, dtype=dtype)
+    B = torch.randn((M, D), device=device, dtype=dtype)
+
+    if provider == "torch":
+        fn = lambda: torch_impl(A, B)
+        ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
+        tflops = ms_to_tflops(M, N, D, ms)
+
+    elif provider == "triton":
+        fn = lambda: relu_bat_a_fused_triton(A, B)
+        ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
+        tflops = ms_to_tflops(M, N, D, ms)
+
+    elif provider == "cuda":
+        fn = lambda: relu_bat_a_fused_cuda(A, B, 256, 64, 2)
+        ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
+        tflops = ms_to_tflops(M, N, D, ms)
+
+    else:  
+        tflops = perf_roofline(
+            FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4),
+            BW_GBs=960,
+            peak_TFLOP=91.1,
+        )
+
+    return tflops
+
+def correctness_sweep_D(N, dtype):
+    device="cuda"
+    for M in Ms:
+        for D in Ds:
+            A = torch.randn((N,D), device=device, dtype=dtype)
+            B = torch.randn((M,D), device=device, dtype=dtype)
+
+            ref = torch_impl(A, B)
+            out_cuda = relu_bat_a_fused_cuda(A, B, 256, 64, 2)
+            out_triton = relu_bat_a_fused_triton(A, B)
+        
+            err_cuda = (out_cuda - ref).abs().max().item()
+            err_triton = (out_triton - ref).abs().max().item()
+            print(f" D={D} triton fused max_abs_err: {err_triton:.6e}")
+            print(f" D={D} cuda fused max_abs_err: {err_cuda:.6e}")  
+
 
 if __name__ == "__main__":
 
@@ -325,22 +297,34 @@ if __name__ == "__main__":
                         help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=200,
                         help="Number of benchmark iterations")
-    parser.add_argument("--sweep", action='store_true', default=False)
+    parser.add_argument("--minimal", action='store_true', default=False, help="Benchmark cuda kernel implementation")
+    parser.add_argument("--relative", action='store_true', default=False, help="Benchmark pytorch, triton and cuda kernel implementations")
+    parser.add_argument("--sweep_M", action='store_true', default=False, help="Benchmark pytorch, triton and cuda kernel implementations across a range of M")
+    parser.add_argument("--sweep_D", action='store_true', default=False, help="Benchmark pytorch, triton and cuda kernel implementations across a range of D")
+
 
     args = parser.parse_args()
 
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    for BM in [32, 64, 128, 128+32, 128+64, 128+96, 256, 512]:
-        for BK in [16, 32, 64, 128]:
-            for num_stages in [2, 3]:
-                r = bench_one(M=139255, N=1392, D=16, BM=BM, BK=BK, num_stages=num_stages, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-                print(r)
+    if not args.minimal and not args.relative and not args.sweep_M and not args.sweep_D:
+        print("Please pick at least one benchmarking mode. See --help for available options.")
 
+    if args.relative:
+        r = bench_one(M=139255, N=1392, D=16, BM=256, BK=64, num_stages=2, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+        print(r)
 
-    if(args.sweep):
-        df = benchmark.run(print_data=False, show_plots=True, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
+    if args.minimal:
+        for D in [16, 32, 64]:
+            for BM in [128, 256, 512]:
+                for BK in [64, 128]:
+                    for num_stages in [2, 3]:
+                        r = bench_minimal(M=139255, N=1392, D=D, BM=BM, BK=BK, num_stages=num_stages, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+                        print(r)
+
+    if args.sweep_M:
+        df = benchmark_sweep.run(print_data=False, show_plots=True, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
 
         FPB_fused = lambda M: flop_per_byte_fused(M=M, N=1392, D=16,wordsize=4) 
         FPB_2kernel = lambda M: flop_per_byte_2kernels(M=M, N=1392, D=16, wordsize=4)
@@ -360,6 +344,12 @@ if __name__ == "__main__":
         df["CUDA % peak achieved"] = df["CUDA fused TFLOP/s"]/df["Triton fused DRAM roofline TFLOP/s"]*100
 
         print(df)
+
+    if args.sweep_D:
+        df = benchmark_sweep_D.run(print_data=False, show_plots=False, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
+
+        print(df)
+        correctness_sweep_D(N=1392, dtype=torch.float32)
 
 
 # Fused kernel traffic:

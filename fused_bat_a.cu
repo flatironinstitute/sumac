@@ -155,12 +155,14 @@ __global__ void relu_bat_a_fused_kernel(
       }
 
       float acc0 = 0.f; float acc1 = 0.f;
-      {
-        static_for<V/2>([&](auto I) {
+      { 
+        constexpr int V0 = (V + 1) / 2;   
+        constexpr int V1 = V - V0;      
+        static_for<V0>([&](auto I) {
           acc0 = dot_float4(b.template get<I>(), a0.template get<I>(), acc0);
         });
-        static_for<V/2>([&](auto I) {
-          acc1 = dot_float4(b.template get<I+V/2>(), a0.template get<I+V/2>(), acc1);
+        static_for<V1>([&](auto I) {
+          acc1 = dot_float4(b.template get<I+V0>(), a0.template get<I+V0>(), acc1);
         });
       }
       const float acc = fmaxf(acc0 + acc1, 0.f);
@@ -195,6 +197,84 @@ __global__ void relu_bat_a_fused_kernel(
 // 2x4 Float4 A's -> 4*4+4*4+2*4*4 = 64 registers minimum
 
 
+template<int BK, int V, int STAGES>
+inline void launch_relu_bat_a_fused(
+    dim3 grid, dim3 block,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  relu_bat_a_fused_kernel<BK, V, STAGES><<<grid, block, 0>>>(
+      (const float*)A.data_ptr<float>(),
+      (const float*)B.data_ptr<float>(),
+      (float*)Y.data_ptr<float>(),
+      N, M, D);
+}
+
+template<int V, int STAGES>
+inline void dispatch_bk(
+    int BK,
+    dim3 grid, dim3 block,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  switch (BK) {
+    case 16:  return launch_relu_bat_a_fused<16,  V, STAGES>(grid, block, A, B, Y, N, M, D);
+    case 32:  return launch_relu_bat_a_fused<32,  V, STAGES>(grid, block, A, B, Y, N, M, D);
+    case 64:  return launch_relu_bat_a_fused<64,  V, STAGES>(grid, block, A, B, Y, N, M, D);
+    case 128: return launch_relu_bat_a_fused<128, V, STAGES>(grid, block, A, B, Y, N, M, D);
+    default:
+      TORCH_CHECK(false, "Unsupported BK=", BK, " (expected 16/32/64/128)");
+  }
+}
+
+template<int V>
+inline void dispatch_stages(
+    int num_stages,
+    int BK,
+    dim3 grid, dim3 block,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  switch (num_stages) {
+    case 2: return dispatch_bk<V, 2>(BK, grid, block, A, B, Y, N, M, D);
+    case 3: return dispatch_bk<V, 3>(BK, grid, block, A, B, Y, N, M, D);
+    default:
+      TORCH_CHECK(false, "Unsupported num_stages=", num_stages, " (expected 2 or 3)");
+  }
+}
+
+inline void dispatch_v(
+    int V_runtime,
+    int num_stages,
+    int BK,
+    dim3 grid, dim3 block,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  switch (V_runtime) {
+    case 1:  return dispatch_stages<1>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 2:  return dispatch_stages<2>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 3:  return dispatch_stages<3>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 4:  return dispatch_stages<4>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 5:  return dispatch_stages<5>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 6:  return dispatch_stages<6>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 7:  return dispatch_stages<7>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 8:  return dispatch_stages<8>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 16:  return dispatch_stages<16>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    default:
+      TORCH_CHECK(false, "Unsupported V=", V_runtime);
+  }
+} 
+  
+
 torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM, int64_t BK, int64_t num_stages) {
   CHECK_CUDA(A); CHECK_CUDA(B);
   CHECK_F32(A);  CHECK_F32(B);
@@ -207,79 +287,14 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM
   const int N = (int)A.size(0);
   const int M = (int)B.size(0);
   const int D = (int)A.size(1);
-
+  const int V = D / 4;
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 
   TORCH_CHECK(BM % 32 == 0, "BM must be multiple of 32");
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, BM));
-  
-  switch (num_stages) {
-    case 2:
-      switch (BK) {
-        case 16:
-          relu_bat_a_fused_kernel<16,4,2><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 32:
-          relu_bat_a_fused_kernel<32,4,2><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 64:
-          relu_bat_a_fused_kernel<64,4,2><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 128:
-          relu_bat_a_fused_kernel<128,4,2><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-    } break;
-    case 3:
-      switch (BK) {
-        case 16:
-          relu_bat_a_fused_kernel<16,4,3><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 32:
-          relu_bat_a_fused_kernel<32,4,3><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 64:
-          relu_bat_a_fused_kernel<64,4,3><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-        case 128:
-          relu_bat_a_fused_kernel<128,4,3><<<grid, block, 0>>>(
-          (const float*)A.data_ptr<float>(),
-          (const float*)B.data_ptr<float>(), 
-          (float*)Y.data_ptr<float>(),
-          N, M, D); 
-          break;
-    } break;
-  }
-  
-  
+
+  dispatch_v(V, num_stages, BK, grid, block, A, B, Y, N, M, D);
 
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
