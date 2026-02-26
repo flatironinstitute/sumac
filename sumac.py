@@ -32,7 +32,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
           mom=0.7, method='GD', lr=1e-1, factor_init=False,
           save_path=None, GD_latent=False, optim="adam", precondition=False,
           adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, muon_momentum=0.95,
-          multi_gpu=True):
+          multi_gpu=True, A_init=None, B_init=None):
     """
     PyTorch version of sumac algorithm driver function.
 
@@ -50,6 +50,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
       precondition: default False. If true, precondition the gradient of factors by A.grad = A.grad @ (B^T B)^{-1}
       optimizer args: adam_, muon_
       multi_gpu: If true, launch multiple streams, each per device
+      A_init, B_init: allow user-specified factor initialization
     Saved Artifacts:
       A, B    : factors (torch.Tensors)
       costs   : list or tensor of cost history
@@ -128,11 +129,11 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         if torch.cuda.device_count() > 1:
             cfg.batch_blocks = torch.cuda.device_count() #max(torch.cuda.device_count() * 4, 8) #
             cfg.lr = cfg.lr * torch.cuda.device_count() * 0.75 #TODO: test / better heuristic 
-        A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent)
+        A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent, A_init, B_init)
     elif method == 'SALSA':
-        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
+        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag, A_init, B_init)
     elif method == 'ALS':
-        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
+        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag, A_init, B_init)
     else:
         raise NotImplementedError("method must be chosen from GD_ or SALSA or ALS")
 
@@ -153,6 +154,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         pickle.dump(costs, open(f"{save_path}/cost.pkl", "wb"))
         pickle.dump(opts, open(f"{save_path}/opts.pkl", "wb"))
     print(f'finish for {max_iterate} iterations!')
+    return A_ori, B_ori, costs
 
 def GD_loop(
     S_index: torch.LongTensor,
@@ -161,6 +163,8 @@ def GD_loop(
     n: int,
     cfg: TrainConfig,
     GD_latent: bool = False,
+    A_init: torch.Tensor = None,
+    B_init: torch.Tensor = None
 ):
     torch.manual_seed(cfg.seed)
     base_device = torch.device(cfg.device)
@@ -175,9 +179,13 @@ def GD_loop(
 
     # Parameters on master
     torch.cuda.nvtx.range_push("Declare params and optimizer")
-    scale = 0.5 * math.sqrt(S_value_cpu.mean().item() / cfg.d)
-    A = torch.nn.Parameter(torch.rand(m, cfg.d, device=master) * scale)
-    B = torch.nn.Parameter(torch.rand(n, cfg.d, device=master) * scale)
+    if A_init is None or B_init is None:
+        scale = 0.5 * math.sqrt(S_value_cpu.mean().item() / cfg.d)
+        A = torch.nn.Parameter(torch.rand(m, cfg.d, device=master) * scale)
+        B = torch.nn.Parameter(torch.rand(n, cfg.d, device=master) * scale)
+    else:
+        A = torch.nn.Parameter(A_init.to(master))
+        B = torch.nn.Parameter(B_init.to(master))
     opt = make_optimizer(
         cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom,
         adam_betas=(cfg.adam_beta1, cfg.adam_beta2), adam_eps=cfg.adam_eps,
@@ -268,10 +276,20 @@ def GD_loop(
                     sumSr_devs[di].add_(sumSr_d.detach())
                     num_jacc_devs[di].add_(numj_d.detach())
             
-            # Launch jobs concurrently to hide CPU-side launch overhead
-            futures = [executor.submit(device_job, di, dev) for di, dev in enumerate(devices)]
-            for f in futures:
-                f.result() # Wait for CPU-side dispatch to finish
+            # Launch jobs concurrently; use a sequential warm-up for the first device
+            # on the first batch to avoid torch.compile threading race conditions.
+            if epoch == 1 and k == 0:
+                # Run the first device job sequentially to trigger compilation/autotuning
+                device_job(0, devices[0])
+                # Then run the remaining devices in parallel
+                futures = [executor.submit(device_job, di, dev) for di, dev in enumerate(devices[1:], 1)]
+                for f in futures:
+                    f.result()
+            else:
+                # Normal parallel dispatch for all other batches
+                futures = [executor.submit(device_job, di, dev) for di, dev in enumerate(devices)]
+                for f in futures:
+                    f.result()
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("wait streams and reduce to master")
@@ -332,7 +350,9 @@ def sumac_loop(S_index: torch.LongTensor,
                n: int,
                d: int,
                opts: dict,
-               test_flag: bool = False):
+               test_flag: bool = False,
+               A_init: torch.Tensor = None,
+               B_init: torch.Tensor = None):
     """
     ALS subroutine to solve the nonlinear low-rank factorization
     S \approx max(0, A B^T) where A is of shape (m, r), B is of shape (n, r)
@@ -354,7 +374,10 @@ def sumac_loop(S_index: torch.LongTensor,
     # 3) initialize A, B and set up blocks
     random.seed(opts['seed'])
     torch.manual_seed(opts['seed'])
-    A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+    if A_init is None or B_init is None:
+        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+    else:
+        A, B = A_init, B_init
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
     num_blocks = opts['num_blocks']
@@ -416,7 +439,9 @@ def sumac_loop(S_index: torch.LongTensor,
     return A, B, costs
 
 
-def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
+def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False,
+               A_init: torch.Tensor = None,
+               B_init: torch.Tensor = None):
     """
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
@@ -428,8 +453,10 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     # Initialization using sumac helper
     random.seed(opts['seed'])
     torch.manual_seed(opts['seed'])
-    A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
-
+    if  A_init is None or B_init is None:
+        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+    else:
+        A, B = A_init, B_init
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
 

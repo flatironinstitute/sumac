@@ -56,8 +56,8 @@ class StochasticRowBlockDataset(Dataset):
     """
     def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
                  m: int, num_blocks: int):
-        self.S_index = S_index #.detach().cpu() #NEW: force CPU
-        self.S_value = S_value # .detach().cpu() #NEW: force CPU
+        self.S_index = S_index.detach().cpu() #NEW: force CPU
+        self.S_value = S_value.detach().cpu() #NEW: force CPU
         self.m = m
         self.num_blocks = num_blocks
         
@@ -79,7 +79,7 @@ class StochasticRowBlockDataset(Dataset):
         Vectorized reshuffle: Re-partitions rows into blocks in a single go.
         """
         # 1. Randomly permute rows
-        dev = self.S_value.device # NEW - change default to cpu torch.device("cpu") # 
+        dev = torch.device("cpu") # self.S_value.device # NEW - change default to cpu  # 
         perm = torch.randperm(self.m, device=dev)
         perm_inv = torch.empty_like(perm)
         perm_inv[perm] = torch.arange(self.m)
