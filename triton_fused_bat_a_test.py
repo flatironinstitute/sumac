@@ -227,7 +227,7 @@ def benchmark_sweep(M, N, D, dtype, provider, wm_iters=25, iters=200):
     ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
     return ms_to_tflops(M, N, D, ms)
 
-Ms = [65536*20]
+Ms = [65536]
 Ds = [4, 6, 8, 15, 16]
 x_vals = [(M, D) for M in Ms for D in Ds]
 

@@ -2,6 +2,8 @@
 #include <cuda/pipeline>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <utility>
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
@@ -322,11 +324,14 @@ __global__ void relu_bat_a_fused_kernel_mixed(
   const int tid = (int)threadIdx.x;
   const int m   = (int)(blockIdx.x * BM + tid);
 
-  
   using Smem =
-    std::conditional_t<R==1, SharedTileR1<V,STAGES,BK>,
-    std::conditional_t<R==2, SharedTileR2<V,STAGES,BK>,
-                       SharedTileR3<V,STAGES,BK>>>>;
+  typename std::conditional<(R == 1),
+    SharedTileR1<V, STAGES, BK>,
+    typename std::conditional<(R == 2),
+      SharedTileR2<V, STAGES, BK>,
+      SharedTileR3<V, STAGES, BK>
+    >::type
+  >::type;
 
   __shared__ Smem smem;
 
@@ -433,13 +438,13 @@ __global__ void relu_bat_a_fused_kernel_mixed(
 
 template<int BK, int V, int STAGES>
 inline void launch_relu_bat_a_fused(
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M, int D)
 {
-  relu_bat_a_fused_kernel_float4<BK, V, STAGES><<<grid, block, 0>>>(
+  relu_bat_a_fused_kernel_float4<BK, V, STAGES> <<<grid, block, 0, stream>>>(
       (const float*)A.data_ptr<float>(),
       (const float*)B.data_ptr<float>(),
       (float*)Y.data_ptr<float>(),
@@ -448,13 +453,13 @@ inline void launch_relu_bat_a_fused(
 
 template<int BK, int V, int STAGES, int R>
 inline void launch_relu_bat_a_fused_r(
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M)
 {
-  relu_bat_a_fused_kernel_mixed<BK, V, STAGES, R><<<grid, block, 0>>>(
+  relu_bat_a_fused_kernel_mixed<BK, V, STAGES, R> <<<grid, block, 0, stream>>>(
       (const float*)A.data_ptr<float>(),
       (const float*)B.data_ptr<float>(),
       (float*)Y.data_ptr<float>(),
@@ -464,17 +469,17 @@ inline void launch_relu_bat_a_fused_r(
 template<int V, int STAGES>
 inline void dispatch_bk(
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M, int D)
 {
   switch (BK) {
-    case 16:  return launch_relu_bat_a_fused<16,  V, STAGES>(grid, block, A, B, Y, N, M, D);
-    case 32:  return launch_relu_bat_a_fused<32,  V, STAGES>(grid, block, A, B, Y, N, M, D);
-    case 64:  return launch_relu_bat_a_fused<64,  V, STAGES>(grid, block, A, B, Y, N, M, D);
-    case 128: return launch_relu_bat_a_fused<128, V, STAGES>(grid, block, A, B, Y, N, M, D);
+    case 16:  return launch_relu_bat_a_fused<16,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
+    case 32:  return launch_relu_bat_a_fused<32,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
+    case 64:  return launch_relu_bat_a_fused<64,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
+    case 128: return launch_relu_bat_a_fused<128, V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
     default:
       TORCH_CHECK(false, "Unsupported BK=", BK, " (expected 16/32/64/128)");
   }
@@ -484,15 +489,15 @@ template<int V>
 inline void dispatch_stages(
     int num_stages,
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M, int D)
 {
   switch (num_stages) {
-    case 2: return dispatch_bk<V, 2>(BK, grid, block, A, B, Y, N, M, D);
-    case 3: return dispatch_bk<V, 3>(BK, grid, block, A, B, Y, N, M, D);
+    case 2: return dispatch_bk<V, 2>(BK, grid, block, stream, A, B, Y, N, M, D);
+    case 3: return dispatch_bk<V, 3>(BK, grid, block, stream, A, B, Y, N, M, D);
     default:
       TORCH_CHECK(false, "Unsupported num_stages=", num_stages, " (expected 2 or 3)");
   }
@@ -501,17 +506,17 @@ inline void dispatch_stages(
 template<int V, int STAGES, int R>
 inline void dispatch_bk_r(
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M)
 {
   switch (BK) {
-    case 16:  return launch_relu_bat_a_fused_r<16,  V, STAGES, R>(grid, block, A, B, Y, N, M);
-    case 32:  return launch_relu_bat_a_fused_r<32,  V, STAGES, R>(grid, block, A, B, Y, N, M);
-    case 64:  return launch_relu_bat_a_fused_r<64,  V, STAGES, R>(grid, block, A, B, Y, N, M);
-    case 128: return launch_relu_bat_a_fused_r<128, V, STAGES, R>(grid, block, A, B, Y, N, M);
+    case 16:  return launch_relu_bat_a_fused_r<16,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
+    case 32:  return launch_relu_bat_a_fused_r<32,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
+    case 64:  return launch_relu_bat_a_fused_r<64,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
+    case 128: return launch_relu_bat_a_fused_r<128, V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
     default:
       TORCH_CHECK(false, "Unsupported BK=", BK, " (expected 16/32/64/128)");
   }
@@ -521,15 +526,15 @@ template<int V, int R>
 inline void dispatch_stages_r(
     int num_stages,
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M)
 {
   switch (num_stages) {
-    case 2: return dispatch_bk_r<V, 2, R>(BK, grid, block, A, B, Y, N, M);
-    case 3: return dispatch_bk_r<V, 3, R>(BK, grid, block, A, B, Y, N, M);
+    case 2: return dispatch_bk_r<V, 2, R>(BK, grid, block, stream, A, B, Y, N, M);
+    case 3: return dispatch_bk_r<V, 3, R>(BK, grid, block, stream, A, B, Y, N, M);
     default:
       TORCH_CHECK(false, "Unsupported num_stages=", num_stages, " (expected 2 or 3)");
   }
@@ -541,22 +546,22 @@ inline void dispatch_v(
     int V_runtime,
     int num_stages,
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M, int D)
 {
   switch (V_runtime) {
-    case 1:  return dispatch_stages<1>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    case 2:  return dispatch_stages<2>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    case 3:  return dispatch_stages<3>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    case 4:  return dispatch_stages<4>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    // case 5:  return dispatch_stages<5>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    // case 6:  return dispatch_stages<6>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    // case 7:  return dispatch_stages<7>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    // case 8:  return dispatch_stages<8>(num_stages, BK, grid, block, A, B, Y, N, M, D);
-    // case 16:  return dispatch_stages<16>(num_stages, BK, grid, block, A, B, Y, N, M, D);
+    case 1:  return dispatch_stages<1>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    case 2:  return dispatch_stages<2>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    case 3:  return dispatch_stages<3>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    case 4:  return dispatch_stages<4>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    // case 5:  return dispatch_stages<5>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    // case 6:  return dispatch_stages<6>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    // case 7:  return dispatch_stages<7>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    // case 8:  return dispatch_stages<8>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    // case 16:  return dispatch_stages<16>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
     default:
       TORCH_CHECK(false, "Unsupported V=", V_runtime);
   }
@@ -567,17 +572,17 @@ inline void dispatch_v_r_fixedR(
     int V_runtime,
     int num_stages,
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M)
 {
   switch (V_runtime) {
-    case 1:  return dispatch_stages_r<1,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    case 2:  return dispatch_stages_r<2,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    case 3:  return dispatch_stages_r<3,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    case 4:  return dispatch_stages_r<4,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
+    case 1:  return dispatch_stages_r<1,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    case 2:  return dispatch_stages_r<2,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    case 3:  return dispatch_stages_r<3,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    case 4:  return dispatch_stages_r<4,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
     // case 5:  return dispatch_stages_r<5,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
     // case 6:  return dispatch_stages_r<6,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
     // case 7:  return dispatch_stages_r<7,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
@@ -593,7 +598,7 @@ inline void dispatch_vr(
     int R_runtime,
     int num_stages,
     int BK,
-    dim3 grid, dim3 block,
+    dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
@@ -603,9 +608,9 @@ inline void dispatch_vr(
   TORCH_CHECK(0 <= R_runtime && R_runtime <= 3, "R must be in {1,2,3}, got ", R_runtime);
 
   switch (R_runtime) {
-    case 1: return dispatch_v_r_fixedR<1>(V_runtime, num_stages, BK, grid, block, A, B, Y, N, M);
-    case 2: return dispatch_v_r_fixedR<2>(V_runtime, num_stages, BK, grid, block, A, B, Y, N, M);
-    case 3: return dispatch_v_r_fixedR<3>(V_runtime, num_stages, BK, grid, block, A, B, Y, N, M);
+    case 1: return dispatch_v_r_fixedR<1>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    case 2: return dispatch_v_r_fixedR<2>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    case 3: return dispatch_v_r_fixedR<3>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
     default:
       TORCH_CHECK(false, "Unreachable R=", R_runtime);
   }
@@ -619,6 +624,10 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM
 
   TORCH_CHECK(A.dim() == 2, "A must be 2D Tensor");
   TORCH_CHECK(B.dim() == 2, "B must be 2D Tensor");
+  
+  c10::cuda::CUDAGuard device_guard(A.device());
+
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
   const int N = (int)A.size(0);
   const int M = (int)B.size(0);
@@ -632,9 +641,9 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, BM));
   if (R == 0) {
-    dispatch_v(V, num_stages, BK, grid, block, A, B, Y, N, M, D);
+    dispatch_v(V, num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
   } else {
-    dispatch_vr(V, R, num_stages, BK, grid, block, A, B, Y, N, M);
+    dispatch_vr(V, R, num_stages, BK, grid, block, stream, A, B, Y, N, M);
   }
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));

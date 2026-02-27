@@ -7,6 +7,8 @@ from _sumac.dataset import block_span, RowBlockDataset
 import triton
 import triton.language as tl
 
+from relu_bat_a_fused_cuda import *
+
 @triton.jit
 def round_f32_to_tf32(x):
     # Round-to-nearest-even to TF32 precision by rounding FP32 mantissa
@@ -191,9 +193,9 @@ def relu_bat_a_fused(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return Y
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
-def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, stepM_blk, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
+def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, AtAinv, stepM_blk, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
     #Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
-    #stepM_blk = -Mt_blk @ pinvAt_dev
+    stepM_blk = -stepM_blk @ AtAinv
     #stepM_blk = -stepM_blk
    
     Lij_blk = torch.sum(Ar_dev[blk_idx[0], :] * B_blk_dev[blk_idx[1], :], dim=1)
@@ -211,7 +213,7 @@ def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, stepM_blk, dB_blk_dev, bl
         blk_idx[1],
         Ct_vals[:, None] * pinvAt_dev[blk_idx[0], :]
     )
-    lsqB_blk = B_blk_dev - stepM_blk + stepC_blk
+    lsqB_blk = B_blk_dev + stepM_blk + stepC_blk
 
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
     return B_blk_dev + dB_blk_new / unbias, dB_blk_new
@@ -309,9 +311,9 @@ def batch_update_multi_gpu(
     # print(f"Factor_fixed is on {Factor_fixed.device}") Var names are confusing, this is already sitting on the GPU
     Ar_cpu = Factor_fixed[row_indices_cpu, :].to(device_cpu, non_blocking=True)
     GramA = (Ar_cpu.T @ Ar_cpu)#.to(device_cpu, non_blocking=True) #dxd - should probably not even solve this on the GPU
-    pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d) = A (A.T A)^(-1)
-    #AtAinv = torch.linalg.pinv(GramA, hermitian=True)#.to(devices[0], non_blocking=True)
-    #pinvAt_cpu = Ar_cpu @ AtAinv
+    #pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d) = A (A.T A)^(-1)
+    AtAinv = torch.linalg.pinv(GramA, hermitian=True)#.to(devices[0], non_blocking=True)
+    pinvAt_cpu = Ar_cpu @ AtAinv
     #AtAinv, pinvAt_cpu = prepare_invs(Ar_cpu) - not worth it
     torch.cuda.nvtx.range_pop()
 
@@ -331,7 +333,7 @@ def batch_update_multi_gpu(
         with ctx:
             # 1. Transfers (async on GPU, normal copies on CPU)
             torch.cuda.nvtx.range_push("H2D")
-            #AtAinv_dev = AtAinv.to(dev, non_blocking=use_cuda)
+            AtAinv_dev = AtAinv.to(dev, non_blocking=use_cuda)
             Ar_dev = Ar_cpu.to(dev, non_blocking=use_cuda)
             row_idx_dev = row_indices_cpu.to(dev, non_blocking=use_cuda)
             pinvAt_dev = pinvAt_cpu.to(dev, non_blocking=use_cuda)
@@ -361,8 +363,9 @@ def batch_update_multi_gpu(
             # 3. LSQ Update
 
             torch.cuda.nvtx.range_push("lsq_update")
-            tmp = relu_bat_c_fused(Ar_dev, B_blk_dev, pinvAt_dev)
-            B_blk_new, dB_blk_new = lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, tmp, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
+            tmp = relu_bat_a_fused_cuda(Ar_dev, B_blk_dev, 256, 64, 2)
+            #tmp = relu_bat_a_fused(Ar_dev, B_blk_dev)
+            B_blk_new, dB_blk_new = lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, AtAinv_dev, tmp, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
             #B_blk_new, dB_blk_new = lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
             torch.cuda.nvtx.range_pop()
             # else:

@@ -16,6 +16,8 @@ setup(
                     "-lineinfo",
                 ],
             },
+            extra_cflags=['-std=c++17'],
+            extra_cuda_cflags=['-std=c++17'],
         )
     ],
     cmdclass={"build_ext": BuildExtension},
