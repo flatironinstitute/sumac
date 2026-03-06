@@ -73,28 +73,6 @@ __device__ __forceinline__ float2 axpy_float2(const float alpha, const float2& X
     fmaf(alpha, X.y, Y.y)
   );
 }
-template<int I>
-struct Lane4 { float4 v; };
-
-template<int... Is>
-struct Vec4RegsImpl : Lane4<Is>... {
-  template<int I>
-  __device__ __forceinline__ float4& get() {
-    return static_cast<Lane4<I>&>(*this).v;
-  }
-
-  template<int I>
-  __device__ __forceinline__ const float4& get() const {
-    return static_cast<const Lane4<I>&>(*this).v;
-  }
-};
-
-template<class Seq> struct Vec4RegsFromSeq;
-template<int... Is>
-struct Vec4RegsFromSeq<std::integer_sequence<int, Is...>> { using type = Vec4RegsImpl<Is...>; };
-
-template<int V>
-using Vec4Registers = typename Vec4RegsFromSeq<std::make_integer_sequence<int, V>>::type;
 
 template<int... Is, class F>
 __device__ __forceinline__ void static_for_impl(std::integer_sequence<int, Is...>, F&& f) {
@@ -203,7 +181,7 @@ __device__ __forceinline__ void issue_tile_mixed(
 }
 
 
-template<int BK, int V, int STAGES>
+template<int BK, int V, int STAGES, int MS>
 __global__ void relu_bat_a_fused_kernel_float4(
     const float* __restrict__ A, 
     const float* __restrict__ B, 
@@ -215,7 +193,7 @@ __global__ void relu_bat_a_fused_kernel_float4(
 
   const int BM  = (int)blockDim.x;
   const int tid = (int)threadIdx.x;
-  const int m   = (int)(blockIdx.x * BM + tid);
+  const int m   = (int)(blockIdx.x * MS * BM + tid);
   
 
   __shared__ alignas(16) float4 As4[STAGES][BK][V];
@@ -224,16 +202,20 @@ __global__ void relu_bat_a_fused_kernel_float4(
   const float4* __restrict__ B4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(B, 16));
   float4* __restrict__ Y4       = reinterpret_cast<float4*>(__builtin_assume_aligned(Y, 16));
 
-  Vec4Registers<V> b, y, a0, a1;
-  static_for<V>([&](auto I) {
-    b.template get<I>() = make_float4(0.f,0.f,0.f,0.f);
-    y.template get<I>() = make_float4(0.f,0.f,0.f,0.f);
+  float4 b[MS][V] = {0.f};
+  float4 y[MS][V] = {0.f};
+
+  float4 a0[V] = {0.f};
+  float4 a1[V] = {0.f};
+
+  static_for<MS>([&](auto J) {
+    if (m + J*BM < M) {
+      static_for<V>([&](auto I) {
+        b[J][I] = B4[(m + J*BM) * (D/4) + (int)I];
+      });
+    }
   });
-
-  if (m < M) {
-    static_for<V>([&](auto I) { b.template get<I>() = B4[m * (D/4) + (int)I]; });
-  }
-
+  
   auto pipe = cuda::make_pipeline();
 
   const int warm = (N + BK - 1) / BK;              
@@ -257,35 +239,34 @@ __global__ void relu_bat_a_fused_kernel_float4(
     __syncthreads();
 
     static_for<V>([&](auto I) { 
-      a0.template get<I>() = As4[cur_stage][0][(int)I]; 
+      a0[I] = As4[cur_stage][0][(int)I]; 
     });
 #pragma unroll
     for (int k = 0; k < BK; ++k) {
 
       if (k+1 < BK) {
         static_for<V>([&](auto I) { 
-          a1.template get<I>() = As4[cur_stage][k+1][(int)I];
+          a1[I] = As4[cur_stage][k+1][(int)I];
         });
       }
 
-      float acc0 = 0.f; float acc1 = 0.f;
-      { 
-        constexpr int V0 = (V + 1) / 2;   
-        constexpr int V1 = V - V0;      
-        static_for<V0>([&](auto I) {
-          acc0 = dot_float4(b.template get<I>(), a0.template get<I>(), acc0);
-        });
-        static_for<V1>([&](auto I) {
-          acc1 = dot_float4(b.template get<I+V0>(), a0.template get<I+V0>(), acc1);
-        });
-      }
-      const float acc = fmaxf(acc0 + acc1, 0.f);
-
-      static_for<V>([&](auto I) {
-        y.template get<I>() = axpy_float4(acc, a0.template get<I>(), y.template get<I>());
+      static_for<MS>([&](auto J) {
+        {
+          float acc = 0.f;
+          static_for<V>([&](auto I) {
+            acc = dot_float4(b[J][I], a0[I], acc);
+          });
+          acc = fmaxf(acc, 0.f);
+          static_for<V>([&](auto I) {
+            y[J][I] = axpy_float4(acc, a0[I], y[J][I]);
+          });
+        } 
       });
+
       if (k+1 < BK) {
-        a0 = a1;
+        static_for<V>([&](auto I) {
+          a0[I] = a1[I];
+        });
       }
     }
 
@@ -299,14 +280,17 @@ __global__ void relu_bat_a_fused_kernel_float4(
     }
   }
 
-  if (m < M) {
-    static_for<V>([&](auto I) {
-      Y4[m * (D/4) + (int)I] = y.template get<I>();
-    });
-  }
+  static_for<MS>([&](auto J) {
+    if (m + J*BM < M) {
+      static_for<V>([&](auto I) {
+        Y4[(m + J*BM) * (D/4) + (int)I] = y[J][I];
+      });
+    }
+  });
+  
 }
 
-template<int BK, int V, int STAGES, int R>
+template<int BK, int V, int STAGES, int R, int MS>
 __global__ void relu_bat_a_fused_kernel_mixed(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -322,7 +306,7 @@ __global__ void relu_bat_a_fused_kernel_mixed(
 
   const int BM  = (int)blockDim.x;
   const int tid = (int)threadIdx.x;
-  const int m   = (int)(blockIdx.x * BM + tid);
+  const int m   = (int)(blockIdx.x * MS * BM + tid);
 
   using Smem =
   typename std::conditional<(R == 1),
@@ -336,27 +320,26 @@ __global__ void relu_bat_a_fused_kernel_mixed(
   __shared__ Smem smem;
 
   
-  Vec4Registers<V> b4, y4, a04, a14;
-  float2 b2 = make_float2(0.f,0.f), y2 = make_float2(0.f,0.f), a02, a12;
-  float  b1 = 0.f, y1 = 0.f, a01, a11;
+  float4 b4[MS][V] = {0.f};
+  float4 y4[MS][V] = {0.f};
+  float4 a04[V] = {0.f};
+  float4 a14[V] = {0.f};
+  float2 b2[MS] = {0.f};
+  float2 y2[MS] = {0.f};
+  float2 a02, a12;
+  float  b1[MS] = {0.f}, y1[MS] = {0.f};
+  float a01, a11;
 
-  static_for<V>([&](auto I) {
-    b4.template get<I>() = make_float4(0.f,0.f,0.f,0.f);
-    y4.template get<I>() = make_float4(0.f,0.f,0.f,0.f);
+  static_for<MS>([&](auto J) {
+    if (m + J*BM < M) {
+      const float* Brow = B + (m + J*BM) * D;
+      static_for<V>([&](auto I) {
+        b4[J][I] = load4_scalar(Brow + 4*I);
+      });
+      if constexpr (HAS2) b2[J] = load2_scalar(Brow + 4*V);
+      if constexpr (HAS1) b1[J] = Brow[4*V + (HAS2 ? 2 : 0)];
+    }
   });
-
-  
-  if (m < M) {
-    const float* Brow = B + m * D;
-
-    static_for<V>([&](auto I) {
-      constexpr int i = (int)I;
-      b4.template get<I>() = load4_scalar(Brow + 4*i);
-    });
-
-    if constexpr (HAS2) b2 = load2_scalar(Brow + 4*V);
-    if constexpr (HAS1) b1 = Brow[4*V + (HAS2 ? 2 : 0)];
-  }
 
   auto pipe = cuda::make_pipeline();
 
@@ -381,30 +364,39 @@ __global__ void relu_bat_a_fused_kernel_mixed(
     pipe.consumer_wait();
     __syncthreads();
 
-    static_for<V>([&](auto I) { a04.template get<I>() = smem.As4[cur_stage][0][(int)I]; });
+    static_for<V>([&](auto I) { a04[I] = smem.As4[cur_stage][0][I]; });
     if constexpr (HAS2) a02 = smem.as2()[cur_stage * BK + 0];
     if constexpr (HAS1) a01 = smem.as1()[cur_stage * BK + 0];
 
 #pragma unroll
     for (int k = 0; k < BK; ++k) {
       if (k + 1 < BK) {
-        static_for<V>([&](auto I) { a14.template get<I>() = smem.As4[cur_stage][k+1][(int)I]; });
+        static_for<V>([&](auto I) { a14[I] = smem.As4[cur_stage][k+1][I]; });
         if constexpr (HAS2) a12 = smem.as2()[cur_stage * BK + (k+1)];
         if constexpr (HAS1) a11 = smem.as1()[cur_stage * BK + (k+1)];
       }
 
-      float acc = 0.f;
-      static_for<V>([&](auto I) { acc = dot_float4(b4.template get<I>(), a04.template get<I>(), acc); });
-      if constexpr (HAS2) acc = dot_float2(b2, a02, acc);
-      if constexpr (HAS1) acc = fmaf(b1, a01, acc);
-      acc = fmaxf(acc, 0.f);
+      static_for<MS>([&](auto J) {
+        float acc = 0.f;
+        static_for<V>([&](auto I) { 
+          acc = dot_float4(b4[J][I], a04[I], acc); 
+        });
+        if constexpr (HAS2) acc = dot_float2(b2[J], a02, acc);
+        if constexpr (HAS1) acc = fmaf(b1[J], a01, acc);
+        acc = fmaxf(acc, 0.f);
 
-      static_for<V>([&](auto I) { y4.template get<I>() = axpy_float4(acc, a04.template get<I>(), y4.template get<I>()); });
-      if constexpr (HAS2) y2 = axpy_float2(acc, a02, y2);
-      if constexpr (HAS1) y1 = fmaf(acc, a01, y1);
+        static_for<V>([&](auto I) { 
+          y4[J][I] = axpy_float4(acc, a04[I], y4[J][I]); 
+        });
+        if constexpr (HAS2) y2[J] = axpy_float2(acc, a02, y2[J]);
+        if constexpr (HAS1) y1[J] = fmaf(acc, a01, y1[J]);
+
+      });
 
       if (k + 1 < BK) {
-        a04 = a14;
+        static_for<V>([&](auto I) {
+          a04[I] = a14[I];
+        });
         if constexpr (HAS2) a02 = a12;
         if constexpr (HAS1) a01 = a11;
       }
@@ -422,21 +414,45 @@ __global__ void relu_bat_a_fused_kernel_mixed(
     }
   }
 
-  if (m < M) {
-    float* Yrow = Y + m * D;
+  static_for<MS>([&](auto J) {
+    if (m + J*BM < M) {
+      float* Yrow = Y + (m + J*BM) * D;
 
-    static_for<V>([&](auto I) {
-      constexpr int i = (int)I;
-      const float4 v = y4.template get<I>();
-      Yrow[4*i + 0] = v.x; Yrow[4*i + 1] = v.y; Yrow[4*i + 2] = v.z; Yrow[4*i + 3] = v.w;
-    });
-    if constexpr (HAS2) { Yrow[4*V + 0] = y2.x; Yrow[4*V + 1] = y2.y; }
-    if constexpr (HAS1) { Yrow[4*V + (HAS2 ? 2 : 0)] = y1; }
-  }
+      static_for<V>([&](auto I) {
+        const float4 v = y4[J][I];
+        Yrow[4*I + 0] = v.x; Yrow[4*I + 1] = v.y; Yrow[4*I + 2] = v.z; Yrow[4*I + 3] = v.w;
+      });
+      if constexpr (HAS2) { Yrow[4*V + 0] = y2[J].x; Yrow[4*V + 1] = y2[J].y; }
+      if constexpr (HAS1) { Yrow[4*V + (HAS2 ? 2 : 0)] = y1[J]; }
+    }
+  });
+
+  // if (m < M) {
+  //   float* Yrow = Y + m * D;
+
+  //   static_for<V>([&](auto I) {
+  //     const float4 v = y4[I];
+  //     Yrow[4*I + 0] = v.x; Yrow[4*I + 1] = v.y; Yrow[4*I + 2] = v.z; Yrow[4*I + 3] = v.w;
+  //   });
+  //   if constexpr (HAS2) { Yrow[4*V + 0] = y2.x; Yrow[4*V + 1] = y2.y; }
+  //   if constexpr (HAS1) { Yrow[4*V + (HAS2 ? 2 : 0)] = y1; }
+  // }
 }
 
+template<int... Xs, class F>
+inline bool dispatch_from_values_impl(int value, std::integer_sequence<int, Xs...>, F&& f) {
+  bool matched = false;
+  ((value == Xs ? (f(std::integral_constant<int, Xs>{}), matched = true) : false) || ...);
+  return matched;
+}
 
-template<int BK, int V, int STAGES>
+template<int... Xs, class F>
+inline void dispatch_from_values(int value, F&& f, const char* name) {
+  const bool ok = dispatch_from_values_impl(value, std::integer_sequence<int, Xs...>{}, std::forward<F>(f));
+  TORCH_CHECK(ok, "Unsupported ", name, "=", value);
+}
+
+template<int BK, int V, int STAGES, int MS>
 inline void launch_relu_bat_a_fused(
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
@@ -444,14 +460,14 @@ inline void launch_relu_bat_a_fused(
     at::Tensor& Y,
     int N, int M, int D)
 {
-  relu_bat_a_fused_kernel_float4<BK, V, STAGES> <<<grid, block, 0, stream>>>(
+  relu_bat_a_fused_kernel_float4<BK, V, STAGES, MS><<<grid, block, 0, stream>>>(
       (const float*)A.data_ptr<float>(),
       (const float*)B.data_ptr<float>(),
       (float*)Y.data_ptr<float>(),
       N, M, D);
 }
 
-template<int BK, int V, int STAGES, int R>
+template<int BK, int V, int STAGES, int R, int MS>
 inline void launch_relu_bat_a_fused_r(
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
@@ -459,164 +475,96 @@ inline void launch_relu_bat_a_fused_r(
     at::Tensor& Y,
     int N, int M)
 {
-  relu_bat_a_fused_kernel_mixed<BK, V, STAGES, R> <<<grid, block, 0, stream>>>(
+  relu_bat_a_fused_kernel_mixed<BK, V, STAGES, R, MS><<<grid, block, 0, stream>>>(
       (const float*)A.data_ptr<float>(),
       (const float*)B.data_ptr<float>(),
       (float*)Y.data_ptr<float>(),
       N, M);
 }
 
-template<int V, int STAGES>
-inline void dispatch_bk(
-    int BK,
-    dim3 grid, dim3 block, cudaStream_t stream,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& Y,
-    int N, int M, int D)
-{
-  switch (BK) {
-    case 16:  return launch_relu_bat_a_fused<16,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
-    case 32:  return launch_relu_bat_a_fused<32,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
-    case 64:  return launch_relu_bat_a_fused<64,  V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
-    case 128: return launch_relu_bat_a_fused<128, V, STAGES>(grid, block, stream, A, B, Y, N, M, D);
-    default:
-      TORCH_CHECK(false, "Unsupported BK=", BK, " (expected 16/32/64/128)");
-  }
-}
-
-template<int V>
-inline void dispatch_stages(
-    int num_stages,
-    int BK,
-    dim3 grid, dim3 block, cudaStream_t stream,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& Y,
-    int N, int M, int D)
-{
-  switch (num_stages) {
-    case 2: return dispatch_bk<V, 2>(BK, grid, block, stream, A, B, Y, N, M, D);
-    case 3: return dispatch_bk<V, 3>(BK, grid, block, stream, A, B, Y, N, M, D);
-    default:
-      TORCH_CHECK(false, "Unsupported num_stages=", num_stages, " (expected 2 or 3)");
-  }
-}
-
-template<int V, int STAGES, int R>
-inline void dispatch_bk_r(
-    int BK,
-    dim3 grid, dim3 block, cudaStream_t stream,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& Y,
-    int N, int M)
-{
-  switch (BK) {
-    case 16:  return launch_relu_bat_a_fused_r<16,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
-    case 32:  return launch_relu_bat_a_fused_r<32,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
-    case 64:  return launch_relu_bat_a_fused_r<64,  V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
-    case 128: return launch_relu_bat_a_fused_r<128, V, STAGES, R>(grid, block, stream, A, B, Y, N, M);
-    default:
-      TORCH_CHECK(false, "Unsupported BK=", BK, " (expected 16/32/64/128)");
-  }
-}
-
-template<int V, int R>
-inline void dispatch_stages_r(
-    int num_stages,
-    int BK,
-    dim3 grid, dim3 block, cudaStream_t stream,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& Y,
-    int N, int M)
-{
-  switch (num_stages) {
-    case 2: return dispatch_bk_r<V, 2, R>(BK, grid, block, stream, A, B, Y, N, M);
-    case 3: return dispatch_bk_r<V, 3, R>(BK, grid, block, stream, A, B, Y, N, M);
-    default:
-      TORCH_CHECK(false, "Unsupported num_stages=", num_stages, " (expected 2 or 3)");
-  }
-}
-
-
-
-inline void dispatch_v(
+inline void dispatch_main(
     int V_runtime,
     int num_stages,
     int BK,
+    int MS_runtime,
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M, int D)
 {
-  switch (V_runtime) {
-    case 1:  return dispatch_stages<1>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    case 2:  return dispatch_stages<2>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    case 3:  return dispatch_stages<3>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    case 4:  return dispatch_stages<4>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    // case 5:  return dispatch_stages<5>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    // case 6:  return dispatch_stages<6>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    // case 7:  return dispatch_stages<7>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    // case 8:  return dispatch_stages<8>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    // case 16:  return dispatch_stages<16>(num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
-    default:
-      TORCH_CHECK(false, "Unsupported V=", V_runtime);
-  }
-} 
-  
-template<int R>
-inline void dispatch_v_r_fixedR(
-    int V_runtime,
-    int num_stages,
-    int BK,
-    dim3 grid, dim3 block, cudaStream_t stream,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    at::Tensor& Y,
-    int N, int M)
-{
-  switch (V_runtime) {
-    case 1:  return dispatch_stages_r<1,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    case 2:  return dispatch_stages_r<2,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    case 3:  return dispatch_stages_r<3,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    case 4:  return dispatch_stages_r<4,  R>(num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    // case 5:  return dispatch_stages_r<5,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    // case 6:  return dispatch_stages_r<6,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    // case 7:  return dispatch_stages_r<7,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    // case 8:  return dispatch_stages_r<8,  R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    // case 16: return dispatch_stages_r<16, R>(num_stages, BK, grid, block, A, B, Y, N, M);
-    default:
-      TORCH_CHECK(false, "Unsupported V=", V_runtime);
-  }
+  dispatch_from_values<1,2,3,4>(V_runtime, [&](auto Vc) {
+    constexpr int V = decltype(Vc)::value;
+
+    dispatch_from_values<2,3,4>(num_stages, [&](auto Sc) {
+      constexpr int STAGES = decltype(Sc)::value;
+
+      dispatch_from_values<16,32,64,128>(BK, [&](auto BKc) {
+        constexpr int BK_ = decltype(BKc)::value;
+
+        dispatch_from_values<1,2,4>(MS_runtime, [&](auto MSc) {
+          constexpr int MS = decltype(MSc)::value;
+
+          launch_relu_bat_a_fused<BK_, V, STAGES, MS>(
+              grid, block, stream, A, B, Y, N, M, D);
+        }, "MS");
+
+      }, "BK");
+
+    }, "num_stages");
+
+  }, "V");
 }
 
-inline void dispatch_vr(
+inline void dispatch_main_r(
     int V_runtime,
     int R_runtime,
     int num_stages,
     int BK,
+    int MS_runtime,
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
     at::Tensor& Y,
     int N, int M)
 {
-  TORCH_CHECK(R_runtime != 0, "dispatch_vr called with R==0");
-  TORCH_CHECK(0 <= R_runtime && R_runtime <= 3, "R must be in {1,2,3}, got ", R_runtime);
+  dispatch_from_values<1,2,3>(R_runtime, [&](auto Rc) {
+    constexpr int R = decltype(Rc)::value;
 
-  switch (R_runtime) {
-    case 1: return dispatch_v_r_fixedR<1>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    case 2: return dispatch_v_r_fixedR<2>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    case 3: return dispatch_v_r_fixedR<3>(V_runtime, num_stages, BK, grid, block, stream, A, B, Y, N, M);
-    default:
-      TORCH_CHECK(false, "Unreachable R=", R_runtime);
-  }
+    dispatch_from_values<1,2,3,4>(V_runtime, [&](auto Vc) {
+      constexpr int V = decltype(Vc)::value;
+
+      dispatch_from_values<2,3,4>(num_stages, [&](auto Sc) {
+        constexpr int STAGES = decltype(Sc)::value;
+
+        dispatch_from_values<16,32,64,128>(BK, [&](auto BKc) {
+          constexpr int BK_ = decltype(BKc)::value;
+
+          dispatch_from_values<1,2,4>(MS_runtime, [&](auto MSc) {
+            constexpr int MS = decltype(MSc)::value;
+
+            launch_relu_bat_a_fused_r<BK_, V, STAGES, R, MS>(
+                grid, block, stream, A, B, Y, N, M);
+          }, "MS");
+
+        }, "BK");
+
+      }, "num_stages");
+
+    }, "V");
+
+  }, "R");
 }
 
-torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM, int64_t BK, int64_t num_stages) {
+
+torch::Tensor relu_bat_a_fused_cuda(
+    torch::Tensor A,
+    torch::Tensor B,
+    int64_t BM,
+    int64_t BK,
+    int64_t num_stages,
+    int64_t num_ms = 1)
+{
   CHECK_CUDA(A); CHECK_CUDA(B);
   CHECK_F32(A);  CHECK_F32(B);
   CHECK_CONTIGUOUS(A);
@@ -624,9 +572,8 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM
 
   TORCH_CHECK(A.dim() == 2, "A must be 2D Tensor");
   TORCH_CHECK(B.dim() == 2, "B must be 2D Tensor");
-  
-  c10::cuda::CUDAGuard device_guard(A.device());
 
+  c10::cuda::CUDAGuard device_guard(A.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
   const int N = (int)A.size(0);
@@ -638,17 +585,24 @@ torch::Tensor relu_bat_a_fused_cuda(torch::Tensor A, torch::Tensor B, int64_t BM
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 
   TORCH_CHECK(BM % 32 == 0, "BM must be multiple of 32");
+  TORCH_CHECK(num_ms >= 1, "num_ms must be >= 1");
+
   const dim3 block(BM);
-  const dim3 grid(ceil_div(M, BM));
+  const dim3 grid(ceil_div(M, (int)num_ms * (int)BM));
+
   if (R == 0) {
-    dispatch_v(V, num_stages, BK, grid, block, stream, A, B, Y, N, M, D);
+    dispatch_main(V, (int)num_stages, (int)BK, (int)num_ms,
+                  grid, block, stream, A, B, Y, N, M, D);
   } else {
-    dispatch_vr(V, R, num_stages, BK, grid, block, stream, A, B, Y, N, M);
+    dispatch_main_r(V, R, (int)num_stages, (int)BK, (int)num_ms,
+                    grid, block, stream, A, B, Y, N, M);
   }
+
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
   return Y;
 }
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("relu_bat_a_fused_cuda", &relu_bat_a_fused_cuda, "relu_bat_a_fused_cuda (CUDA)");

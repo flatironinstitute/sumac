@@ -363,7 +363,7 @@ def batch_update_multi_gpu(
             # 3. LSQ Update
 
             torch.cuda.nvtx.range_push("lsq_update")
-            tmp = relu_bat_a_fused_cuda(Ar_dev, B_blk_dev, 256, 64, 2)
+            tmp = relu_bat_a_fused_cuda(Ar_dev, B_blk_dev, 256, 32, 2, 4)
             #tmp = relu_bat_a_fused(Ar_dev, B_blk_dev)
             B_blk_new, dB_blk_new = lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, AtAinv_dev, tmp, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
             #B_blk_new, dB_blk_new = lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
