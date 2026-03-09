@@ -103,7 +103,7 @@ def autotune_cuda_kernel(
     verbose_env_var: str = "KERNEL_AUTOTUNE_VERBOSE",
 ):
     """
-    Decorate a Python launcher function whose signature looks like:
+    Decorate a kernel launcher function whose signature looks like:
 
         fn(A, B, *, BM, BK, num_stages, num_ms)
 
@@ -381,3 +381,4 @@ def relu_bat_a_validate(
 #   KERNEL_AUTOTUNE_DISABLE=1   -  bypass autotuning, use first config in each list
 #   KERNEL_AUTOTUNE_FORCE=1     -  ignore cache and retune
 #   KERNEL_AUTOTUNE_VERBOSE=1   -  print tuning/cache diagnostics
+#   KERNEL_AUTOTUNE_VALIDATE=1  -  validate correctness of candidate
