@@ -427,16 +427,6 @@ __global__ void relu_bat_a_fused_kernel_mixed(
     }
   });
 
-  // if (m < M) {
-  //   float* Yrow = Y + m * D;
-
-  //   static_for<V>([&](auto I) {
-  //     const float4 v = y4[I];
-  //     Yrow[4*I + 0] = v.x; Yrow[4*I + 1] = v.y; Yrow[4*I + 2] = v.z; Yrow[4*I + 3] = v.w;
-  //   });
-  //   if constexpr (HAS2) { Yrow[4*V + 0] = y2.x; Yrow[4*V + 1] = y2.y; }
-  //   if constexpr (HAS1) { Yrow[4*V + (HAS2 ? 2 : 0)] = y1; }
-  // }
 }
 
 template<int... Xs, class F>
