@@ -138,18 +138,22 @@ def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
 def relu_bat_a_cuda_launcher():
     @autotune_cuda_kernel(
         configs={
-            "BM": [64, 128, 256],
-            "BK": [16, 32, 64, 128],
-            "num_stages": [2, 3, 4],
+            "BM": [32, 64, 128, 256, 384],
+            "BK": [16, 32, 64, 128, 256],
+            "num_stages": [1, 2, 3, 4],
             "num_ms": [1, 2, 4],
         },
         key_fn=relu_bat_a_key,
         constraint_fn=relu_bat_a_constraints,
         validate_fn=relu_bat_a_validate,
         cache_path="relu_bat_a_autotune.json",
-        n_trials=100,
+        n_trials=500,
         warmup=5,
         rep=50,
+        sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256, 384],
+            "BK": [16, 32, 64, 128, 256],
+            "num_stages": [1, 2, 3, 4],
+            "num_ms": [1, 2, 4],})
     )
     def relu_bat_a_cuda(
         A: torch.Tensor,
@@ -165,7 +169,7 @@ def relu_bat_a_cuda_launcher():
 
 
 @torch.no_grad()
-def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
+def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
 
@@ -176,7 +180,7 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
     #y = relu_bat_a_tuned(A,B)
 
     out_triton = relu_bat_a_fused_triton(A, B)
-    out_cuda = kernel_ext.relu_bat_a_fused_cuda(A,B, BM, BK, num_stages, 4)
+    out_cuda = kernel_ext.relu_bat_a_fused_cuda(A,B, 256, 32, 3, 4)
     err_triton = (out_triton - ref).abs().max().item()
     err_cuda = (out_cuda - ref).abs().max().item()
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
@@ -198,7 +202,6 @@ def bench_one(M: int, N: int, D: int, BM: int, BK: int, num_stages: int, dtype=t
     t_cuda = triton.testing.do_bench(cuda_run,  warmup=wm_iters, rep=iters)
 
     return {
-        "BM": BM, "BK": BK, "num_stages": num_stages,
         #"max_abs_err_triton":  float(err_triton),
 
         "torch_ms":   float(t_torch),
@@ -318,11 +321,14 @@ def correctness_sweep_D(N, dtype):
     device="cuda"
     for M in Ms:
         for D in Ds:
+
+            relu_bat_a_tuned = relu_bat_a_cuda_launcher()
+
             A = torch.randn((N,D), device=device, dtype=dtype)
             B = torch.randn((M,D), device=device, dtype=dtype)
 
             ref = torch_impl(A, B)
-            out_cuda = kernel_ext.relu_bat_a_fused_cuda(A, B, 256, 32, 2, 4)
+            out_cuda = relu_bat_a_tuned(A, B)
         
             err_cuda = (out_cuda - ref).abs().max().item()
             print(f" D={D} cuda fused max_abs_err: {err_cuda:.6e}")  
@@ -350,7 +356,7 @@ if __name__ == "__main__":
         print("Please pick at least one benchmarking mode. See --help for available options.")
 
     if args.relative:
-        r = bench_one(M=139255, N=1392, D=16, BM=256, BK=32, num_stages=3, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+        r = bench_one(M=139255, N=1392, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
         # r = bench_one(M=262144, N=1392, D=16, BM=384, BK=32, num_stages=2, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
         print(r)
 
@@ -389,7 +395,7 @@ if __name__ == "__main__":
         df = benchmark_sweep_D.run(print_data=False, show_plots=False, save_path="triton_bench", wm_iters=args.warmup_iters, iters=args.iters, return_df=True)
 
         print(df)
-        #correctness_sweep_D(N=1392, dtype=torch.float32)
+        correctness_sweep_D(N=1392, dtype=torch.float32)
 
 
 # Fused kernel traffic:

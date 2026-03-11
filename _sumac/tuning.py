@@ -337,13 +337,16 @@ def relu_bat_a_constraints(
 
     if BM % 32 != 0:
         return False
-    if BK not in (16, 32, 64, 128):
+    if BK not in (16, 32, 64, 128, 256):
         return False
-    if num_stages not in (2, 3, 4):
+    if num_stages not in (1, 2, 3, 4):
         return False
     if num_ms not in (1, 2, 4):
         return False
     if num_ms < 1:
+        return False
+    
+    if BM == 384 and num_ms == 4:
         return False
 
     V = D // 4
