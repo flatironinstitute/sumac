@@ -38,3 +38,7 @@ To run sumac-GD with loss aligned as ALS and preconditioning
 ```
 python sumac_connectome.py --mode GDlatent_prec_sumac
 ```
+
+### Exploration: Lower bound of the rank (embedding dimension)
+
+Given a sparse matrix, what's the minimum (effective) rank needed for subzero matrix completion? We include a simple greedy algorithm in ```tests/check_min_rank.py```. To compute the (effective) rank for our example datasets, use ```check_min_rank.sh```.
