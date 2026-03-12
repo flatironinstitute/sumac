@@ -9,29 +9,25 @@ setup(
             name="relu_bat_a_fused_cuda",
             sources=["fused_bat_a.cu"],
             extra_compile_args={
-                "cxx": ["-O3"],
+                "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-lineinfo",
+                    "-lineinfo", "-std=c++17"
                 ],
             },
-            extra_cflags=['-std=c++17'],
-            extra_cuda_cflags=['-std=c++17'],
         ),
         CUDAExtension(
             name="relu_bat_c_fused_cuda",
             sources=["fused_bat_c.cu"],
             extra_compile_args={
-                "cxx": ["-O3"],
+                "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-lineinfo",
+                    "-lineinfo", "-std=c++17"
                 ],
             },
-            extra_cflags=['-std=c++17'],
-            extra_cuda_cflags=['-std=c++17'],
         )
     ],
     cmdclass={"build_ext": BuildExtension},
