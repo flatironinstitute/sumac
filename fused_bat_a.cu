@@ -2,9 +2,12 @@
 #include <cuda/pipeline>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <cooperative_groups.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <utility>
+
+namespace cg = cooperative_groups;
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_F32(x)  TORCH_CHECK(x.scalar_type() == at::kFloat, #x " must be float32")
@@ -85,28 +88,39 @@ __device__ __forceinline__ void static_for(F&& f) {
 
 template<int BK, int V, int STAGES>
 __device__ __forceinline__ void issue_tile_float4(
-    cuda::pipeline<cuda::thread_scope_thread>& pipe,
+    cg::thread_block cta,
+    cuda::pipeline<cuda::thread_scope_block>& pipe,
     float4 As4[STAGES][BK][V],
     const float4* __restrict__ A4,
-    int tid, int BM,
     int stage, int n0, int N,
     int D4_full)
 {
-  const int full_elems = BK * D4_full;
-  for (int idx = tid; idx < full_elems; idx += BM) {
-    const int k  = idx / D4_full;
-    const int dv = idx - k * D4_full;
-    const int n  = n0 + k;
+  constexpr int tile_bytes  = BK * V * sizeof(float4);
 
-    float4* smem_ptr = &As4[stage][k][dv];
-    if (n < N) {
-      const float4* gmem_ptr = &A4[n * D4_full + dv];
-      cuda::memcpy_async(
-          smem_ptr, gmem_ptr,
-          cuda::aligned_size_t<16>(sizeof(float4)),
-          pipe);
-    } else {
-      *smem_ptr = make_float4(0.f, 0.f, 0.f, 0.f);
+  float4* smem_ptr = &As4[stage][0][0];
+
+  if (n0 + BK <= N) {
+    const float4* gmem_ptr = &A4[n0 * D4_full];
+
+    cuda::memcpy_async(
+        cta,
+        smem_ptr,
+        gmem_ptr,
+        cuda::aligned_size_t<16>(tile_bytes),
+        pipe);
+  }
+  else {
+    const int full_elems = BK * D4_full;
+    for (int idx = threadIdx.x; idx < full_elems; idx += blockDim.x) {
+      const int k  = idx / D4_full;
+      const int dv = idx - k * D4_full;
+      const int n  = n0 + k;
+
+      float4* s = &As4[stage][k][dv];
+      if (n < N)
+        *s = A4[n * D4_full + dv];
+      else
+        *s = make_float4(0.f,0.f,0.f,0.f);
     }
   }
 }
@@ -157,7 +171,7 @@ __device__ __forceinline__ void issue_tile_mixed(
     float4* smem_ptr = &As4[stage][k][dv];
 
     if (n < N) {
-      const float* row = A + n * (4*V + R); // D
+      const float* row = A + n * (4*V + R); 
       const float* p   = row + 4*dv;
 
       if (((uintptr_t)p & 0xF) == 0) {
@@ -225,7 +239,7 @@ __device__ __forceinline__ void issue_tile_mixed_sync(
     float4* smem_ptr = &As4[0][k][dv];
 
     if (n < N) {
-      const float* row = A + n * (4*V + R); // D
+      const float* row = A + n * (4*V + R); 
       const float* p   = row + 4*dv;
 
       if (((uintptr_t)p & 0xF) == 0) {
@@ -298,8 +312,13 @@ __global__ void relu_bat_a_fused_kernel_float4(
       });
     }
   });
-  
-  auto pipe = cuda::make_pipeline();
+
+
+  cg::thread_block cta = cg::this_thread_block();
+
+  __shared__ cuda::pipeline_shared_state<cuda::thread_scope_block, STAGES> shared_state;
+
+  auto pipe = cuda::make_pipeline(cta, &shared_state);
 
   const int warm = (N + BK - 1) / BK;              
   const int prefetch_tiles = (warm < STAGES) ? warm : STAGES;
@@ -308,7 +327,7 @@ __global__ void relu_bat_a_fused_kernel_float4(
     const int n0 = t * BK;
     if (t < prefetch_tiles) {
       pipe.producer_acquire();
-      issue_tile_float4<BK, V, STAGES>(pipe, As4, A4, tid, BM, t, n0, N, D / 4);
+      issue_tile_float4<BK, V, STAGES>(cta, pipe, As4, A4, t, n0, N, D / 4);
       pipe.producer_commit();
     }
   }
@@ -358,7 +377,7 @@ __global__ void relu_bat_a_fused_kernel_float4(
 
     if (n_prefetch < N) {
       pipe.producer_acquire();
-      issue_tile_float4<BK, V, STAGES>(pipe, As4, A4, tid, BM, cur_stage, n_prefetch, N, D/4);
+      issue_tile_float4<BK, V, STAGES>(cta, pipe, As4, A4, cur_stage, n_prefetch, N, D/4);
       pipe.producer_commit();
     }
   }
@@ -871,6 +890,7 @@ torch::Tensor relu_bat_a_fused_cuda(
   const int D = (int)A.size(1);
   const int V = D / 4;
   const int R = D % 4;
+
 
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 

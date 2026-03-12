@@ -380,6 +380,104 @@ def relu_bat_a_validate(
     torch.testing.assert_close(output, ref, rtol=1e-4, atol=1e-4)
 
 
+
+
+def relu_bat_c_reference(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+    return torch.relu(B @ A.T) @ C
+
+
+def relu_bat_c_key(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> Dict[str, Any]:
+    if A.device != B.device != C.device:
+        raise ValueError("A, B and C must be on the same device")
+    if A.ndim != 2 or B.ndim != 2 or C.ndim != 2:
+        raise ValueError("A, B and C must all be 2D")
+    if A.shape[1] != B.shape[1] and C.shape[1] != A.shape[1]:
+        raise ValueError("A, B and C must have the same D dimension")
+
+    key = _default_device_key(A)
+    key.update(
+        {
+            "N": int(A.shape[0]),
+            "M": int(B.shape[0]),
+            "D": int(A.shape[1]),
+            "V": int(A.shape[1] // 4),
+            "R": int(A.shape[1] % 4),
+        }
+    )
+    return key
+
+
+def relu_bat_c_constraints(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    BM: int,
+    BK: int,
+    num_stages: int,
+    num_ms: int,
+) -> bool:
+    if A.device != B.device:
+        return False
+    if A.ndim != 2 or B.ndim != 2:
+        return False
+    if A.shape[1] != B.shape[1]:
+        return False
+    if not A.is_cuda or not B.is_cuda:
+        return False
+    if A.dtype != torch.float32 or B.dtype != torch.float32:
+        return False
+    if not A.is_contiguous() or not B.is_contiguous():
+        return False
+
+    N, D = A.shape
+    M, _ = B.shape
+
+    if BM % 32 != 0:
+        return False
+    if BK not in (16, 32, 64, 128, 256):
+        return False
+    if num_stages not in (1, 2, 3, 4):
+        return False
+    if num_ms not in (1, 2, 4):
+        return False
+    if num_ms < 1:
+        return False
+    
+    if BM == 384 and num_ms == 4:
+        return False
+
+    V = D // 4
+    R = D % 4
+    if V not in (1, 2, 3, 4):
+        return False
+    if R not in (0, 1, 2, 3):
+        return False
+
+    if M < BM and num_ms > 1:
+        return False
+    if N <= 32 and BK > 32:
+        return False
+    if D > 64 and num_ms == 4:
+        return False
+
+    return True
+
+
+def relu_bat_c_validate(
+    output: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    BM: int,
+    BK: int,
+    num_stages: int,
+    num_ms: int,
+) -> None:
+    del BM, BK, num_stages, num_ms
+    ref = relu_bat_c_reference(A, B, C)
+    torch.testing.assert_close(output, ref, rtol=1e-4, atol=1e-4)
+
+
 # Environment flags:
 #   KERNEL_AUTOTUNE_DISABLE=1   -  bypass autotuning, use first config in each list
 #   KERNEL_AUTOTUNE_FORCE=1     -  ignore cache and retune

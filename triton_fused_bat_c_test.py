@@ -5,6 +5,7 @@ import os
 import argparse
 os.environ["MPLBACKEND"] = "Agg"
 
+from _sumac.tuning import *
 import relu_bat_c_fused_cuda as kernel_ext 
 
 @triton.jit
@@ -147,6 +148,41 @@ def flop_per_byte_2kernels(M, N, D, wordsize):
 def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
         return min(peak_TFLOP,(BW_GBs * FLOP_per_Byte)/1e3) #/1e3 to get to TFLOP/s
 
+
+
+def relu_bat_c_cuda_launcher():
+    @autotune_cuda_kernel(
+        configs={
+            "BM": [32, 64, 128, 256, 384],
+            "BK": [16, 32, 64, 128],
+            "num_stages": [1, 2, 3],
+            "num_ms": [1, 2, 4],
+        },
+        key_fn=relu_bat_c_key,
+        constraint_fn=relu_bat_c_constraints,
+        validate_fn=relu_bat_c_validate,
+        cache_path="relu_bat_c_autotune.json",
+        n_trials=500,
+        warmup=5,
+        rep=50,
+        sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256, 384],
+            "BK": [16, 32, 64, 128],
+            "num_stages": [1, 2, 3],
+            "num_ms": [1, 2, 4],})
+    )
+    def relu_bat_c_cuda(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        BM: int,
+        BK: int,
+        num_stages: int,
+        num_ms: int,
+    ) -> torch.Tensor:
+        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_stages, num_ms)
+    return relu_bat_c_cuda
+
+
 @torch.no_grad()
 def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_iters=25, iters=200):
     A = torch.randn((N, D), device=device, dtype=dtype)
@@ -154,12 +190,12 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
     C = torch.randn((N, D), device=device, dtype=dtype)
     
     ref = torch_impl(A, B, C)
-
+    relu_bat_c_tuned = relu_bat_c_cuda_launcher()
     out_triton = relu_bat_c_fused(A, B, C)
 
     err_triton = (out_triton - ref).abs().max().item()
 
-    out_cuda = kernel_ext.relu_bat_c_fused_cuda(A, B, C, 256, 32, 4)
+    out_cuda = relu_bat_c_tuned(A, B, C)
 
     err_cuda = (out_cuda - ref).abs().max().item()
 
@@ -175,7 +211,7 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
         return relu_bat_c_fused(A, B, C)
     
     def cuda_run():
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, 128, 32, 4)
+        return relu_bat_c_tuned(A, B, C)
 
     torch.cuda.synchronize()
 
@@ -212,7 +248,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    r = bench_one(M=139255, N=1392, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    r = bench_one(M=140800, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
 
     
