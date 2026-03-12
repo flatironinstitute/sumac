@@ -139,7 +139,7 @@ def relu_bat_a_cuda_launcher():
     @autotune_cuda_kernel(
         configs={
             "BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128, 256],
+            "BK": [16, 32, 64, 128],
             "num_stages": [1, 2, 3, 4],
             "num_ms": [1, 2, 4],
         },
@@ -151,7 +151,7 @@ def relu_bat_a_cuda_launcher():
         warmup=5,
         rep=50,
         sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128, 256],
+            "BK": [16, 32, 64, 128],
             "num_stages": [1, 2, 3, 4],
             "num_ms": [1, 2, 4],})
     )
@@ -267,7 +267,7 @@ def benchmark_sweep(M, N, D, dtype, provider, wm_iters=25, iters=200):
         #fn = lambda: kernel_ext.relu_bat_a_fused_cuda(A, B, 256, 64, 4)
         fn = lambda: relu_bat_a_tuned(A, B)
     else:
-        return perf_roofline(FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4), BW_GBs=960, peak_TFLOP=91.1)
+        return perf_roofline(FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4), BW_GBs=960, peak_TFLOP=80)
     
         
     ms = triton.testing.do_bench(fn, warmup=wm_iters, rep=iters)
@@ -312,7 +312,7 @@ def benchmark_sweep_D(M, D, N, dtype, provider, wm_iters=25, iters=200):
         tflops = perf_roofline(
             FLOP_per_Byte=flop_per_byte_fused(M, N, D, 4),
             BW_GBs=960,
-            peak_TFLOP=91.1,
+            peak_TFLOP=80,
         )
 
     return tflops
@@ -375,7 +375,7 @@ if __name__ == "__main__":
         FPB_fused = lambda M: flop_per_byte_fused(M=M, N=1392, D=16,wordsize=4) 
         FPB_2kernel = lambda M: flop_per_byte_2kernels(M=M, N=1392, D=16, wordsize=4)
 
-        kernel_roofline = lambda Flop_per_Byte: perf_roofline(FLOP_per_Byte=Flop_per_Byte, BW_GBs=960, peak_TFLOP=91.1)
+        kernel_roofline = lambda Flop_per_Byte: perf_roofline(FLOP_per_Byte=Flop_per_Byte, BW_GBs=960, peak_TFLOP=80) #FP32 peak for RTX pro 6000 Ada is only 80, not 91.1 according to ncu at boostclock
 
         df["Torch [FLOP/Byte]"] = df["M"].apply(FPB_2kernel)
         df["Triton fused [FLOP/Byte]"] = df["M"].apply(FPB_fused)

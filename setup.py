@@ -22,3 +22,23 @@ setup(
     ],
     cmdclass={"build_ext": BuildExtension},
 )
+setup(
+    name="relu_bat_c_fused_cuda",
+    ext_modules=[
+        CUDAExtension(
+            name="relu_bat_c_fused_cuda",
+            sources=["fused_bat_c.cu"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": [
+                    "-O3",
+                    "--use_fast_math",
+                    "-lineinfo",
+                ],
+            },
+            extra_cflags=['-std=c++17'],
+            extra_cuda_cflags=['-std=c++17'],
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension},
+)
