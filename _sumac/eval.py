@@ -3,8 +3,8 @@ import torch
 from _sumac.dataset import block_span
 
 
-@torch.compile(fullgraph=True)
-def block_core_no_errz(
+@torch.compile(fullgraph=True, mode="max-autotune")
+def block_loss_no_errz(
     A_block: torch.Tensor,   
     B: torch.Tensor,         
     local_r: torch.Tensor,   
@@ -27,37 +27,32 @@ def block_core_no_errz(
     errZ_num = mse_full
     return mse_full, sum_sr, jacc_num, errZ_num
 
-
-@torch.compile(fullgraph=True)
-def block_core_errz(
-    A_block: torch.Tensor, 
-    B: torch.Tensor,       
-    local_r: torch.Tensor, 
+@torch.compile(fullgraph=True, mode="max-autotune")
+def block_loss_errz(
+    A_block: torch.Tensor,
+    B: torch.Tensor,
+    local_r: torch.Tensor,
     cols_all: torch.Tensor,
     vals_all: torch.Tensor,
 ):
-
-    L = A_block @ B.T
-    Sr = torch.relu(L)
-
+    Sr = torch.relu(A_block @ B.T)
     sum_sr = Sr.sum()
     sum_sr2 = (Sr * Sr).sum()
 
-    sr_obs = Sr[local_r, cols_all]
+    A_obs = A_block[local_r]      
+    B_obs = B[cols_all]           
+    L_obs = (A_obs * B_obs).sum(dim=1)
+
+    sr_obs = torch.relu(L_obs)
     dot_obs = (vals_all * sr_obs).sum()
     jacc_num = torch.minimum(vals_all, sr_obs).sum()
+
     ssq_vals = (vals_all * vals_all).sum()
     mse_full = sum_sr2 - 2.0 * dot_obs + ssq_vals
 
-    L_obs = L[local_r, cols_all]
-    neg_mask = L_obs < 0
-
-    corr_terms = torch.where(
-        neg_mask,
-        (L_obs * L_obs) - 2.0 * vals_all * L_obs,
-        torch.zeros_like(L_obs),
-    )
-    errZ_num = mse_full + corr_terms.sum()
+    neg = torch.relu(-L_obs)
+    corr = (neg * neg + 2.0 * vals_all * neg).sum()
+    errZ_num = mse_full + corr
 
     return mse_full, sum_sr, jacc_num, errZ_num
 
@@ -135,9 +130,9 @@ def block_loss_and_pred(
     )
 
     if errZ_obj:
-        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_core_errz(A_block, B, local_r, cols_all, vals_all)
+        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, local_r, cols_all, vals_all)
     else:
-        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_core_no_errz(A_block, B, local_r, cols_all, vals_all)
+        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)
 
     return mse_full, sumSr_block, jacc_num_block, errZ_num_block
 
