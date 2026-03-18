@@ -7,6 +7,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <utility>
 
+#pragma nv_diag_suppress static_var_with_dynamic_init
+
 namespace cg = cooperative_groups;
 
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -32,81 +34,61 @@ __device__ __forceinline__ float4 axpy_float4(const float alpha, const float4& X
   );
 }
 
-template<int... Is, class F>
-__device__ __forceinline__ void static_for_impl(std::integer_sequence<int, Is...>, F&& f) {
-  (f(std::integral_constant<int, Is>{}), ...);
-}
-template<int N, class F>
-__device__ __forceinline__ void static_for(F&& f) {
-  static_for_impl(std::make_integer_sequence<int, N>{}, (F&&)f);
-}
 
 
 template<int BK, int V, int STAGES>
-__device__ __forceinline__ void issue_tile_float4(
+__device__ __forceinline__ void copy_tiles_async_float4(
     cg::thread_block cta,
     cuda::pipeline<cuda::thread_scope_block>& pipe,
     float4 As4[STAGES][BK][V],
     const float4* __restrict__ A4,
-    int stage, int n0, int N,
-    int D4_full)
+    float4 Cs4[STAGES][BK][V],
+    const float4* __restrict__ C4,
+    int stage, int n0, int N)
 {
   constexpr int tile_bytes  = BK * V * sizeof(float4);
 
-  float4* smem_ptr = &As4[stage][0][0];
+  float4* smem_ptr_A = &As4[stage][0][0];
+  float4* smem_ptr_C = &Cs4[stage][0][0];
 
   if (n0 + BK <= N) {
-    const float4* gmem_ptr = &A4[n0 * D4_full];
-
+    const float4* gmem_ptr_A = &A4[n0 * V];
+    const float4* gmem_ptr_C = &C4[n0 * V];
     cuda::memcpy_async(
         cta,
-        smem_ptr,
-        gmem_ptr,
+        smem_ptr_A,
+        gmem_ptr_A,
         cuda::aligned_size_t<16>(tile_bytes),
         pipe);
+    cuda::memcpy_async(
+        cta,
+        smem_ptr_C,
+        gmem_ptr_C,
+        cuda::aligned_size_t<16>(tile_bytes),
+        pipe);
+    
   }
-  else {
-    const int full_elems = BK * D4_full;
-    for (int idx = threadIdx.x; idx < full_elems; idx += blockDim.x) {
-      const int k  = idx / D4_full;
-      const int dv = idx - k * D4_full;
-      const int n  = n0 + k;
+    else {
+      const int full_elems = BK * V;
+      for (int idx = threadIdx.x; idx < full_elems; idx += blockDim.x) {
+        const int k  = idx / V;
+        const int dv = idx - k * V;
+        const int n  = n0 + k;
 
-      float4* s = &As4[stage][k][dv];
-      if (n < N)
-        *s = A4[n * D4_full + dv];
-      else
-        *s = make_float4(0.f,0.f,0.f,0.f);
+        float4* s_A = &As4[stage][k][dv];
+        float4* s_C = &Cs4[stage][k][dv];
+        if (n < N) {
+          *s_A = A4[n * V + dv];
+          *s_C = C4[n * V + dv];
+        } else {
+          *s_A = make_float4(0.f, 0.f, 0.f, 0.f);
+          *s_C = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
     }
   }
 }
 
-template<int BK, int V>
-__device__ __forceinline__ void issue_tile_float4_sync(
-    float4 As4[BK][V],
-    const float4* __restrict__ A4,
-    int tid, int BM,
-    int n0, int N,
-    int D4_full)
-{
-  const int full_elems = BK * D4_full;
-  for (int idx = tid; idx < full_elems; idx += BM) {
-    const int k = idx / D4_full;
-    const int dv = idx - k * D4_full;
-    const int n = n0 + k;
-
-    float4* smem_ptr = &As4[k][dv];
-    if (n < N) {
-      *smem_ptr = __ldg(&A4[n * D4_full + dv]);
-    } else {
-      *smem_ptr = make_float4(0.f, 0.f, 0.f, 0.f);
-    }
-  }
-
-}
-
-
-template<int BK, int V, int STAGES, int MS>
+template<int BK, int V, int STAGES, int MS, int KNR>
 __global__ void relu_bat_c_fused_kernel_float4(
     const float* __restrict__ A, 
     const float* __restrict__ B, 
@@ -137,19 +119,18 @@ __global__ void relu_bat_c_fused_kernel_float4(
 
   float4 b[MS][V] = {0.f};
   float4 y[MS][V] = {0.f};
+  float4 a[KNR][V] = {0.f};
+  float score[MS][KNR] = {0.f};
 
-  float4 a0[V] = {0.f};
-  float4 a1[V] = {0.f};
-  float4 c0[V] = {0.f};
-  float4 c1[V] = {0.f};
-
-  static_for<MS>([&](auto J) {
+  #pragma unroll
+  for (int J = 0; J < MS; ++J) {
     if (m + J*BM < M) {
-      static_for<V>([&](auto I) {
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
         b[J][I] = B4[(m + J*BM) * (D/4) + I];
-      });
+      }
     }
-  });
+  }
   
 
   const int warm = (N + BK - 1) / BK;              
@@ -159,8 +140,7 @@ __global__ void relu_bat_c_fused_kernel_float4(
     const int n0 = t * BK;
     if (t < prefetch_tiles) {
       pipe.producer_acquire();
-      issue_tile_float4<BK, V, STAGES>(cta, pipe, As4, A4, t, n0, N, D / 4);
-      issue_tile_float4<BK, V, STAGES>(cta, pipe, Cs4, C4, t, n0, N, D / 4);
+      copy_tiles_async_float4<BK, V, STAGES>(cta, pipe, As4, A4, Cs4, C4, t, n0, N);
       pipe.producer_commit();
     }
   }
@@ -173,38 +153,58 @@ __global__ void relu_bat_c_fused_kernel_float4(
     pipe.consumer_wait();
     __syncthreads();
 
-    static_for<V>([&](auto I) { 
-      a0[I] = As4[cur_stage][0][I]; 
-      c0[I] = Cs4[cur_stage][0][I];
-    });
-#pragma unroll
-    for (int k = 0; k < BK; ++k) {
 
-      if (k+1 < BK) {
-        static_for<V>([&](auto I) { 
-          a1[I] = As4[cur_stage][k+1][I];
-          c1[I] = Cs4[cur_stage][k+1][I];
-        });
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk += KNR) {
+
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int I = 0; I < V; ++I) {
+          a[r][I] = As4[cur_stage][kk + r][I];
+        }
       }
 
-      static_for<MS>([&](auto J) {
-        {
-          float acc = 0.f;
-          static_for<V>([&](auto I) {
-            acc = dot_float4(b[J][I], a0[I], acc);
-          });
-          acc = fmaxf(acc, 0.f);
-          static_for<V>([&](auto I) {
-            y[J][I] = axpy_float4(acc, c0[I], y[J][I]);
-          });
-        } 
-      });
+      #pragma unroll
+      for (int J = 0; J < MS; ++J) {
+        #pragma unroll
+        for (int r = 0; r < KNR; ++r) {
+          score[J][r] = 0.f;
+        }
+      }
 
-      if (k+1 < BK) {
-        static_for<V>([&](auto I) {
-          a0[I] = a1[I];
-          c0[I] = c1[I];
-        });
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
+        #pragma unroll
+        for (int J = 0; J < MS; ++J) {
+          const float4 bj = b[J][I];
+
+          #pragma unroll
+          for (int r = 0; r < KNR; ++r) {
+            score[J][r] = dot_float4(bj, a[r][I], score[J][r]);
+          }
+        }
+      }
+
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int I = 0; I < V; ++I) {
+          a[r][I] = Cs4[cur_stage][kk + r][I];
+        }
+      }
+
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int J = 0; J < MS; ++J) {
+          const float alpha = fmaxf(score[J][r], 0.f);
+
+          #pragma unroll
+          for (int I = 0; I < V; ++I) {
+            y[J][I] = axpy_float4(alpha, a[r][I], y[J][I]);
+          }
+        }
       }
     }
 
@@ -213,113 +213,154 @@ __global__ void relu_bat_c_fused_kernel_float4(
 
     if (n_prefetch < N) {
       pipe.producer_acquire();
-      issue_tile_float4<BK, V, STAGES>(cta, pipe, As4, A4, cur_stage, n_prefetch, N, D/4);
-      issue_tile_float4<BK, V, STAGES>(cta, pipe, Cs4, C4, cur_stage, n_prefetch, N, D/4);
+      copy_tiles_async_float4<BK, V, STAGES>(cta, pipe, As4, A4, Cs4, C4, cur_stage, n_prefetch, N);
       pipe.producer_commit();
     }
   }
 
-  static_for<MS>([&](auto J) {
+  #pragma unroll
+  for (int J = 0; J < MS; ++J) {
     if (m + J*BM < M) {
-      static_for<V>([&](auto I) {
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
         Y4[(m + J*BM) * (D/4) + I] = y[J][I];
-      });
+      }
     }
-  });
+  }
   
 }
 
-template<int BK, int V, int MS>
+template<int BK, int V, int MS, int KNR>
 __global__ void relu_bat_c_fused_kernel_float4_sync(
-    const float* __restrict__ A, 
-    const float* __restrict__ B, 
+    const float* __restrict__ A,
+    const float* __restrict__ B,
     const float* __restrict__ C,
-    float* __restrict__ Y,       
+    float* __restrict__ Y,
     int N, int M, int D)
 {
-
-  const int BM  = blockDim.x;
-  const int tid = threadIdx.x;
-  const int m   = blockIdx.x * MS * BM + tid;
   
+  
+  static_assert(BK % KNR == 0, "BK must be divisible by KNR");
+
+  const int BM  = (int)blockDim.x;
+  const int tid = (int)threadIdx.x;
+  const int m0  = (int)(blockIdx.x * MS * BM + tid);
 
   __shared__ alignas(16) float4 As4[BK][V];
   __shared__ alignas(16) float4 Cs4[BK][V];
 
-  const float4* __restrict__ A4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(A, 16));
-  const float4* __restrict__ B4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(B, 16));
-  const float4* __restrict__ C4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(C, 16));
-
-  float4* __restrict__ Y4       = reinterpret_cast<float4*>(__builtin_assume_aligned(Y, 16));
+  const float4* __restrict__ A4 = reinterpret_cast<const float4*>(A);
+  const float4* __restrict__ B4 = reinterpret_cast<const float4*>(B);
+  const float4* __restrict__ C4 = reinterpret_cast<const float4*>(C);
+  float4* __restrict__ Y4       = reinterpret_cast<float4*>(Y);
 
   float4 b[MS][V] = {0.f};
   float4 y[MS][V] = {0.f};
 
-  float4 a0[V] = {0.f};
-  float4 a1[V] = {0.f};
-  float4 c0[V] = {0.f};
-  float4 c1[V] = {0.f};
+  float4 a[KNR][V] = {0.f};
 
-  static_for<MS>([&](auto J) {
-    if (m + J*BM < M) {
-      static_for<V>([&](auto I) {
-        b[J][I] = B4[(m + J*BM) * (D/4) + I];
-      });
+  float score[MS][KNR] = {0.f};
+  // MS=4, V=4, KNR=2
+  // MS * V * 2 float4 = MS * V * 2 * 4 Registers = 4 * 4 * 2 * 4 = 128 Regs for b and y
+  // KNR * V * float4 = 2 * 4 * 4 Regs = 32 Regs for a
+  // MS * KNR * 1 Regs = 8 Regs for score
+  // at least 168 regs -> 3 warps per scheduler max
+  #pragma unroll
+  for (int j = 0; j < MS; ++j) {
+    #pragma unroll
+    for (int i = 0; i < V; ++i) {
+      y[j][i] = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (m0 + j * BM < M) {
+        b[j][i] = B4[(m0 + j * BM) * V + i];
+      }
     }
-  });
-  
+  }
+
   for (int n0 = 0; n0 < N; n0 += BK) {
 
-    issue_tile_float4_sync<BK,V>(As4, A4, tid, BM, n0, N, D / 4);
-    issue_tile_float4_sync<BK,V>(Cs4, C4, tid, BM, n0, N, D / 4);
+    for (int idx = tid; idx < BK*V; idx += BM) {
+      const int k  = idx / V;
+      const int dv = idx - k * V;
+      const int n  = n0 + k;
+
+      const float4 z = make_float4(0.f, 0.f, 0.f, 0.f);
+      As4[k][dv] = (n < N) ? __ldg(&A4[n * V + dv]) : z;
+      Cs4[k][dv] = (n < N) ? __ldg(&C4[n * V + dv]) : z;
+    }
     __syncthreads();
 
-    static_for<V>([&](auto I) { 
-      a0[I] = As4[0][I]; 
-      c0[I] = Cs4[0][I];
-    });
-#pragma unroll
-    for (int k = 0; k < BK; ++k) {
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk += KNR) {
 
-      if (k+1 < BK) {
-        static_for<V>([&](auto I) { 
-          a1[I] = As4[k+1][I];
-          c1[I] = Cs4[k+1][I];
-        });
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int i = 0; i < V; ++i) {
+          a[r][i] = As4[kk + r][i];
+        }
       }
 
-      static_for<MS>([&](auto J) {
-        {
-          float acc = 0.f;
-          static_for<V>([&](auto I) {
-            acc = dot_float4(b[J][I], a0[I], acc);
-          });
-          acc = fmaxf(acc, 0.f);
-          static_for<V>([&](auto I) {
-            y[J][I] = axpy_float4(acc, c0[I], y[J][I]);
-          });
-        } 
-      });
-
-      if (k+1 < BK) {
-        static_for<V>([&](auto I) {
-          a0[I] = a1[I];
-          c0[I] = c1[I];
-        });
+      #pragma unroll
+      for (int j = 0; j < MS; ++j) {
+        #pragma unroll
+        for (int r = 0; r < KNR; ++r) {
+          score[j][r] = 0.f;
+        }
       }
+
+      #pragma unroll
+      for (int i = 0; i < V; ++i) {
+
+        #pragma unroll
+        for (int j = 0; j < MS; ++j) {
+          const float4 bj = b[j][i];
+
+          #pragma unroll
+          for (int r = 0; r < KNR; ++r) {
+            const float4 ar = a[r][i];
+            score[j][r] = dot_float4(bj,ar,score[j][r]);   
+          }
+        }
+      }
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int i = 0; i < V; ++i) {
+          a[r][i] = Cs4[kk + r][i];
+        }
+      }
+
+      #pragma unroll
+      for (int r = 0; r < KNR; ++r) {
+        #pragma unroll
+        for (int j = 0; j < MS; ++j) {
+          const float alpha = fmaxf(score[j][r], 0.f);
+
+          #pragma unroll
+          for (int i = 0; i < V; ++i) {
+            const float4 ar = a[r][i];
+            y[j][i] = axpy_float4(alpha, ar, y[j][i]);
+          }
+        }
+      }
+
+
+
     }
 
     __syncthreads();
   }
 
-  static_for<MS>([&](auto J) {
-    if (m + J*BM < M) {
-      static_for<V>([&](auto I) {
-        Y4[(m + J*BM) * (D/4) + I] = y[J][I];
-      });
+  #pragma unroll
+  for (int j = 0; j < MS; ++j) {
+    const int row = m0 + j * BM;
+    if (row < M) {
+      #pragma unroll
+      for (int i = 0; i < V; ++i) {
+        Y4[row * V + i] = y[j][i];
+      }
     }
-  });
-  
+  }
 }
 
 
@@ -336,8 +377,7 @@ inline void dispatch_from_values(int value, F&& f, const char* name) {
   TORCH_CHECK(ok, "Unsupported ", name, "=", value);
 }
 
-
-template<int BK, int V, int STAGES, int MS>
+template<int BK, int V, int STAGES, int MS, int KNR>
 inline void launch_relu_bat_c_fused(
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
@@ -346,23 +386,21 @@ inline void launch_relu_bat_c_fused(
     at::Tensor& Y,
     int N, int M, int D)
 {
-
-  if constexpr (STAGES==1) {
-    relu_bat_c_fused_kernel_float4_sync<BK, V, MS><<<grid, block, 0, stream>>>(
-      (const float*)A.data_ptr<float>(),
-      (const float*)B.data_ptr<float>(),
-      (const float*)C.data_ptr<float>(),
-      (float*)Y.data_ptr<float>(),
-      N, M, D);
+  if constexpr (STAGES == 1) {
+    relu_bat_c_fused_kernel_float4_sync<BK, V, MS, KNR><<<grid, block, 0, stream>>>(
+        (const float*)A.data_ptr<float>(),
+        (const float*)B.data_ptr<float>(),
+        (const float*)C.data_ptr<float>(),
+        (float*)Y.data_ptr<float>(),
+        N, M, D);
   } else {
-    relu_bat_c_fused_kernel_float4<BK, V, STAGES, MS><<<grid, block, 0, stream>>>(
-      (const float*)A.data_ptr<float>(),
-      (const float*)B.data_ptr<float>(),
-      (const float*)C.data_ptr<float>(),
-      (float*)Y.data_ptr<float>(),
-      N, M, D);
+    relu_bat_c_fused_kernel_float4<BK, V, STAGES, MS, KNR><<<grid, block, 0, stream>>>(
+        (const float*)A.data_ptr<float>(),
+        (const float*)B.data_ptr<float>(),
+        (const float*)C.data_ptr<float>(),
+        (float*)Y.data_ptr<float>(),
+        N, M, D);
   }
-  
 }
 
 inline void dispatch(
@@ -370,6 +408,7 @@ inline void dispatch(
     int num_stages,
     int BK,
     int MS_runtime,
+    int KNR_runtime,
     dim3 grid, dim3 block, cudaStream_t stream,
     const at::Tensor& A,
     const at::Tensor& B,
@@ -389,8 +428,13 @@ inline void dispatch(
         dispatch_from_values<1,2,4>(MS_runtime, [&](auto MSc) {
           constexpr int MS = decltype(MSc)::value;
 
-          launch_relu_bat_c_fused<BK_, V, STAGES, MS>(
-              grid, block, stream, A, B, C, Y, N, M, D);
+          dispatch_from_values<1,2,4>(KNR_runtime, [&](auto KNRc) {
+            constexpr int KNR = decltype(KNRc)::value;
+
+              launch_relu_bat_c_fused<BK_, V, STAGES, MS, KNR>(
+                  grid, block, stream, A, B, C, Y, N, M, D);
+          }, "KNR");
+
         }, "MS");
 
       }, "BK");
@@ -407,7 +451,8 @@ torch::Tensor relu_bat_c_fused_cuda(
     int64_t BM,
     int64_t BK,
     int64_t num_stages,
-    int64_t num_ms = 1)
+    int64_t num_ms, 
+    int64_t num_knr)
 {
   CHECK_CUDA(A); CHECK_CUDA(B);
   CHECK_CUDA(C);
@@ -437,7 +482,7 @@ torch::Tensor relu_bat_c_fused_cuda(
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, num_ms * BM));
 
-  dispatch(V, num_stages, BK, num_ms, grid, block, stream, A, B, C, Y, N, M, D);
+  dispatch(V, num_stages, BK, num_ms, num_knr, grid, block, stream, A, B, C, Y, N, M, D);
   
 
   auto err = cudaGetLastError();
