@@ -318,7 +318,6 @@ def relu_bat_c_constraints(
     BK: int,
     num_stages: int,
     num_ms: int,
-    KNR: int,
 ) -> bool:
     if A.device != B.device or A.device != C.device:
         return False
@@ -342,15 +341,9 @@ def relu_bat_c_constraints(
         return False
     if num_stages not in (1, 2, 3, 4):
         return False
-    if num_ms not in (1, 2, 4):
-        return False
-    if KNR not in (1, 2, 4, 8, 16):
-        return False
+    # if num_ms not in (1, 2, 4):
+    #     return False
 
-    if KNR < 1 or KNR > BK:
-        return False
-    if BK % KNR != 0:
-        return False
 
     if BM == 384 and num_ms == 4:
         return False
@@ -380,9 +373,8 @@ def relu_bat_c_validate(
     BK: int,
     num_stages: int,
     num_ms: int,
-    KNR: int,
 ) -> None:
-    del BM, BK, num_stages, num_ms, KNR
+    del BM, BK, num_stages, num_ms
     ref = relu_bat_c_reference(A, B, C)
     torch.testing.assert_close(output, ref, rtol=1e-4, atol=1e-4)
 

@@ -153,11 +153,10 @@ def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
 def relu_bat_c_cuda_launcher():
     @autotune_cuda_kernel(
         configs={
-            "BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128],
+            "BM": [32, 64, 128, 256],
+            "BK": [16, 32, 64],
             "num_stages": [1, 2, 3],
-            "num_ms": [1, 2, 4],
-            "KNR": [1, 2, 4],
+            "num_ms": [4,6],
         },
         key_fn=relu_bat_c_key,
         constraint_fn=relu_bat_c_constraints,
@@ -166,11 +165,10 @@ def relu_bat_c_cuda_launcher():
         n_trials=1000,
         warmup=5,
         rep=50,
-        sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128],
+        sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256],
+            "BK": [16, 32, 64],
             "num_stages": [1, 2, 3],
-            "num_ms": [1, 2, 4],
-            "KNR": [1, 2, 4]})
+            "num_ms": [4, 6]})
     )
     def relu_bat_c_cuda(
         A: torch.Tensor,
@@ -180,9 +178,8 @@ def relu_bat_c_cuda_launcher():
         BK: int,
         num_stages: int,
         num_ms: int,
-        KNR:  int,
     ) -> torch.Tensor:
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_stages, num_ms, KNR)
+        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_stages, num_ms)
     return relu_bat_c_cuda
 
 
@@ -251,7 +248,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    r = bench_one(M=140800, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    r = bench_one(M=145408, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     #r = bench_one(M=145408, N=14540, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
 
