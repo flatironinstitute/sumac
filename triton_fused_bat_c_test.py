@@ -155,7 +155,7 @@ def relu_bat_c_cuda_launcher():
         configs={
             "BM": [32, 64, 128, 256],
             "BK": [16, 32, 64],
-            "num_stages": [1, 2, 3],
+            "num_stages": [1],
             "num_ms": [4,6],
         },
         key_fn=relu_bat_c_key,
@@ -167,7 +167,7 @@ def relu_bat_c_cuda_launcher():
         rep=50,
         sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256],
             "BK": [16, 32, 64],
-            "num_stages": [1, 2, 3],
+            "num_stages": [1],
             "num_ms": [4, 6]})
     )
     def relu_bat_c_cuda(
@@ -191,9 +191,9 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
     
     ref = torch_impl(A, B, C)
     relu_bat_c_tuned = relu_bat_c_cuda_launcher()
-    out_triton = relu_bat_c_fused(A, B, C)
+    # out_triton = relu_bat_c_fused(A, B, C)
 
-    err_triton = (out_triton - ref).abs().max().item()
+    # err_triton = (out_triton - ref).abs().max().item()
 
     out_cuda = relu_bat_c_tuned(A, B, C)
 
@@ -201,14 +201,14 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
 
 
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
-    print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
+    # print(f"  triton fused (1D)           max_abs_err vs torch: {err_triton:.6e}")
     print(f"  cuda fused (1D)             max_abs_err vs torch: {err_cuda:.6e}")
 
     def torch_run():
         return torch_impl(A, B, C)
 
-    def triton_run():
-        return relu_bat_c_fused(A, B, C)
+    # def triton_run():
+    #     return relu_bat_c_fused(A, B, C)
     
     def cuda_run():
         return relu_bat_c_tuned(A, B, C)
@@ -216,21 +216,21 @@ def bench_one(M: int, N: int, D: int, dtype=torch.float32, device="cuda", wm_ite
     torch.cuda.synchronize()
 
     t_torch   = triton.testing.do_bench(torch_run,          warmup=wm_iters, rep=iters)
-    t_triton  = triton.testing.do_bench(triton_run,         warmup=wm_iters, rep=iters)
+    # t_triton  = triton.testing.do_bench(triton_run,         warmup=wm_iters, rep=iters)
     t_cuda    = triton.testing.do_bench(cuda_run,           warmup=wm_iters, rep=iters)
 
     return {
         "M": M, "N": N, "D": D, "dtype": str(dtype).replace("torch.", ""),
 
-        "max_abs_err_triton":  float(err_triton),
+        # "max_abs_err_triton":  float(err_triton),
         "max_abs_err_cuda":    float(err_cuda),
         "torch_ms":   float(t_torch),
-        "triton_ms":  float(t_triton),
+        # "triton_ms":  float(t_triton),
         "cuda_ms":    float(t_cuda),
         "torch_TFLOPs":   float(ms_to_tflops(M, N, D, t_torch)),
-        "triton_TFLOPs":  float(ms_to_tflops(M, N, D, t_triton)),
+        # "triton_TFLOPs":  float(ms_to_tflops(M, N, D, t_triton)),
         "cuda_TFLOPs":    float(ms_to_tflops(M, N, D, t_cuda)),
-        "speedup_triton":  float(t_torch / t_triton),
+        # "speedup_triton":  float(t_torch / t_triton),
         "speedup_cuda": float(t_torch/t_cuda),
     }
 
@@ -249,6 +249,12 @@ if __name__ == "__main__":
     assert torch.cuda.is_available()
 
     r = bench_one(M=145408, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
+    r = bench_one(M=145408, N=1408, D=17, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
+    r = bench_one(M=145408, N=1408, D=18, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
+    r = bench_one(M=145408, N=1408, D=19, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     #r = bench_one(M=145408, N=14540, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
 

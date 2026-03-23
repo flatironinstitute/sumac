@@ -17,6 +17,15 @@ static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 #define CHECK_F32(x)  TORCH_CHECK(x.scalar_type() == at::kFloat, #x " must be float32")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+__device__ __forceinline__ float4 load4_scalar(const float* p) {
+  return make_float4(p[0], p[1], p[2], p[3]);
+}
+
+__device__ __forceinline__ float2 load2_scalar(const float* p) {
+  return make_float2(p[0], p[1]);
+}
+
+
 __device__ __forceinline__ float dot_float4(const float4& A, const float4& B, const float c) {
   float r = fmaf(A.x, B.x, c);
   r = fmaf(A.y, B.y, r);
@@ -34,6 +43,18 @@ __device__ __forceinline__ float4 axpy_float4(const float alpha, const float4& X
   );
 }
 
+__device__ __forceinline__ float dot_float2(const float2& A, const float2& B, const float c) {
+  float r = fmaf(A.x, B.x, c);
+  r = fmaf(A.y, B.y, r);
+  return r;
+}
+
+__device__ __forceinline__ float2 axpy_float2(const float alpha, const float2& X, const float2& Y) {
+  return make_float2(
+    fmaf(alpha, X.x, Y.x),
+    fmaf(alpha, X.y, Y.y)
+  );
+}
 
 
 template<int BK, int V, int STAGES>
@@ -87,6 +108,94 @@ __device__ __forceinline__ void copy_tiles_async_float4(
     }
   }
 }
+
+
+template<int BK, int V, int R>
+__device__ __forceinline__ void copy_tiles_mixed_sync(
+    float4 As4[BK][V],
+    float2* __restrict__ As2_flat, 
+    float*  __restrict__ As1_flat, 
+    const float* __restrict__ A,
+    float4 Cs4[BK][V],
+    float2* __restrict__ Cs2_flat,
+    float*  __restrict__ Cs1_flat,
+    const float* __restrict__ C, 
+    int tid, int BM, int n0, int N)
+{
+  constexpr bool HAS2 = (R >= 2);
+  constexpr bool HAS1 = (R == 1 || R == 3);
+
+  const int full_elems = BK * V;
+  for (int idx = tid; idx < full_elems; idx += BM) {
+    const int k  = idx / V;
+    const int dv = idx - k * V;
+    const int n  = n0 + k;
+
+    float4* smem_ptr_A = &As4[k][dv];
+    float4* smem_ptr_C = &Cs4[k][dv];
+
+    if (n < N) {
+      const float* row_A = A + n * (4*V + R); 
+      const float* p_A   = row_A + 4*dv;
+      const float* row_C = C + n * (4*V + R); 
+      const float* p_C   = row_C + 4*dv;
+
+      if (((uintptr_t)p_A & 0xF) == 0) {
+        *smem_ptr_A = __ldg(reinterpret_cast<const float4*>(p_A));
+      } else {
+        *smem_ptr_A = load4_scalar(p_A);
+      }
+      if (((uintptr_t)p_C & 0xF) == 0) {
+        *smem_ptr_C = __ldg(reinterpret_cast<const float4*>(p_C));
+      } else {
+        *smem_ptr_C = load4_scalar(p_C);   
+      }
+    } else {
+      *smem_ptr_A = make_float4(0.f,0.f,0.f,0.f);
+      *smem_ptr_C = make_float4(0.f,0.f,0.f,0.f);
+    }
+  }
+
+  for (int k = tid; k < BK; k += BM) {
+    const int n = n0 + k;
+    if (n >= N) {
+      if constexpr (HAS2) {
+        As2_flat[k] = make_float2(0.f, 0.f);
+        Cs2_flat[k] = make_float2(0.f, 0.f);
+      }
+      if constexpr (HAS1) {
+        As1_flat[k] = 0.f;
+        Cs1_flat[k] = 0.f;
+      }
+        continue;
+    }
+
+    const float* row_A = A + n * (4*V + R);
+    const float* tail_A = row_A + 4*V;
+    const float* row_C = C + n * (4*V + R);
+    const float* tail_C = row_C + 4*V;
+
+    if constexpr (HAS2) {
+      if (((uintptr_t)tail_A & 0x7) == 0) {
+        As2_flat[k] = __ldg(reinterpret_cast<const float2*>(tail_A));
+      } else {
+        As2_flat[k] = load2_scalar(tail_A);
+      }
+      if (((uintptr_t)tail_C & 0x7) == 0) {
+        Cs2_flat[k] = __ldg(reinterpret_cast<const float2*>(tail_C));
+      } else {
+        Cs2_flat[k] = load2_scalar(tail_C);
+      }
+    }
+
+    if constexpr (HAS1) {
+      const int off = (HAS2 ? 2 : 0);
+      As1_flat[k] = tail_A[off];
+      Cs1_flat[k] = tail_C[off];
+    }
+  }
+}
+
 
 template<int BK, int V, int STAGES, int MS>
 __global__ void relu_bat_c_fused_kernel_float4(
@@ -326,6 +435,135 @@ __global__ void relu_bat_c_fused_kernel_float4_sync(
 }
 
 
+template<int BK, int V, int R, int MS>
+__global__ void relu_bat_c_fused_kernel_mixed_sync(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    const float* __restrict__ C,
+    float* __restrict__ Y,       
+    int N, int M, int D)
+{
+  
+  static_assert(R >= 0 && R <=3);
+
+  constexpr bool HAS2 = (R >= 2);
+  constexpr bool HAS1 = (R == 1 || R == 3);
+
+  const int BM  = blockDim.x;
+  const int tid = threadIdx.x;
+  const int m   = blockIdx.x * MS * BM + tid;
+  
+
+  __shared__ alignas(16) float4 As4[BK][V];
+  __shared__ alignas(16) float4 Cs4[BK][V];
+  __shared__ float2 As2[BK];
+  __shared__ float As[BK];
+  __shared__ float2 Cs2[BK];
+  __shared__ float Cs[BK];
+  
+
+  const float4* __restrict__ A4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(A, 16));
+  const float4* __restrict__ B4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(B, 16));
+  const float4* __restrict__ C4 = reinterpret_cast<const float4*>(__builtin_assume_aligned(C, 16));
+  float4* __restrict__ Y4       = reinterpret_cast<float4*>(__builtin_assume_aligned(Y, 16));
+
+  float4 b[MS][V] = {0.f};
+  float2 b2[MS]       = {0.f};
+  float b1[MS]        = {0.f};
+  float4 y[MS][V] = {0.f};
+  float2 y2[MS]   = {0.f};
+  float  y1[MS]   = {0.f};
+  float4 a[V]     = {0.f};
+  float score[MS] = {0.f};
+  float2 a2       = {0.f};
+  float a1        = {0.f};
+
+  #pragma unroll
+  for (int J = 0; J < MS; ++J) {
+    const float* Brow = B + (m + J*BM) * D;
+    if (m + J*BM < M) {
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
+        b[J][I] = load4_scalar(Brow + 4*I);
+      }
+      if constexpr (HAS2) b2[J] = load2_scalar(Brow + 4 * V);
+      if constexpr (HAS1) b1[J] = Brow[4*V + (HAS2 ? 2 : 0)];
+    }
+  }
+  
+  
+  for (int n0 = 0; n0 < N; n0 += BK) {
+    
+    copy_tiles_mixed_sync<BK,V,R>(As4, As2, As, A, Cs4, Cs2, Cs, C, tid, BM, n0, N);
+    __syncthreads();
+
+
+    #pragma unroll
+    for (int kk = 0; kk < BK; ++kk) {
+
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
+        a[I] = As4[kk][I];
+      }
+      if constexpr (HAS2) a2 = As2[kk];
+      if constexpr (HAS1) a1 = As[kk];
+
+      #pragma unroll
+      for (int J = 0; J < MS; ++J) {
+          score[J] = 0.f;
+      }
+
+      #pragma unroll
+      for (int J = 0; J < MS; ++J) {
+        #pragma unroll
+        for (int I = 0; I < V; ++I) {
+          const float4 bj = b[J][I];
+          score[J] = dot_float4(bj, a[I], score[J]);
+        }
+        if constexpr (HAS2) score[J] = dot_float2(b2[J], a2, score[J]);
+        if constexpr (HAS1) score[J] = fmaf(b1[J], a1, score[J]);
+      }
+
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
+        a[I] = Cs4[kk][I];
+      }
+      if constexpr (HAS2) a2 = Cs2[kk];
+      if constexpr (HAS1) a1 = Cs[kk];
+
+      #pragma unroll
+      for (int J = 0; J < MS; ++J) {
+        const float alpha = fmaxf(score[J], 0.f);
+
+        #pragma unroll
+        for (int I = 0; I < V; ++I) {
+          y[J][I] = axpy_float4(alpha, a[I], y[J][I]);
+        }
+        if constexpr (HAS2) y2[J] = axpy_float2(alpha, a2, y2[J]);
+        if constexpr (HAS1) y1[J] = fmaf(alpha, a1, y1[J]);
+      }
+    }
+
+    __syncthreads();
+    
+  }
+  #pragma unroll
+  for (int J = 0; J < MS; ++J) {
+    if (m + J*BM < M) {
+      float* Yrow = Y + (m + J*BM) * D;
+
+      #pragma unroll
+      for (int I = 0; I < V; ++I) {
+        const float4 v = y[J][I];
+        Yrow[4*I + 0] = v.x; Yrow[4*I + 1] = v.y; Yrow[4*I + 2] = v.z; Yrow[4*I + 3] = v.w;
+      }
+      if constexpr (HAS2) { Yrow[4*V + 0] = y2[J].x; Yrow[4*V + 1] = y2[J].y; }
+      if constexpr (HAS1) { Yrow[4*V + (HAS2 ? 2 : 0)] = y1[J]; }
+    }
+  }
+  
+}
+
 template<int... Xs, class F>
 inline bool dispatch_from_values_impl(int value, std::integer_sequence<int, Xs...>, F&& f) {
   bool matched = false;
@@ -365,6 +603,25 @@ inline void launch_relu_bat_c_fused(
   }
 }
 
+template<int BK, int V, int R, int STAGES, int MS>
+inline void launch_relu_bat_c_fused_mixed(
+    dim3 grid, dim3 block, cudaStream_t stream,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  if constexpr (STAGES == 1) {
+    relu_bat_c_fused_kernel_mixed_sync<BK, V, R, MS><<<grid, block, 0, stream>>>(
+        (const float*)A.data_ptr<float>(),
+        (const float*)B.data_ptr<float>(),
+        (const float*)C.data_ptr<float>(),
+        (float*)Y.data_ptr<float>(),
+        N, M, D);
+  } 
+}
+
 inline void dispatch(
     int V_runtime,
     int num_stages,
@@ -401,6 +658,50 @@ inline void dispatch(
   }, "V");
 }
 
+
+inline void dispatch_R(
+    int V_runtime,
+    int R_runtime,
+    int num_stages,
+    int BK,
+    int MS_runtime,
+    dim3 grid, dim3 block, cudaStream_t stream,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    at::Tensor& Y,
+    int N, int M, int D)
+{
+  dispatch_from_values<4>(V_runtime, [&](auto Vc) {
+    constexpr int V = decltype(Vc)::value;
+
+    dispatch_from_values<1,2,3>(R_runtime, [&](auto Rc) {
+      constexpr int R = decltype(Rc)::value;
+
+        dispatch_from_values<1>(num_stages, [&](auto Sc) {
+          constexpr int STAGES = decltype(Sc)::value;
+
+          dispatch_from_values<16,32,64>(BK, [&](auto BKc) {
+            constexpr int BK_ = decltype(BKc)::value;
+
+            dispatch_from_values<4,6>(MS_runtime, [&](auto MSc) {
+              constexpr int MS = decltype(MSc)::value;
+
+                  launch_relu_bat_c_fused_mixed<BK_, V, R, STAGES, MS>(
+                      grid, block, stream, A, B, C, Y, N, M, D);
+
+            }, "MS");
+
+          }, "BK");
+
+        }, "num_stages");
+      
+      }, "R");
+
+  }, "V");
+}
+
+
 torch::Tensor relu_bat_c_fused_cuda(
     torch::Tensor A,
     torch::Tensor B,
@@ -429,6 +730,7 @@ torch::Tensor relu_bat_c_fused_cuda(
   const int M = B.size(0);
   const int D = A.size(1);
   const int V = D / 4;
+  const int R = D % 4;
 
   auto Y = torch::empty({M, D}, torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
 
@@ -438,8 +740,11 @@ torch::Tensor relu_bat_c_fused_cuda(
   const dim3 block(BM);
   const dim3 grid(ceil_div(M, num_ms * BM));
 
-  dispatch(V, num_stages, BK, num_ms, grid, block, stream, A, B, C, Y, N, M, D);
-  
+  if (R == 0) {
+    dispatch(V, num_stages, BK, num_ms, grid, block, stream, A, B, C, Y, N, M, D);
+  } else {
+    dispatch_R(V, R, num_stages, BK, num_ms, grid, block, stream, A, B, C, Y, N, M, D);
+  }
 
   auto err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
