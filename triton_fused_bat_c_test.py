@@ -155,8 +155,7 @@ def relu_bat_c_cuda_launcher():
         configs={
             "BM": [32, 64, 128, 256],
             "BK": [16, 32, 64],
-            "num_stages": [1],
-            "num_ms": [4,6],
+            "num_ms": [2, 4, 6],
         },
         key_fn=relu_bat_c_key,
         constraint_fn=relu_bat_c_constraints,
@@ -167,8 +166,7 @@ def relu_bat_c_cuda_launcher():
         rep=50,
         sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256],
             "BK": [16, 32, 64],
-            "num_stages": [1],
-            "num_ms": [4, 6]})
+            "num_ms": [2, 4, 6]})
     )
     def relu_bat_c_cuda(
         A: torch.Tensor,
@@ -176,10 +174,9 @@ def relu_bat_c_cuda_launcher():
         C: torch.Tensor,
         BM: int,
         BK: int,
-        num_stages: int,
         num_ms: int,
     ) -> torch.Tensor:
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_stages, num_ms)
+        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_ms)
     return relu_bat_c_cuda
 
 
@@ -248,6 +245,13 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
+    r = bench_one(M=145408, N=1408, D=4, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
+    r = bench_one(M=145408, N=1408, D=8, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
+
+    r = bench_one(M=145408, N=1408, D=13, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    print(r)
     r = bench_one(M=145408, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
     r = bench_one(M=145408, N=1408, D=17, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)

@@ -316,7 +316,6 @@ def relu_bat_c_constraints(
     C: torch.Tensor,
     BM: int,
     BK: int,
-    num_stages: int,
     num_ms: int,
 ) -> bool:
     if A.device != B.device or A.device != C.device:
@@ -338,8 +337,6 @@ def relu_bat_c_constraints(
     if BM % 32 != 0:
         return False
     if BK not in (16, 32, 64, 128, 256):
-        return False
-    if num_stages not in (1, 2, 3, 4):
         return False
     # if num_ms not in (1, 2, 4):
     #     return False
@@ -371,10 +368,9 @@ def relu_bat_c_validate(
     C: torch.Tensor,
     BM: int,
     BK: int,
-    num_stages: int,
     num_ms: int,
 ) -> None:
-    del BM, BK, num_stages, num_ms
+    del BM, BK, num_ms
     ref = relu_bat_c_reference(A, B, C)
     torch.testing.assert_close(output, ref, rtol=1e-4, atol=1e-4)
 
