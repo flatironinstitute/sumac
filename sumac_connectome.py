@@ -15,6 +15,7 @@ from utils import _ensure_nccl_env
 
 if __name__ == '__main__':
     torch.set_float32_matmul_precision('high')
+    torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
     parser = argparse.ArgumentParser()
     parser.add_argument('--d', type=int, default=16)
     parser.add_argument('--iters', type=int, default=50)
@@ -29,7 +30,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_only', action='store_true', help='eval only')
     parser.add_argument('--eval_path', type=str, default='connectome_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'connectome.txt'
     parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'connectome.txt'
-
+    parser.add_argument('--compile_cache_path', type=str, default='sumac_compile_cache')
     args = parser.parse_args()
     # log experiment configuration
     args_dict = vars(args)
@@ -56,6 +57,13 @@ if __name__ == '__main__':
         print('Experiment Setting:')
         for key, value in args_dict.items():
             print(f"| {key}: {value}")
+
+    compile_artifact_file = "sumac_compile_artifacts.bin"
+    if os.path.exists(args.compile_cache_path):
+
+        artifact_bytes = open(os.path.join(args.compile_cache_path,compile_artifact_file), "rb").read()
+        torch.compiler.load_cache_artifacts(artifact_bytes)
+    
     # load data (3, E)
     data = np.loadtxt(args.filename).T
     S_index = torch.LongTensor(data[0:2,:])
@@ -98,6 +106,11 @@ if __name__ == '__main__':
 
         sys.stdout = old_stdout
         log_file.close()
+    
+    if not os.path.exists(args.compile_cache_path):
+            os.makedirs(args.compile_cache_path, exist_ok=True)
+    artifact_bytes, cache_info = torch.compiler.save_cache_artifacts()
+    open(os.path.join(args.compile_cache_path,compile_artifact_file), "wb").write(artifact_bytes)
 
 ##launch scripts
 #GPU: python sumac_connectome.py --iters 1000  --num_blocks 100 

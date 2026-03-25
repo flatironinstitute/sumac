@@ -13,13 +13,13 @@ from _sumac.tuning import *
 
 
 def relu_bat_c_cuda_launcher():
+    tuning_config = {
+        "BM": [32, 64, 128, 256],
+        "BK": [16, 32, 64],
+        "num_ms": [4,6]
+    }
     @autotune_cuda_kernel(
-        configs={
-            "BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128],
-            "num_stages": [1, 2, 3],
-            "num_ms": [1, 2, 4],
-        },
+        configs=tuning_config,
         key_fn=relu_bat_c_key,
         constraint_fn=relu_bat_c_constraints,
         validate_fn=relu_bat_c_validate,
@@ -27,10 +27,7 @@ def relu_bat_c_cuda_launcher():
         n_trials=500,
         warmup=5,
         rep=50,
-        sampler=optuna.samplers.GridSampler(search_space={"BM": [32, 64, 128, 256, 384],
-            "BK": [16, 32, 64, 128],
-            "num_stages": [1, 2, 3],
-            "num_ms": [1, 2, 4],})
+        sampler=optuna.samplers.GridSampler(search_space=tuning_config)
     )
     def relu_bat_c_cuda(
         A: torch.Tensor,
@@ -38,16 +35,15 @@ def relu_bat_c_cuda_launcher():
         C: torch.Tensor,
         BM: int,
         BK: int,
-        num_stages: int,
         num_ms: int,
     ) -> torch.Tensor:
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_stages, num_ms)
+        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_ms)
     return relu_bat_c_cuda
 
 
 relu_bat_c_tuned = relu_bat_c_cuda_launcher()
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=True)
 def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, stepM_blk, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
     #Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
     #stepM_blk = -stepM_blk @ AtAinv
@@ -73,7 +69,7 @@ def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, stepM_blk, dB_blk_dev, bl
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
     return B_blk_dev + dB_blk_new / unbias, dB_blk_new
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=True)
 def lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
     Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
     stepM_blk = -Mt_blk @ pinvAt_dev
@@ -98,7 +94,7 @@ def lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, mom
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
     return B_blk_dev + dB_blk_new / unbias, dB_blk_new
 
-@torch.compile(mode='max-autotune-no-cudagraphs')
+@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=True)
 def matmul_relu_fused(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, momentum, unbias):
     Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
     stepM_blk = -Mt_blk @ pinvAt_dev
@@ -172,9 +168,8 @@ def batch_update_multi_gpu(
     #AtAinv, pinvAt_cpu = prepare_invs(Ar_cpu) - not worth it
     torch.cuda.nvtx.range_pop()
 
-    momentum = opts.get('exaggerate', 0.7)
+    momentum = torch.tensor(opts.get('exaggerate', 0.7), device=Factor_fixed.device)
     unbias = 1 - (momentum ** stepnum)
-    
     next_B_blks = [None] * num_gpus
     next_dB_blks = [None] * num_gpus
     block_ranges = []

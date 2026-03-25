@@ -3,7 +3,7 @@ import torch
 from _sumac.dataset import block_span
 
 
-@torch.compile(fullgraph=True, mode="max-autotune")
+@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def block_loss_no_errz(
     A_block: torch.Tensor,   
     B: torch.Tensor,         
@@ -27,7 +27,7 @@ def block_loss_no_errz(
     errZ_num = mse_full
     return mse_full, sum_sr, jacc_num, errZ_num
 
-@torch.compile(fullgraph=True, mode="max-autotune")
+@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def block_loss_errz(
     A_block: torch.Tensor,
     B: torch.Tensor,
