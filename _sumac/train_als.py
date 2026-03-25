@@ -1,7 +1,4 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
 import math
  
 @torch.compile #if we compile this, we can get kernel fusion of the matmuls and clamp. Standalone clamp is expensive and entirely bandwidth bound
@@ -81,21 +78,8 @@ def least_squares_update_fast(
         B_blk_dev = B_devs[dev_idx][start:end] #(block_size, r) ##OLD
 
 
-        dB_block, sumSr_blk, ssqSr_blk = block_dense(A_dev, B_blk_dev, pinvA_trans_dev) #block_dense is jit-compiled version of the snippet below
+        dB_block, sumSr_blk, ssqSr_blk = block_dense(A_dev, B_blk_dev, pinvA_trans_dev) 
 
-        # # 1) reconstruct full block and immediately sparsify
-        # torch.cuda.nvtx.range_push("torch.clamp")
-        # dense_Sr = torch.clamp(A_dev @ B_blk_dev.T, min=0.0)      # (m, block_size)
-        # torch.cuda.nvtx.range_pop()
-
-        # torch.cuda.nvtx.range_push("coalesce")
-        # Sr = dense_Sr.to_sparse_coo().coalesce()          # keep only >0 entries
-        # torch.cuda.nvtx.range_pop()
-        # # 2) compute the first term -Sr
-        # torch.cuda.nvtx.range_push("sumSr ssqSr")
-        # sumSr_devs[dev_idx] += Sr.sum()
-        # ssqSr_devs[dev_idx] += (Sr * Sr).sum()
-        # torch.cuda.nvtx.range_pop()
 
         sumSr_devs[dev_idx] += sumSr_blk
         ssqSr_devs[dev_idx] += ssqSr_blk

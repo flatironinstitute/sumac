@@ -1,28 +1,18 @@
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader
 
 import math
 import time
 import random
-from data import dense_to_sparse, prune_zero_rows_cols
-from dataclasses import dataclass
-import os
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.utils import clip_grad_norm_
+from data import prune_zero_rows_cols
 import pickle
-from typing import Tuple
 
-from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset
+from _sumac.dataset import collate_blocks, StochasticRowBlockDataset
 from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
-                            zero_replica_grads, compute_backward_on_device, sync_all, wait_streams_before_reduce, \
+                            zero_replica_grads, compute_backward_on_device, wait_streams_before_reduce, \
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
-from _sumac.train_als import least_squares_update_fast, least_squares_update, refactor
+from _sumac.train_als import least_squares_update_fast, refactor
 from _sumac.train_salsa import update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 

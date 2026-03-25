@@ -1,12 +1,6 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import contextlib
 from contextlib import nullcontext
-from _sumac.dataset import block_span, RowBlockDataset
-import triton
-import triton.language as tl
-
+from _sumac.dataset import block_span
 import relu_bat_c_fused_cuda as kernel_ext
 from _sumac.tuning import *
 
@@ -16,7 +10,7 @@ def relu_bat_c_cuda_launcher():
     tuning_config = {
         "BM": [32, 64, 128, 256],
         "BK": [16, 32, 64],
-        "num_ms": [4,6]
+        "num_ms": [2,4,6]
     }
     @autotune_cuda_kernel(
         configs=tuning_config,
@@ -45,35 +39,8 @@ relu_bat_c_tuned = relu_bat_c_cuda_launcher()
 
 @torch.compile(mode='max-autotune-no-cudagraphs', dynamic=True)
 def lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, stepM_blk, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
-    #Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
-    #stepM_blk = -stepM_blk @ AtAinv
     stepM_blk = -stepM_blk
    
-    Lij_blk = torch.sum(Ar_dev[blk_idx[0], :] * B_blk_dev[blk_idx[1], :], dim=1)
-    Mij_blk = torch.relu(Lij_blk)
-
-    Ct_vals = blk_vals - Lij_blk + Mij_blk
-
-    bs = B_blk_dev.shape[0]
-    r = B_blk_dev.shape[1]
-
-    stepC_blk = torch.zeros((bs, r), device=B_blk_dev.device, dtype=B_blk_dev.dtype)
-
-    stepC_blk.index_add_(
-        0,
-        blk_idx[1],
-        Ct_vals[:, None] * pinvAt_dev[blk_idx[0], :]
-    )
-    lsqB_blk = B_blk_dev + stepM_blk + stepC_blk
-
-    dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
-    return B_blk_dev + dB_blk_new / unbias, dB_blk_new
-
-@torch.compile(mode='max-autotune-no-cudagraphs', dynamic=True)
-def lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias):
-    Mt_blk = torch.relu(B_blk_dev @ Ar_dev.T)
-    stepM_blk = -Mt_blk @ pinvAt_dev
-
     Lij_blk = torch.sum(Ar_dev[blk_idx[0], :] * B_blk_dev[blk_idx[1], :], dim=1)
     Mij_blk = torch.relu(Lij_blk)
 
@@ -104,12 +71,6 @@ def matmul_relu_fused(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, momentum, unbia
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
     return B_blk_dev + dB_blk_new / unbias, dB_blk_new
 
-# @torch.compile(mode='max-autotune-no-cudagraphs')
-# def prepare_invs(Ar_cpu):
-#     GramA = Ar_cpu.T @ Ar_cpu
-#     AtAinv = torch.linalg.pinv(GramA, hermitian=True)
-#     pinvAt_cpu = Ar_cpu @ AtAinv
-#     return AtAinv, pinvAt_cpu
 
 def update_factor_salsa(S_idx_full, S_val_full, dataset, block_id, Factor_fixed, Factor_update, dFactor, opts, stepnum, multi_gpu=True, streams=None, map_buffers=None):
     """
@@ -118,12 +79,11 @@ def update_factor_salsa(S_idx_full, S_val_full, dataset, block_id, Factor_fixed,
     # 1) Unpack indices
     torch.cuda.nvtx.range_push("Unpack indices")
     m_fixed = Factor_fixed.shape[0]
-    n_update = Factor_update.shape[0]
     _, edge_idx, row_indices = dataset[block_id]
     torch.cuda.nvtx.range_pop()
 
-    torch.cuda.nvtx.range_push("Slicing S")
     # 2) Slicing S (mimics sparse_slice in Matlab)
+    torch.cuda.nvtx.range_push("Slicing S")
     idx_raw = S_idx_full[:, edge_idx].clone()
     val_raw = S_val_full[edge_idx]
     torch.cuda.nvtx.range_pop() 
@@ -159,13 +119,10 @@ def batch_update_multi_gpu(
 
     # Pre-calculate pseudoinverse. We slice Factor_fixed first.
     torch.cuda.nvtx.range_push("pseudo-inverse")
-    # print(f"Factor_fixed is on {Factor_fixed.device}") Var names are confusing, this is already sitting on the GPU
-    Ar_cpu = Factor_fixed[row_indices_cpu, :]#.to(device_cpu, non_blocking=True)
-    GramA = (Ar_cpu.T @ Ar_cpu)#.to(device_cpu, non_blocking=True) #dxd - should probably not even solve this on the GPU
-    pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d) = A (A.T A)^(-1)
-    #AtAinv = torch.linalg.pinv(GramA, hermitian=True)#.to(devices[0], non_blocking=True)
-    #pinvAt_cpu = Ar_cpu @ AtAinv
-    #AtAinv, pinvAt_cpu = prepare_invs(Ar_cpu) - not worth it
+    Ar = Factor_fixed[row_indices_cpu, :]
+
+    GramA = (Ar.T @ Ar)
+    pinvAt_cpu = torch.linalg.solve(GramA, Ar.T).T  # (m_batch, d) = A (A.T A)^(-1)
     torch.cuda.nvtx.range_pop()
 
     momentum = torch.tensor(opts.get('exaggerate', 0.7), device=Factor_fixed.device)
@@ -183,18 +140,13 @@ def batch_update_multi_gpu(
         with ctx:
             # 1. Transfers (async on GPU, normal copies on CPU)
             torch.cuda.nvtx.range_push("H2D")
-            #AtAinv_dev = AtAinv.to(dev, non_blocking=use_cuda)
-            Ar_dev = Ar_cpu.to(dev, non_blocking=use_cuda)
+            Ar_dev = Ar.to(dev, non_blocking=use_cuda)
             row_idx_dev = row_indices_cpu.to(dev, non_blocking=use_cuda)
             pinvAt_dev = pinvAt_cpu.to(dev, non_blocking=use_cuda)
             B_blk_dev = B[start:end, :].to(dev, non_blocking=use_cuda)
             dB_blk_dev = dB[start:end, :].to(dev, non_blocking=use_cuda)
             torch.cuda.nvtx.range_pop()
-            # 2. Parallel Masking and Re-mapping
-            torch.cuda.nvtx.range_push("mask")
-            #mask = (Sr_idx_raw[1] >= start) & (Sr_idx_raw[1] < end)
-            torch.cuda.nvtx.range_pop()
-            # if mask.any():
+
             
             torch.cuda.nvtx.range_push("set blk_idx, blk_vals")
             blk_idx = Sr_idx_raw.to(dev, non_blocking=use_cuda)
@@ -214,19 +166,13 @@ def batch_update_multi_gpu(
 
             torch.cuda.nvtx.range_push("lsq_update")
             tmp = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev)
-            #tmp = relu_bat_a_fused(Ar_dev, B_blk_dev)
             B_blk_new, dB_blk_new = lsq_update_nomatmul(Ar_dev, B_blk_dev, pinvAt_dev, tmp, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
-            #B_blk_new, dB_blk_new = lsq_update(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, blk_idx, blk_vals, momentum, unbias)
             torch.cuda.nvtx.range_pop()
-            # else:
-            #     print("Alternative path was taken!")
-            #     torch.cuda.nvtx.range_push("matmul_relu_fused")
-            #     B_blk_new, dB_blk_new = matmul_relu_fused(Ar_dev, B_blk_dev, pinvAt_dev, dB_blk_dev, momentum, unbias)
-            #     torch.cuda.nvtx.range_pop()
+            
 
             # 4. Momentum and Back
-            next_B_blks[dev_idx] = B_blk_new #.to(devices[dev_idx], non_blocking=use_cuda)
-            next_dB_blks[dev_idx] = dB_blk_new #.to(devices[dev_idx], non_blocking=use_cuda) this was causing a circular D2H - H2D copy
+            next_B_blks[dev_idx] = B_blk_new 
+            next_dB_blks[dev_idx] = dB_blk_new
 
     # Synchronize only if using CUDA
     if use_cuda:
@@ -234,10 +180,10 @@ def batch_update_multi_gpu(
             s.synchronize()
 
     torch.cuda.nvtx.range_push("nextB setup")
-    nextB = torch.empty_like(B)  #B and dB are on the device
+    nextB = torch.empty_like(B)  
     next_dB = torch.empty_like(dB)
     for i, (start, end) in enumerate(block_ranges):
-        nextB[start:end] = next_B_blks[i]  #this would trigger H2D and form a D2H H2D loop with the "4. Momentum and Back" block
+        nextB[start:end] = next_B_blks[i]  
         next_dB[start:end] = next_dB_blks[i]
     torch.cuda.nvtx.range_pop()
     return nextB, next_dB

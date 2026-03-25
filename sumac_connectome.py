@@ -1,14 +1,13 @@
 import torch 
 import argparse 
 import os
-import pickle
 import numpy as np
 
 from data import *
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from sumac import sumac 
-from _sumac.dataset import block_span, RowBlockDataset, collate_blocks
+from _sumac.dataset import RowBlockDataset, collate_blocks
 from _sumac.eval import eval 
 import sys
 from utils import _ensure_nccl_env

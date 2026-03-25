@@ -574,7 +574,7 @@ inline bool dispatch_from_values_impl(int value, std::integer_sequence<int, Xs..
 template<int... Xs, class F>
 inline void dispatch_from_values(int value, F&& f, const char* name) {
   const bool ok = dispatch_from_values_impl(value, std::integer_sequence<int, Xs...>{}, std::forward<F>(f));
-  TORCH_CHECK(ok, "Unsupported ", name, "=", value);
+  TORCH_CHECK(ok, "Unsupported ", name, "=", value, ". Add ", name, "=", value, " to the dispatch set in fused_bat_c.cu and recompile the extension.");
 }
 
 template<int BK, int V, int MS>
