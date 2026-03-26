@@ -2,10 +2,10 @@ import torch
 import argparse 
 import os
 import numpy as np
-
+import scipy.io as sio
 from data import *
 from torch.utils.data import DataLoader
-
+import h5py
 from sumac import sumac 
 from _sumac.dataset import RowBlockDataset, collate_blocks
 from _sumac.eval import eval 
@@ -64,9 +64,21 @@ if __name__ == '__main__':
         torch.compiler.load_cache_artifacts(artifact_bytes)
     
     # load data (3, E)
-    data = np.loadtxt(args.filename).T
-    S_index = torch.LongTensor(data[0:2,:])
-    S_value = torch.FloatTensor(data[2,:])
+    if args.filename.endswith('.mat'):
+        mat = sio.loadmat(args.filename)
+        S = mat['S']
+
+        S = S.tocoo()
+
+        S_index = torch.tensor([S.row, S.col], dtype=torch.long)
+        S_value = torch.tensor(S.data, dtype=torch.float64 if args.float64 else torch.float32)
+
+    else:
+        data = np.loadtxt(args.filename).T
+
+        S_index = torch.LongTensor(data[0:2,:])
+        S_value = torch.FloatTensor(data[2,:])
+
     m = n = int(S_index[0].max())
     print(f'm=n={m}, E={len(S_value)}')
     # normalize to start at zero-index
