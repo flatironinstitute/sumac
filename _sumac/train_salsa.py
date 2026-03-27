@@ -1,29 +1,59 @@
 import torch
 from contextlib import nullcontext
 from _sumac.dataset import block_span
-import relu_bat_c_fused_cuda as kernel_ext
+# import relu_bat_c_fused_cuda as kernel_ext
 from _sumac.tuning import *
 
+from relu_batc_jit.jit_kernel import relu_bat_c_fused
 
+
+# def relu_bat_c_cuda_launcher():
+#     tuning_config = {
+#         "BM": [32, 64, 128, 256],
+#         "BK": [16, 32, 64],
+#         "num_ms": [2,4,6]
+#     }
+#     @autotune_cuda_kernel(
+#         configs=tuning_config,
+#         key_fn=relu_bat_c_key,
+#         constraint_fn=relu_bat_c_constraints,
+#         validate_fn=relu_bat_c_validate,
+#         cache_path="relu_bat_c_autotune.json",
+#         n_trials=500,
+#         warmup=5,
+#         rep=50,
+#         sampler=optuna.samplers.GridSampler(search_space=tuning_config)
+#     )
+#     def relu_bat_c_cuda(
+#         A: torch.Tensor,
+#         B: torch.Tensor,
+#         C: torch.Tensor,
+#         BM: int,
+#         BK: int,
+#         num_ms: int,
+#     ) -> torch.Tensor:
+#         return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_ms)
+#     return relu_bat_c_cuda
 
 def relu_bat_c_cuda_launcher():
-    tuning_config = {
-        "BM": [32, 64, 128, 256],
+    tune_config = {
+        "BM": [32, 64, 96, 128, 256],
         "BK": [16, 32, 64],
-        "num_ms": [2,4,6]
+        "num_ms": [1, 2, 4, 6],
     }
+
     @autotune_cuda_kernel(
-        configs=tuning_config,
-        key_fn=relu_bat_c_key,
-        constraint_fn=relu_bat_c_constraints,
-        validate_fn=relu_bat_c_validate,
-        cache_path="relu_bat_c_autotune.json",
-        n_trials=500,
-        warmup=5,
-        rep=50,
-        sampler=optuna.samplers.GridSampler(search_space=tuning_config)
+    configs=tune_config,
+    key_fn=relu_bat_c_key,
+    constraint_fn=relu_bat_c_constraints,
+    validate_fn=relu_bat_c_validate,
+    cache_path="relu_bat_c_jit_autotune.json",
+    n_trials=1000,
+    warmup=5,
+    rep=50,
+    sampler=optuna.samplers.GridSampler(search_space=tune_config)        
     )
-    def relu_bat_c_cuda(
+    def relu_batc(
         A: torch.Tensor,
         B: torch.Tensor,
         C: torch.Tensor,
@@ -31,8 +61,8 @@ def relu_bat_c_cuda_launcher():
         BK: int,
         num_ms: int,
     ) -> torch.Tensor:
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_ms)
-    return relu_bat_c_cuda
+        return relu_bat_c_fused(A, B, C, BK=BK, MS=num_ms, BM=BM)
+    return relu_batc
 
 
 relu_bat_c_tuned = relu_bat_c_cuda_launcher()
