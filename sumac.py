@@ -13,7 +13,7 @@ from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_r
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
 from _sumac.train_als import least_squares_update_fast, refactor
-from _sumac.train_salsa_new import update_factor_salsa
+from _sumac.train_salsa import update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
 def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
