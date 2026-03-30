@@ -1,5 +1,4 @@
 import functools
-import inspect
 import json
 import os
 import threading
@@ -55,20 +54,6 @@ def _normalize_for_json(x: Any) -> Any:
     return str(x)
 
 
-def _stable_key(d: Dict[str, Any]) -> str:
-    return json.dumps(_normalize_for_json(d), sort_keys=True)
-
-
-def _default_device_key(t: torch.Tensor) -> Dict[str, Any]:
-    props = torch.cuda.get_device_properties(t.device)
-    return {
-        "gpu_name": props.name,
-        "cc": [props.major, props.minor],
-        "sm_count": props.multi_processor_count,
-        "device_index": int(t.device.index if t.device.index is not None else 0),
-    }
-
-
 def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
     return float(
         triton.testing.do_bench(
@@ -88,23 +73,23 @@ class TuneResult:
 
 def autotune_cuda_kernel(
     *,
-    configs: Dict[str, list],
-    key_fn: Callable[..., Hashable],
-    constraint_fn: Optional[Callable[..., bool]] = None,
-    validate_fn: Optional[Callable[..., None]] = None,
-    cache_path: str = "kernel_autotune_cache.json",
-    n_trials: int = 24,
-    warmup: int = 25,
-    rep: int = 100,
+    configs,
+    key_fn,
+    constraint_fn=None,
+    validate_fn=None,
+    cache_path="kernel_autotune_cache.json",
+    n_trials=24,
+    warmup=25,
+    rep=100,
     sampler=None,
-    force_env_var: str = "KERNEL_AUTOTUNE_FORCE",
-    disable_env_var: str = "KERNEL_AUTOTUNE_DISABLE",
-    validate_env_var: str = "KERNEL_AUTOTUNE_VALIDATE",
-    verbose_env_var: str = "KERNEL_AUTOTUNE_VERBOSE",
+    force_env_var="KERNEL_AUTOTUNE_FORCE",
+    disable_env_var="KERNEL_AUTOTUNE_DISABLE",
+    validate_env_var="KERNEL_AUTOTUNE_VALIDATE",
+    verbose_env_var="KERNEL_AUTOTUNE_VERBOSE",
 ):
     store = JsonConfigStore(cache_path)
 
-    memo: Dict[Hashable, Dict[str, Any]] = {}
+    memo = {}
     default_params = {k: v[0] for k, v in configs.items()}
 
     if sampler is None:
@@ -115,19 +100,16 @@ def autotune_cuda_kernel(
     do_validate_default = os.getenv(validate_env_var, "0") == "1"
     verbose_default = os.getenv(verbose_env_var, "0") == "1"
 
-    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is required for this autotuned kernel")
-
+    def decorator(fn):
+        def resolve_params(*args, **kwargs):
+          
             if disable_default:
-                return fn(*args, **kwargs, **default_params)
+                return dict(default_params)
 
             mem_key = key_fn(*args, **kwargs)
             params = None if force_default else memo.get(mem_key)
             if params is not None:
-                return fn(*args, **kwargs, **params)
+                return params
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
@@ -135,7 +117,7 @@ def autotune_cuda_kernel(
             if payload is not None:
                 params = payload["params"]
                 memo[mem_key] = params
-                return fn(*args, **kwargs, **params)
+                return params
 
             result = _run_study(
                 fn=fn,
@@ -166,16 +148,21 @@ def autotune_cuda_kernel(
                     f"params={params} runtime_ms={result.runtime_ms:.4f}"
                 )
 
+            return params
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            params = resolve_params(*args, **kwargs)
             return fn(*args, **kwargs, **params)
 
-        def clear_memo() -> None:
+        def clear_memo():
             memo.clear()
 
+        wrapper.resolve_params = resolve_params
         wrapper.clear_memo = clear_memo
         return wrapper
 
     return decorator
-
 
 def _run_study(
     *,
@@ -286,10 +273,8 @@ def relu_bat_c_constraints(
     if BM == 384 and num_ms == 4:
         return False
 
-    V = D // 4
     R = D % 4
-    if V not in (1, 2, 3, 4):
-        return False
+
     if R not in (0, 1, 2, 3):
         return False
 

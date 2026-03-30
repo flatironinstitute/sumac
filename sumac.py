@@ -13,7 +13,7 @@ from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_r
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
 from _sumac.train_als import least_squares_update_fast, refactor
-from _sumac.train_salsa import update_factor_salsa
+from _sumac.train_salsa_new import update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
 def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
@@ -417,6 +417,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     else:
         streams, row_map_buffers, col_map_buffers = None, None, None
 
+    momentum = torch.tensor(opts.get("exaggerate", 0.7), device=A.device, dtype=A.dtype)
     for iter_idx in range(1, opts['max_iterate'] + 1):
         torch.cuda.nvtx.range_push("Iteration " + str(iter_idx))
         t_start = time.time()
@@ -430,17 +431,15 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
         
         for mb_idx, block_id in enumerate(block_order):
             stepnum = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
-
+            unbias = 1 - (momentum ** stepnum)
             torch.cuda.nvtx.range_push("update_factor_salsa B")
             # --- Update B ---
-            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, opts, stepnum,
-                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=row_map_buffers)
+            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias)
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("update_factor_salsa A")
             # --- Update A ---
-            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, opts, stepnum,
-                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=col_map_buffers)
+            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias)
             torch.cuda.nvtx.range_pop()
 
         # Metrics and Reporting
