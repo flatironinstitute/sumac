@@ -1,6 +1,7 @@
 import torch
 
 from _sumac.dataset import block_span
+from relu_abt_reduce_jit.jit_kernel import relu_abt_reduce_fused
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
@@ -31,13 +32,12 @@ def block_loss_no_errz(
 def block_loss_errz(
     A_block: torch.Tensor,
     B: torch.Tensor,
+    sum_sr: torch.Tensor,
+    sum_sr2: torch.Tensor,
     local_r: torch.Tensor,
     cols_all: torch.Tensor,
     vals_all: torch.Tensor,
 ):
-    Sr = torch.relu(A_block @ B.T)
-    sum_sr = Sr.sum()
-    sum_sr2 = (Sr * Sr).sum()
 
     A_obs = A_block[local_r]      
     B_obs = B[cols_all]           
@@ -48,13 +48,13 @@ def block_loss_errz(
     jacc_num = torch.minimum(vals_all, sr_obs).sum()
 
     ssq_vals = (vals_all * vals_all).sum()
-    mse_full = sum_sr2 - 2.0 * dot_obs + ssq_vals
+    mse_full = sum_sr2.squeeze() - 2.0 * dot_obs + ssq_vals
 
     neg = torch.relu(-L_obs)
     corr = (neg * neg + 2.0 * vals_all * neg).sum()
     errZ_num = mse_full + corr
 
-    return mse_full, sum_sr, jacc_num, errZ_num
+    return mse_full, sum_sr.squeeze(), jacc_num, errZ_num
 
 
 
@@ -128,12 +128,15 @@ def block_loss_and_pred(
         row_indices=row_indices,
         start=start,
     )
-
+#       torch.cuda.profiler.start()
     if errZ_obj:
-        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, local_r, cols_all, vals_all)
+        with torch.cuda.nvtx.range("block_loss_errz"):
+            sum_sr, sum_sr2 = relu_abt_reduce_fused(A_block, B, 32, 4, 128)
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, sum_sr, sum_sr2, local_r, cols_all, vals_all)
     else:
-        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)
-
+        with torch.cuda.nvtx.range("block_loss_no_errz"):
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)
+#    torch.cuda.profiler.stop()
     return mse_full, sumSr_block, jacc_num_block, errZ_num_block
 
 

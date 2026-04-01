@@ -418,9 +418,10 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
         streams, row_map_buffers, col_map_buffers = None, None, None
 
     momentum = torch.tensor(opts.get("exaggerate", 0.7), device=A.device, dtype=A.dtype)
+    t_start = time.time()
     for iter_idx in range(1, opts['max_iterate'] + 1):
         torch.cuda.nvtx.range_push("Iteration " + str(iter_idx))
-        t_start = time.time()
+
         # Truly stochastic sampling: reshuffle partitions every epoch
         torch.cuda.nvtx.range_push("reshuffle")
         ds_rows.reshuffle()
@@ -448,8 +449,8 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
                                     eval_loader, device=device, errZ_obj=True)
             
-            if num_gpus > 0:
-                torch.cuda.synchronize() ##timing on gpu
+            #if num_gpus > 0:
+            torch.cuda.synchronize() ##timing on gpu
             elapsed = time.time() - t_start
             rmse_hist.append(rmse)
             jacc_hist.append(jacc)
@@ -457,6 +458,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             
             if opts['display']:
                 print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
+            t_start = time.time()
         torch.cuda.nvtx.range_pop()
     # WRAP UP
     A, B = refactor(A, B)

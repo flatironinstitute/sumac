@@ -81,6 +81,7 @@ if __name__ == '__main__':
 
     m = n = int(S_index[0].max())
     print(f'm=n={m}, E={len(S_value)}')
+    # print(torch._inductor.list_options())
     # normalize to start at zero-index
     S_index -= 1
     dtype = torch.float64 if args.float64 else torch.float32
