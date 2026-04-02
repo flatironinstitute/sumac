@@ -359,7 +359,6 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     """
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
-    dtype = opts['dtype']
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
     S_index = S_index.to(device)
     S_value = S_value.to(device)
@@ -374,22 +373,15 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
 
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
-    # print(f"A.device = {A.device}")
-    # print(f"A.shape = {A.shape}")
-    # print(f"dA.device = {dA.device}")
-    # print(f"dA.shape = {dA.shape}")
-    # print(f"B.device = {B.device}")
-    # print(f"B.shape = {B.shape}")
-    # print(f"dB.device = {dB.device}")
-    # print(f"dB.shape = {dB.shape}")
+
     
     # Datasets for row and column blocks
-    #ds_rows = RowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+
     torch.cuda.nvtx.range_push("StochasitcRowBlockDataset rows")
     ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'])
-    S_index_T = S_index[[1, 0], :]
-    #ds_cols = RowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+    S_index_T = S_index[[1, 0], :] 
     torch.cuda.nvtx.range_pop()
+
     torch.cuda.nvtx.range_push("StochasticRowBlockDataset cols")
     ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
     torch.cuda.nvtx.range_pop()
@@ -404,19 +396,8 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     jacc_hist = []
     time_hist = []
     
-    t_start_loop = time.time()
-    # --- PERSISTENT CUDA INFRASTRUCTURE (eliminates launch overhead) ---
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    multi_gpu_internal = (num_gpus > 1) 
+    t_start_loop = time.time()    
     
-    if num_gpus > 0:
-        devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
-        streams = [torch.cuda.Stream(device=d) for d in devices]
-        row_map_buffers = [torch.zeros(m, dtype=torch.long, device=d) for d in devices]
-        col_map_buffers = [torch.zeros(n, dtype=torch.long, device=d) for d in devices]
-    else:
-        streams, row_map_buffers, col_map_buffers = None, None, None
-
     momentum = torch.tensor(opts.get("exaggerate", 0.7), device=A.device, dtype=A.dtype)
     t_start = time.time()
     for iter_idx in range(1, opts['max_iterate'] + 1):
@@ -431,8 +412,10 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
         #random.shuffle(block_order) -- only used for deterministic minibatch
         
         for mb_idx, block_id in enumerate(block_order):
+
             stepnum = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
             unbias = 1 - (momentum ** stepnum)
+
             torch.cuda.nvtx.range_push("update_factor_salsa B")
             # --- Update B ---
             B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias)

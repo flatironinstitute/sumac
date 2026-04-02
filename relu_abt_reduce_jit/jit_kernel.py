@@ -5,11 +5,14 @@ from pathlib import Path
 import torch
 
 from torch.utils.cpp_extension import include_paths
+DEBUG = False
 
 _KERNEL_PATH = Path(__file__).with_name("kernel.cu")
+_KERNEL_PATH_MIXED = Path(__file__).with_name("kernel_mixed.cu")
 _KERNEL_MARKER = "// KERNEL_START"
-KERNEL_SOURCE_START_LINE = 5 #this is only used for source-line->instruction correlation in nsight-compute
-DEBUG = False
+
+KERNEL_SOURCE_START_LINE = 10 #this is only used for source-line->instruction correlation in nsight-compute
+KERNEL_SOURCE_START_LINE_MIXED = 85
 
 def _make_header(BK, V, MS):
     return f"""
@@ -17,7 +20,13 @@ def _make_header(BK, V, MS):
 #define V  {V}
 #define MS {MS}
 """
-
+def _make_header_mixed(BK, V, R, MS):
+    return f"""
+#define BK {BK}
+#define V  {V}
+#define R  {R}
+#define MS {MS}
+"""
 
 def _split_kernel_file(path: Path) -> tuple[str, str]:
     src = path.read_text()
@@ -46,10 +55,33 @@ def get_relu_abt_reduce_kernel_float4(BK, V, MS):
     return torch.cuda._compile_kernel(
         kernel_source,
         kernel_name="relu_abt_reduce_kernel_float4_sync",
-        header_code=header_code + "\n" + _make_header(BK, V, MS),
+        header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
+
+@lru_cache(maxsize=None)
+def get_relu_abt_reduce_kernel_mixed(BK, V, R, MS):
+    header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
+    header_code = (
+        f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
+        + _make_header_mixed(BK, V, R, MS)
+        + "\n"
+        + header_code
+        + "\n"
+        + f'#line {KERNEL_SOURCE_START_LINE_MIXED} "{_KERNEL_PATH_MIXED}"\n'
+    )
+    if DEBUG:
+        print(f"compiling relu_abt_reduce (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
+
+    return torch.cuda._compile_kernel(
+        kernel_source=kernel_source,
+        kernel_name="relu_abt_reduce_kernel_mixed_sync",
+        header_code=header_code,
+        cuda_include_dirs=include_paths("cuda"),
+        nvcc_options = ["-lineinfo"]
+    )
+
 
 def relu_abt_reduce_fused(
         A: torch.Tensor,
@@ -73,11 +105,12 @@ def relu_abt_reduce_fused(
     if D != DB:
         raise ValueError(f"Inner dimensions must match, got {D} and {DB}")
     V = D // 4
+    R = D % 4
 
     dynamic_shared_mem_bytes = 2 * BM * 4
     out_sum = torch.zeros(1, device=A.device, dtype=A.dtype)
     out_sum2 = torch.zeros(1, device=A.device, dtype=A.dtype)
-    kernel = get_relu_abt_reduce_kernel_float4(BK, V, MS)
+    kernel = get_relu_abt_reduce_kernel_float4(BK, V, MS) if R==0 else get_relu_abt_reduce_kernel_mixed(BK, V, R, MS)
     torch.cuda.nvtx.range_pop()
     
     grid = (
