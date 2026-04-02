@@ -13,8 +13,6 @@ def relu_bat_c_cuda_launcher():
     @autotune_cuda_kernel(
         configs=tune_config,
         key_fn=relu_bat_c_key,
-        constraint_fn=relu_bat_c_constraints,
-        validate_fn=relu_bat_c_validate,
         cache_path="relu_bat_c_jit_autotune.json",
         n_trials=1000,
         warmup=5,

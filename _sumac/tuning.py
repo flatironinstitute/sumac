@@ -4,7 +4,7 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Hashable, Optional
+from typing import Any, Callable, Dict, Optional
 
 import optuna
 import torch
@@ -75,8 +75,6 @@ def autotune_cuda_kernel(
     *,
     configs,
     key_fn,
-    constraint_fn=None,
-    validate_fn=None,
     cache_path="kernel_autotune_cache.json",
     n_trials=24,
     warmup=25,
@@ -84,11 +82,9 @@ def autotune_cuda_kernel(
     sampler=None,
     force_env_var="KERNEL_AUTOTUNE_FORCE",
     disable_env_var="KERNEL_AUTOTUNE_DISABLE",
-    validate_env_var="KERNEL_AUTOTUNE_VALIDATE",
     verbose_env_var="KERNEL_AUTOTUNE_VERBOSE",
 ):
     store = JsonConfigStore(cache_path)
-
     memo = {}
     default_params = {k: v[0] for k, v in configs.items()}
 
@@ -97,12 +93,10 @@ def autotune_cuda_kernel(
 
     disable_default = os.getenv(disable_env_var, "0") == "1"
     force_default = os.getenv(force_env_var, "0") == "1"
-    do_validate_default = os.getenv(validate_env_var, "0") == "1"
     verbose_default = os.getenv(verbose_env_var, "0") == "1"
 
     def decorator(fn):
         def resolve_params(*args, **kwargs):
-          
             if disable_default:
                 return dict(default_params)
 
@@ -124,23 +118,24 @@ def autotune_cuda_kernel(
                 args=args,
                 kwargs=kwargs,
                 configs=configs,
-                constraint_fn=constraint_fn,
-                validate_fn=validate_fn if do_validate_default else None,
                 n_trials=n_trials,
                 warmup=warmup,
                 rep=rep,
                 sampler=sampler,
+                disk_key=disk_key
             )
 
             params = result.params
             memo[mem_key] = params
 
-            payload = {
-                "function": fn.__name__,
-                "params": params,
-                "runtime_ms": result.runtime_ms,
-            }
-            store.put(disk_key, payload)
+            store.put(
+                disk_key,
+                {
+                    "function": fn.__name__,
+                    "params": params,
+                    "runtime_ms": result.runtime_ms,
+                },
+            )
 
             if verbose_default:
                 print(
@@ -155,14 +150,12 @@ def autotune_cuda_kernel(
             params = resolve_params(*args, **kwargs)
             return fn(*args, **kwargs, **params)
 
-        def clear_memo():
-            memo.clear()
-
         wrapper.resolve_params = resolve_params
-        wrapper.clear_memo = clear_memo
+        wrapper.clear_memo = memo.clear
         return wrapper
 
     return decorator
+
 
 def _run_study(
     *,
@@ -170,12 +163,11 @@ def _run_study(
     args: tuple[Any, ...],
     kwargs: Dict[str, Any],
     configs: Dict[str, list],
-    constraint_fn: Optional[Callable[..., bool]],
-    validate_fn: Optional[Callable[..., None]],
     n_trials: int,
     warmup: int,
     rep: int,
     sampler: optuna.samplers.BaseSampler,
+    disk_key: str,
 ) -> TuneResult:
     static_kwargs = dict(kwargs)
 
@@ -186,27 +178,22 @@ def _run_study(
         }
         merged = {**static_kwargs, **params}
 
-        if constraint_fn is not None and not constraint_fn(*args, **merged):
-            raise optuna.TrialPruned()
-
         def run():
             return fn(*args, **merged)
 
-        out = run()
-        torch.cuda.synchronize()
+        try:
+            run()
+            torch.cuda.synchronize()
+            runtime_ms = _bench_callable(run, warmup=warmup, rep=rep)
+            trial.set_user_attr("runtime_ms", runtime_ms)
 
-        if validate_fn is not None:
-            validate_fn(output=out, *args, **merged)
+        except Exception:
+            raise optuna.TrialPruned()
 
-        runtime_ms = _bench_callable(
-            run,
-            warmup=warmup,
-            rep=rep,
-        )
-        trial.set_user_attr("runtime_ms", runtime_ms)
         return runtime_ms
-
-    study = optuna.create_study(direction="minimize", sampler=sampler)
+    
+    study_name = f"{fn.__module__}.{fn.__qualname__}:{disk_key}"
+    study = optuna.create_study(study_name = study_name, direction="minimize", sampler=sampler)
     study.optimize(objective, n_trials=n_trials)
 
     best = study.best_trial
@@ -214,10 +201,6 @@ def _run_study(
         params={name: best.params[name] for name in configs},
         runtime_ms=float(best.user_attrs["runtime_ms"]),
     )
-
-
-def relu_bat_c_reference(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-    return torch.relu(B @ A.T) @ C
 
 def relu_bat_c_key(
     A: torch.Tensor,
@@ -238,72 +221,26 @@ def relu_bat_c_key(
         int(D),
     )
 
-def relu_bat_c_constraints(
+
+def relu_abt_reduce_key(
     A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BK: int,
-    num_ms: int,
-) -> bool:
-    if A.device != B.device or A.device != C.device:
-        return False
-    if A.ndim != 2 or B.ndim != 2 or C.ndim != 2:
-        return False
-    if A.shape[1] != B.shape[1] or C.shape[1] != A.shape[1]:
-        return False
-    if not A.is_cuda or not B.is_cuda or not C.is_cuda:
-        return False
-    if A.dtype != torch.float32 or B.dtype != torch.float32 or C.dtype != torch.float32:
-        return False
-    if not A.is_contiguous() or not B.is_contiguous() or not C.is_contiguous():
-        return False
+    B: torch.Tensor
+) -> tuple:
+    props = torch.cuda.get_device_properties(A.device)
 
     N, D = A.shape
     M, _ = B.shape
 
-    if BM % 32 != 0:
-        return False
-    if BK not in (16, 32, 64, 128, 256):
-        return False
-    # if num_ms not in (1, 2, 4):
-    #     return False
-
-
-    if BM == 384 and num_ms == 4:
-        return False
-
-    R = D % 4
-
-    if R not in (0, 1, 2, 3):
-        return False
-
-    if M < BM and num_ms > 1:
-        return False
-    if N <= 32 and BK > 32:
-        return False
-    if D > 64 and num_ms == 4:
-        return False
-
-    return True
-
-def relu_bat_c_validate(
-    output: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BK: int,
-    num_ms: int,
-) -> None:
-    del BM, BK, num_ms
-    ref = relu_bat_c_reference(A, B, C)
-    torch.testing.assert_close(output, ref, rtol=1e-4, atol=1e-4)
-
-
+    return (
+        props.major,
+        props.minor,
+        props.multi_processor_count,
+        int(N),
+        int(M),
+        int(D),
+    )
 
 # Environment flags:
 #   KERNEL_AUTOTUNE_DISABLE=1   -  bypass autotuning, use first config in each list
 #   KERNEL_AUTOTUNE_FORCE=1     -  ignore cache and retune
 #   KERNEL_AUTOTUNE_VERBOSE=1   -  print tuning/cache diagnostics
-#   KERNEL_AUTOTUNE_VALIDATE=1  -  validate correctness of candidate

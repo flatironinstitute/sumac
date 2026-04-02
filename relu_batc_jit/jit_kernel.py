@@ -5,10 +5,15 @@ from pathlib import Path
 import torch
 
 from torch.utils.cpp_extension import include_paths
+DEBUG = False
+
 
 _KERNEL_PATH = Path(__file__).with_name("kernel.cu")
 _KERNEL_PATH_MIXED = Path(__file__).with_name("kernel_mixed.cu")
 _KERNEL_MARKER = "// KERNEL_START"
+
+KERNEL_SOURCE_START_LINE = 19
+KERNEL_SOURCE_START_LINE_MIXED = 127 #Using these markers to ~mostly~ fix the source-line->instruction correlation in nsight-compute
 
 def _make_header(BK, V, MS):
     return f"""
@@ -38,25 +43,46 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
 @lru_cache(maxsize=None)
 def get_relu_bat_c_kernel_float4(BK, V, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
-   
+ 
+    header_code = (
+        f'#line 1 "{_KERNEL_PATH}"\n'
+        + header_code
+        + "\n"
+        + _make_header(BK, V, MS)
+        + "\n"
+        + f'#line {KERNEL_SOURCE_START_LINE} "{_KERNEL_PATH}"\n'
+    )
+    if DEBUG:
+        print(f"compiling relu_bat_c (float4 variant) with BK={BK}, V={V}, MS={MS}")
     
-
     return torch.cuda._compile_kernel(
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_float4_sync",
-        header_code=header_code + "\n" + _make_header(BK, V, MS),
+        header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
+        nvcc_options = ["-lineinfo"]
     )
 
 @lru_cache(maxsize=None)
 def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
+    header_code = (
+        f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
+        + _make_header_mixed(BK, V, R, MS) #This ordering matters since header_code uses them
+        + "\n"
+        + header_code
+        + "\n"
+        + f'#line {KERNEL_SOURCE_START_LINE_MIXED} "{_KERNEL_PATH_MIXED}"\n'
+    )
+    if DEBUG:
+        print(f"compiling relu_bat_c (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
 
     return torch.cuda._compile_kernel(
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_mixed_sync",
-        header_code= _make_header_mixed(BK, V, R, MS) + "\n" + header_code,
-        cuda_include_dirs=include_paths("cuda")
+        header_code= header_code,
+        cuda_include_dirs=include_paths("cuda"),
+        nvcc_options = ["-lineinfo"]
     )
 
 def relu_bat_c_fused(

@@ -6,7 +6,8 @@ import argparse
 os.environ["MPLBACKEND"] = "Agg"
 
 from _sumac.tuning import *
-import relu_bat_c_fused_cuda as kernel_ext 
+#import relu_bat_c_fused_cuda as kernel_ext 
+from relu_batc_jit.api import relu_bat_c_fused_op
 
 @triton.jit
 def round_f32_to_tf32(x):
@@ -158,9 +159,7 @@ def relu_bat_c_cuda_launcher():
             "num_ms": [2, 4, 6],
         },
         key_fn=relu_bat_c_key,
-        constraint_fn=relu_bat_c_constraints,
-        validate_fn=relu_bat_c_validate,
-        cache_path="relu_bat_c_autotune.json",
+        cache_path="relu_bat_c_jit_autotune.json",
         n_trials=1000,
         warmup=5,
         rep=50,
@@ -176,7 +175,7 @@ def relu_bat_c_cuda_launcher():
         BK: int,
         num_ms: int,
     ) -> torch.Tensor:
-        return kernel_ext.relu_bat_c_fused_cuda(A, B, C, BM, BK, num_ms)
+        return relu_bat_c_fused_op(A, B, C, BM, BK, num_ms)
     return relu_bat_c_cuda
 
 
@@ -245,22 +244,22 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    r = bench_one(M=145408, N=1408, D=4, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
-    r = bench_one(M=145408, N=1408, D=8, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
+    # r = bench_one(M=145408, N=1408, D=4, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    # print(r)
+    # r = bench_one(M=145408, N=1408, D=8, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    # print(r)
 
     r = bench_one(M=145408, N=1408, D=13, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
     r = bench_one(M=145408, N=1408, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     print(r)
-    r = bench_one(M=145408, N=1408, D=17, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
-    r = bench_one(M=145408, N=1408, D=18, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
-    r = bench_one(M=145408, N=1408, D=19, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    # r = bench_one(M=145408, N=1408, D=17, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    # print(r)
+    # r = bench_one(M=145408, N=1408, D=18, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
+    # print(r)
+    # r = bench_one(M=145408, N=1408, D=19, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
     #r = bench_one(M=145408, N=14540, D=16, dtype=torch.float32, wm_iters=args.warmup_iters, iters=args.iters)
-    print(r)
+    # print(r)
 
     
 

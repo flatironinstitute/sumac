@@ -8,6 +8,8 @@ from torch.utils.cpp_extension import include_paths
 
 _KERNEL_PATH = Path(__file__).with_name("kernel.cu")
 _KERNEL_MARKER = "// KERNEL_START"
+KERNEL_SOURCE_START_LINE = 5 #this is only used for source-line->instruction correlation in nsight-compute
+DEBUG = False
 
 def _make_header(BK, V, MS):
     return f"""
@@ -29,8 +31,17 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
 @lru_cache(maxsize=None)
 def get_relu_abt_reduce_kernel_float4(BK, V, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
-    header_code = f'#line 1 "{_KERNEL_PATH}"\n' + header_code
-    
+
+    header_code = (
+        f'#line 1 "{_KERNEL_PATH}"\n'
+        + header_code
+        + "\n"
+        + _make_header(BK, V, MS)
+        + "\n"
+        + f'#line {KERNEL_SOURCE_START_LINE} "{_KERNEL_PATH}"\n'
+    )
+    if DEBUG:
+        print(f"compiling relu_abt_reduce with BK={BK}, V={V}, MS={MS}")
 
     return torch.cuda._compile_kernel(
         kernel_source,
@@ -43,9 +54,9 @@ def get_relu_abt_reduce_kernel_float4(BK, V, MS):
 def relu_abt_reduce_fused(
         A: torch.Tensor,
         B: torch.Tensor,
+        BM: int,
         BK: int,
         MS: int,
-        BM: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     torch.cuda.nvtx.range_push("Prep kernel")
     if not (A.is_cuda and B.is_cuda):

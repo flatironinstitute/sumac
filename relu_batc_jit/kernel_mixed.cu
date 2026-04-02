@@ -8,7 +8,6 @@ __device__ __forceinline__ float2 load2_scalar(const float* p) {
   return make_float2(p[0], p[1]);
 }
 
-
 __device__ __forceinline__ float dot_float4(const float4& A, const float4& B, const float c) {
   float r = fmaf(A.x, B.x, c);
   r = fmaf(A.y, B.y, r);
@@ -38,8 +37,6 @@ __device__ __forceinline__ float2 axpy_float2(const float alpha, const float2& X
     fmaf(alpha, X.y, Y.y)
   );
 }
-
-
 
 __device__ __forceinline__ void copy_tiles_mixed_sync(
     float4 As4[BK][V],
