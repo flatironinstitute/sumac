@@ -222,7 +222,7 @@ def relu_bat_c_key(
     )
 
 
-def relu_abt_reduce_key(
+def relu_bat_reduce_key(
     A: torch.Tensor,
     B: torch.Tensor
 ) -> tuple:

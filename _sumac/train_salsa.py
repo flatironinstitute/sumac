@@ -89,7 +89,6 @@ def batch_update_single_gpu(
 ):
 
     dev = B.device
-    dtype = B.dtype
 
     m_batch = row_indices_cpu.shape[0]
 

@@ -1,20 +1,20 @@
 from __future__ import annotations
 import torch
 
-from .jit_kernel import relu_abt_reduce_fused as _relu_abt_reduce_fused_impl
+from .jit_kernel import relu_bat_reduce_fused as _relu_bat_reduce_fused_impl
 
 
-@torch.library.custom_op("sumac::relu_abt_reduce_fused", mutates_args=(), device_types="cuda")
-def relu_abt_reduce_fused_op(
+@torch.library.custom_op("sumac::relu_bat_reduce_fused", mutates_args=(), device_types="cuda")
+def relu_bat_reduce_fused_op(
     A: torch.Tensor,
     B: torch.Tensor,
     BM: int,
     BK: int,
     MS: int,
 ) -> tuple[torch.Tensor,torch.Tensor]:
-    return _relu_abt_reduce_fused_impl(A, B, BM, BK, MS)
+    return _relu_bat_reduce_fused_impl(A, B, BM, BK, MS)
 
-@relu_abt_reduce_fused_op.register_fake
+@relu_bat_reduce_fused_op.register_fake
 def _(
     A: torch.Tensor,
     B: torch.Tensor,

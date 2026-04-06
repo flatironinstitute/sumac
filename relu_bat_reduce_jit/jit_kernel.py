@@ -38,7 +38,7 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
 
 
 @lru_cache(maxsize=None)
-def get_relu_abt_reduce_kernel_float4(BK, V, MS):
+def get_relu_bat_reduce_kernel_float4(BK, V, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
 
     header_code = (
@@ -50,18 +50,18 @@ def get_relu_abt_reduce_kernel_float4(BK, V, MS):
         + f'#line {KERNEL_SOURCE_START_LINE} "{_KERNEL_PATH}"\n'
     )
     if DEBUG:
-        print(f"compiling relu_abt_reduce with BK={BK}, V={V}, MS={MS}")
+        print(f"compiling relu_bat_reduce with BK={BK}, V={V}, MS={MS}")
 
     return torch.cuda._compile_kernel(
         kernel_source,
-        kernel_name="relu_abt_reduce_kernel_float4_sync",
+        kernel_name="relu_bat_reduce_kernel_float4_sync",
         header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
 @lru_cache(maxsize=None)
-def get_relu_abt_reduce_kernel_mixed(BK, V, R, MS):
+def get_relu_bat_reduce_kernel_mixed(BK, V, R, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
     header_code = (
         f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
@@ -72,18 +72,18 @@ def get_relu_abt_reduce_kernel_mixed(BK, V, R, MS):
         + f'#line {KERNEL_SOURCE_START_LINE_MIXED} "{_KERNEL_PATH_MIXED}"\n'
     )
     if DEBUG:
-        print(f"compiling relu_abt_reduce (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
+        print(f"compiling relu_bat_reduce (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
 
     return torch.cuda._compile_kernel(
         kernel_source=kernel_source,
-        kernel_name="relu_abt_reduce_kernel_mixed_sync",
+        kernel_name="relu_bat_reduce_kernel_mixed_sync",
         header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
 
-def relu_abt_reduce_fused(
+def relu_bat_reduce_fused(
         A: torch.Tensor,
         B: torch.Tensor,
         BM: int,
@@ -108,9 +108,9 @@ def relu_abt_reduce_fused(
     R = D % 4
 
     dynamic_shared_mem_bytes = 2 * BM * 4
-    out_sum = torch.zeros(1, device=A.device, dtype=A.dtype)
-    out_sum2 = torch.zeros(1, device=A.device, dtype=A.dtype)
-    kernel = get_relu_abt_reduce_kernel_float4(BK, V, MS) if R==0 else get_relu_abt_reduce_kernel_mixed(BK, V, R, MS)
+    out_sum = torch.zeros(1, device=A.device, dtype=torch.float64)
+    out_sum2 = torch.zeros(1, device=A.device, dtype=torch.float64)
+    kernel = get_relu_bat_reduce_kernel_float4(BK, V, MS) if R==0 else get_relu_bat_reduce_kernel_mixed(BK, V, R, MS)
     torch.cuda.nvtx.range_pop()
     
     grid = (
@@ -123,4 +123,4 @@ def relu_abt_reduce_fused(
     with torch.cuda.nvtx.range("launch kernel"):
         kernel(grid, block, (A, B, out_sum, out_sum2, M, N, D), shared_mem=dynamic_shared_mem_bytes)
 
-    return out_sum, out_sum2
+    return out_sum.float(), out_sum2.float()

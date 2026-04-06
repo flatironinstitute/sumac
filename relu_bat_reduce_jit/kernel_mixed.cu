@@ -83,11 +83,11 @@ __device__ __forceinline__ void copy_tile_mixed_sync(
 
 // KERNEL_START
 
-extern "C" __global__ void relu_abt_reduce_kernel_mixed_sync(
+extern "C" __global__ void relu_bat_reduce_kernel_mixed_sync(
     const float* __restrict__ A,
     const float* __restrict__ B,
-    float* __restrict__ out_sum,
-    float* __restrict__ out_sum2,
+    double* __restrict__ out_sum,
+    double* __restrict__ out_sum2,
     int M, int N, int D)
 {
   static_assert(R >= 0 && R <= 3);
@@ -214,7 +214,7 @@ extern "C" __global__ void relu_abt_reduce_kernel_mixed_sync(
   }
 
   if (tid == 0) {
-    atomicAdd(out_sum,  s_sum[0]);
-    atomicAdd(out_sum2, s_sum2[0]);
+    atomicAdd(out_sum,  (double)s_sum[0]);
+    atomicAdd(out_sum2, (double)s_sum2[0]);
   }
 }

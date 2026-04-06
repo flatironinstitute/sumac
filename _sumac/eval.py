@@ -1,11 +1,11 @@
 import torch
 
 from _sumac.dataset import block_span
-from relu_abt_reduce_jit.api import relu_abt_reduce_fused
+from relu_bat_reduce_jit.api import relu_bat_reduce_fused
 from _sumac.tuning import *
 
 
-def relu_abt_reduce_launcher():
+def relu_bat_reduce_launcher():
     tune_config = {
         "BM": [32, 64, 96, 128, 256, 512],
         "BK": [16, 32, 64, 128],
@@ -14,25 +14,25 @@ def relu_abt_reduce_launcher():
 
     @autotune_cuda_kernel(
         configs=tune_config,
-        key_fn=relu_abt_reduce_key,
-        cache_path="relu_abt_reduce_jit_autotune.json",
+        key_fn=relu_bat_reduce_key,
+        cache_path="relu_bat_reduce_jit_autotune.json",
         n_trials=1000,
         warmup=5,
         rep=50,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
     )
-    def relu_abt_reduce(
+    def relu_bat_reduce(
         A: torch.Tensor,
         B: torch.Tensor,
         BM: int,
         BK: int,
         num_ms: int,
     ) -> tuple[torch.Tensor,torch.Tensor]:
-        return relu_abt_reduce_fused(A, B, BM, BK, num_ms)
+        return relu_bat_reduce_fused(A, B, BM, BK, num_ms)
     
-    return relu_abt_reduce
+    return relu_bat_reduce
 
-relu_abt_tuned = relu_abt_reduce_launcher()
+relu_bat_tuned = relu_bat_reduce_launcher()
 
 @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
 def block_loss_no_errz(
@@ -69,7 +69,7 @@ def block_loss_errz(
     BK: int,
     MS: int
 ):
-    sum_sr, sum_sr2 = relu_abt_reduce_fused(A_block, B, BM, BK, MS)
+    sum_sr, sum_sr2 = relu_bat_reduce_fused(A_block, B, BM, BK, MS)
     A_obs = A_block[local_r]      
     B_obs = B[cols_all]           
     L_obs = (A_obs * B_obs).sum(dim=1)
@@ -162,7 +162,7 @@ def block_loss_and_pred(
 #       torch.cuda.profiler.start()
     if errZ_obj:
         with torch.cuda.nvtx.range("block_loss_errz"):
-            params = relu_abt_tuned.resolve_params(A_block, B)
+            params = relu_bat_tuned.resolve_params(A_block, B)
             BM = params["BM"]
             BK = params["BK"]
             MS = params["num_ms"]

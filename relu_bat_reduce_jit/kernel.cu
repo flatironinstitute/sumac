@@ -8,11 +8,11 @@ __device__ __forceinline__ float dot_float4(const float4& A, const float4& B, co
 
 // KERNEL_START
 
-extern "C" __global__ void relu_abt_reduce_kernel_float4_sync(
+extern "C" __global__ void relu_bat_reduce_kernel_float4_sync(
     const float* __restrict__ A, 
     const float* __restrict__ B, 
-    float* __restrict__ out_sum, 
-    float* __restrict__ out_sum2,
+    double* __restrict__ out_sum, 
+    double* __restrict__ out_sum2,
     int M, int N, int D)
 {
   const int BM  = (int)blockDim.x;
@@ -107,7 +107,7 @@ extern "C" __global__ void relu_abt_reduce_kernel_float4_sync(
   }
 
   if (tid == 0) {
-    atomicAdd(out_sum,  s_sum[0]);
-    atomicAdd(out_sum2, s_sum2[0]);
+    atomicAdd(out_sum,  (double)s_sum[0]);
+    atomicAdd(out_sum2, (double)s_sum2[0]);
   }
 }
