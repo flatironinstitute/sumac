@@ -77,7 +77,7 @@ def batch_update_single_gpu(
     Sr_idx_raw: torch.Tensor,
     Sr_vals: torch.Tensor,
     Factor_fixed: torch.Tensor,
-    row_indices_cpu: torch.Tensor,
+    row_indices: torch.Tensor,
     B: torch.Tensor,
     dB: torch.Tensor,
     momentum,
@@ -87,20 +87,19 @@ def batch_update_single_gpu(
     BK,
     MS,
 ):
-
+    
     dev = B.device
 
-    m_batch = row_indices_cpu.shape[0]
+    m_batch = row_indices.shape[0]
 
-    Ar_dev = Factor_fixed[row_indices_cpu, :]
+    Ar_dev = Factor_fixed[row_indices, :]
     GramA = Ar_dev.T @ Ar_dev
     pinvAt_dev = torch.linalg.solve(GramA, Ar_dev.T).T
 
-    blk_idx = Sr_idx_raw.to(dev).clone()
-    blk_vals = Sr_vals.to(dev).clone()
+    blk_idx = Sr_idx_raw
+    blk_vals = Sr_vals
 
-    row_idx_dev = row_indices_cpu.to(dev)
-
+    row_idx_dev = row_indices
     local_map = torch.zeros(m_fixed, dtype=torch.long, device=dev)
 
     local_map[row_idx_dev] = torch.arange(m_batch, device=dev)
@@ -119,7 +118,7 @@ def batch_update_single_gpu(
         unbias=unbias,
         BM=BM,
         BK=BK,
-        MS=MS
+        MS=MS,
     )
 
     return B_new, dB_new
@@ -138,7 +137,7 @@ def update_factor_salsa(
 ):
     m_fixed = Factor_fixed.shape[0]
     _, edge_idx, row_indices = dataset[block_id]
-    idx_raw = S_idx_full[:, edge_idx].clone()
+    idx_raw = S_idx_full[:, edge_idx]
     val_raw = S_val_full[edge_idx]
 
     params = relu_bat_c_tuned.resolve_params(Factor_fixed[row_indices, :], Factor_update, Factor_fixed[row_indices, :])
@@ -150,7 +149,7 @@ def update_factor_salsa(
         Sr_idx_raw=idx_raw,
         Sr_vals=val_raw,
         Factor_fixed=Factor_fixed,
-        row_indices_cpu=row_indices,
+        row_indices=row_indices,
         B=Factor_update,
         dB=dFactor,
         momentum=momentum,
