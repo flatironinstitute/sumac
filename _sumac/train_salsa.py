@@ -5,7 +5,7 @@ from _sumac.tuning import *
 
 def relu_bat_c_cuda_launcher():
     tune_config = {
-        "BM": [32, 64, 96, 128, 256],
+        "BM": [32, 64, 128, 256],
         "BK": [16, 32, 64],
         "num_ms": [1, 2, 4, 6],
     }

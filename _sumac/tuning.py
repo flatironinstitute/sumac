@@ -187,7 +187,8 @@ def _run_study(
             runtime_ms = _bench_callable(run, warmup=warmup, rep=rep)
             trial.set_user_attr("runtime_ms", runtime_ms)
 
-        except Exception:
+        except Exception as e:
+            print(f"[Trial {trial.number}] Error: {e}")
             raise optuna.TrialPruned()
 
         return runtime_ms

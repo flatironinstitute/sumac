@@ -7,9 +7,9 @@ from _sumac.tuning import *
 
 def relu_bat_reduce_launcher():
     tune_config = {
-        "BM": [32, 64, 96, 128, 256, 512],
+        "BM": [32, 64, 128, 256, 512],
         "BK": [16, 32, 64, 128],
-        "num_ms": [1, 2, 4, 6, 8],
+        "num_ms": [1, 2, 4, 6 ,8],
     }
 
     @autotune_cuda_kernel(
