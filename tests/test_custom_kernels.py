@@ -2,7 +2,6 @@ import torch
 from relu_batc_jit.api import relu_bat_c_fused
 from relu_bat_reduce_jit.api import relu_bat_reduce_fused
 import pytest 
-from _sumac.tuning import *
 
 @pytest.mark.parametrize("D", [16, 32, 64, 128])
 def test_relu_batc_kernel(D: int):
