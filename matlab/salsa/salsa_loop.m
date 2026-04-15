@@ -128,23 +128,33 @@ function lsqB = lsq_update(S,A,B)
 
 % CONTRIBUTION FROM ELEMENTS WITH S=0
 pseudoInverseAt = A/(A'*A);
-Mt = max(0,B*A');       
-stepM = -Mt*pseudoInverseAt;
+%Mt = max(0,B*A');       
+%stepM = -Mt*pseudoInverseAt;
+kernelPath = '../../relu_batc_jit/kernel.cu';
+
+BK = int32(32);
+MS = int32(4); % This controls how many rows of B are processed per thread. 
+% Rough guideline for H100: D=16 -> MS=4, D=32 -> MS=2, D=64 -> MS=1, D>64 don't use this custom kernel - register spills will ruin performance
+V  = int32(size(A,2) / 4);
+threads = int32(128);
+
+Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.', kernelPath, BK, MS, V, threads);
 
 % CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
 [m,n] = size(S);
 [i,j,Sij] = find(S);
 % Lij = sum(A(i,:).*B(j,:),2);
-Lij = zeros(size(Sij));
-for k=1:size(A,2)
-  Lij = Lij + A(i,k).*B(j,k);  % LOOP TO SAVE MEMORY
-end
+% Lij = zeros(size(Sij));
+% for k=1:size(A,2)
+%   Lij = Lij + A(i,k).*B(j,k);  % LOOP TO SAVE MEMORY
+% end
+Lij = sum(A(i,:).*B(j,:), 2);
 Mij = max(0,Lij);
 Ct = sparse(j,i,Sij-Lij+Mij,n,m);
 stepC = Ct*pseudoInverseAt;
 
 % UPDATE
-lsqB = B + stepM + stepC;
+lsqB = B - Yt.' + stepC; % - Yt.' instead of +stepM - the kernel needs row major but matlab's layout is column major
 
 end
 
