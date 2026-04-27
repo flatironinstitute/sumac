@@ -64,7 +64,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         'exaggerate': mom, #momentum for SALSA or ALS
         'momentum_start_iter': 10, #ALS 
         'refactor_interval': 25, #ALS
-        'eval_interval': 1, #evaluation per interval for SALSA or ALS
+        'eval_interval': 10, #evaluation per interval for SALSA or ALS
         'factor_init': factor_init, #ALS; if True: A,B specific initialization
         'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
     }
@@ -450,7 +450,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             t_start = time.time()
         torch.cuda.nvtx.range_pop()
     # WRAP UP
-    #A, B = refactor(A, B)
+    A, B = refactor(A, B)
     
     costs = {
         'rmse': rmse_hist,
