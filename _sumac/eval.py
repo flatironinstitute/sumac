@@ -189,35 +189,6 @@ def block_loss_and_pred(
         start=start,
     )
 
-    # 1. are there duplicate edge indices themselves?
-    u_edge, c_edge = torch.unique(edge_idx, return_counts=True)
-    if (c_edge > 1).any():
-        print("duplicate edge_idx entries:",
-            (c_edge > 1).sum().item(),
-            "max multiplicity:", c_edge.max().item())
-
-    # 2. are there duplicate global coordinates in THIS block?
-    coords_g = torch.stack([rows_all, cols_all], dim=1)
-    u_g, c_g = torch.unique(coords_g, dim=0, return_counts=True)
-    if (c_g > 1).any():
-        print("duplicate GLOBAL coords in block:",
-            (c_g > 1).sum().item(),
-            "max multiplicity:", c_g.max().item())
-
-    # 3. are there duplicate local coordinates?
-    coords_l = torch.stack([local_r, cols_all], dim=1)
-    u_l, c_l = torch.unique(coords_l, dim=0, return_counts=True)
-    if (c_l > 1).any():
-        print("duplicate LOCAL coords in block:",
-            (c_l > 1).sum().item(),
-            "max multiplicity:", c_l.max().item())
-
-    # 4. row_indices uniqueness
-    u_rows, c_rows = torch.unique(row_indices, return_counts=True)
-    if (c_rows > 1).any():
-        print("duplicate row_indices:",
-            (c_rows > 1).sum().item(),
-            "max multiplicity:", c_rows.max().item())
 #       torch.cuda.profiler.start()
     if errZ_obj:
         with torch.cuda.nvtx.range("block_loss_errz"):
