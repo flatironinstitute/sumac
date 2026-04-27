@@ -21,7 +21,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
           mom=0.7, method='GD', lr=1e-1, factor_init=False,
           save_path=None, GD_latent=False, optim="adam", precondition=False,
           adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, muon_momentum=0.95,
-          multi_gpu=True):
+          multi_gpu=True, seed=0):
     """
     PyTorch version of sumac algorithm driver function.
 
@@ -54,7 +54,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         'max_iterate': max_iterate,
         'dtype': dtype,
         'method': method,
-        'seed': random.randint(0, 2**31 - 1),
+        'seed': seed,
         'display': 1,
         'cache_MB': 5000,  
         'time_limit': float('inf'), #ALS early stopping
@@ -64,7 +64,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         'exaggerate': mom, #momentum for SALSA or ALS
         'momentum_start_iter': 10, #ALS 
         'refactor_interval': 25, #ALS
-        'eval_interval': 10, #evaluation per interval for SALSA or ALS
+        'eval_interval': 1, #evaluation per interval for SALSA or ALS
         'factor_init': factor_init, #ALS; if True: A,B specific initialization
         'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
     }
@@ -365,10 +365,15 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     
     # Initialization using sumac helper
     random.seed(opts['seed'])
-    torch.manual_seed(opts['seed'])
-    
+    gen = torch.Generator(device=device)
+    print(f"seed = {opts['seed']}")
+    gen.manual_seed(opts['seed'])
+    gen_rows = torch.Generator(device=device)
+    gen_rows.manual_seed(opts['seed'] + 1)
+    gen_cols = torch.Generator(device=device)
+    gen_cols.manual_seed(opts['seed'] + 2)
     torch.cuda.nvtx.range_push("als_init_factors")
-    A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
+    A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag, gen=gen)
     torch.cuda.nvtx.range_pop()
 
     dA = torch.zeros_like(A)
@@ -378,14 +383,15 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     # Datasets for row and column blocks
 
     torch.cuda.nvtx.range_push("StochasitcRowBlockDataset rows")
-    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'], gen=gen_rows)
     S_index_T = S_index[[1, 0], :] 
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("StochasticRowBlockDataset cols")
-    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'], gen=gen_cols)
     torch.cuda.nvtx.range_pop()
     ##init evaluation
+
     torch.cuda.nvtx.range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
@@ -444,7 +450,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
             t_start = time.time()
         torch.cuda.nvtx.range_pop()
     # WRAP UP
-    A, B = refactor(A, B)
+    #A, B = refactor(A, B)
     
     costs = {
         'rmse': rmse_hist,

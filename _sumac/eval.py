@@ -4,21 +4,54 @@ from _sumac.dataset import block_span
 from relu_bat_reduce_jit.api import relu_bat_reduce_fused
 from _sumac.tuning import *
 
+@torch.compile
+def relu_bat_reduce_fallback(A: torch.Tensor,
+                        B: torch.Tensor):
+    A64 = A.to(torch.float64)
+    B64 = B.to(torch.float64)
+    Sr = torch.relu(A64 @ B64.T)
+    
+    sum_sr = Sr.sum()
+    sum_sr2 = (Sr * Sr).sum()
+    return sum_sr, sum_sr2
+
+
+def relu_bat_reduce_constraints(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    BM: int,
+    BK: int,
+    num_ms: int,
+) -> bool:
+    if A.shape[1] >= 32 and num_ms > 4:
+        return False
+
+    if A.shape[1] >= 64 and num_ms > 2:  
+        return False  
+    
+    props = torch.cuda.get_device_properties(torch.cuda.current_device)
+
+    if props.shared_memory_per_block < 4 * BK * A.shape[1]:
+        return False
+
+    return True
 
 def relu_bat_reduce_launcher():
     tune_config = {
-        "BM": [32, 64, 128, 256, 512],
+        "BM": [32, 64, 128, 256],
         "BK": [16, 32, 64, 128],
-        "num_ms": [1, 2, 4, 6 ,8],
+        "num_ms": [1, 2, 4, 6],
     }
 
     @autotune_cuda_kernel(
         configs=tune_config,
+        fallback_fn=relu_bat_reduce_fallback,
+        constraint_fn=relu_bat_reduce_constraints,
         key_fn=relu_bat_reduce_key,
         cache_path="relu_bat_reduce_jit_autotune.json",
         n_trials=1000,
-        warmup=5,
-        rep=50,
+        warmup=1,
+        rep=5,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
     )
     def relu_bat_reduce(
@@ -65,27 +98,23 @@ def block_loss_errz(
     local_r: torch.Tensor,
     cols_all: torch.Tensor,
     vals_all: torch.Tensor,
-    BM: int,
-    BK: int,
-    MS: int
 ):
-    sum_sr, sum_sr2 = relu_bat_reduce_fused(A_block, B, BM, BK, MS)
-    A_obs = A_block[local_r]      
-    B_obs = B[cols_all]           
+    sum_sr, sum_sr2 = relu_bat_tuned(A_block, B)
+    vals_all64 = vals_all.to(torch.float64)
+    A_obs = A_block[local_r].to(torch.float64)      
+    B_obs = B[cols_all].to(torch.float64)           
     L_obs = (A_obs * B_obs).sum(dim=1)
+    Mij = torch.relu(L_obs)
 
-    sr_obs = torch.relu(L_obs)
-    dot_obs = (vals_all * sr_obs).sum()
-    jacc_num = torch.minimum(vals_all, sr_obs).sum()
+    obs_sq = (Mij * Mij).sum()
+    obs_res_sq = ((vals_all64 - Mij) * (vals_all64 - Mij)).sum()
+    mse_full = (sum_sr2.squeeze() - obs_sq) + obs_res_sq
 
-    ssq_vals = (vals_all * vals_all).sum()
-    mse_full = sum_sr2.squeeze() - 2.0 * dot_obs + ssq_vals
+    errZ_num = sum_sr2.squeeze() - obs_sq + ((vals_all64 - L_obs) * (vals_all64 - L_obs)).sum()
 
-    neg = torch.relu(-L_obs)
-    corr = (neg * neg + 2.0 * vals_all * neg).sum()
-    errZ_num = mse_full + corr
-
-    return mse_full, sum_sr.squeeze(), jacc_num, errZ_num
+    jacc_num = torch.minimum(vals_all64, Mij).sum()
+    
+    return mse_full.to(torch.float32), sum_sr.squeeze().to(torch.float32), jacc_num.to(torch.float32), errZ_num.to(torch.float32)
 
 
 
@@ -148,7 +177,7 @@ def block_loss_and_pred(
     rows_all = S_index[0, edge_idx]
     cols_all = S_index[1, edge_idx]
     vals_all = S_value[edge_idx]
-
+    
     rows_all = rows_all.to(device=A.device, dtype=torch.long)
     cols_all = cols_all.to(device=A.device, dtype=torch.long)
     vals_all = vals_all.to(device=A.device)
@@ -159,15 +188,42 @@ def block_loss_and_pred(
         row_indices=row_indices,
         start=start,
     )
+
+    # 1. are there duplicate edge indices themselves?
+    u_edge, c_edge = torch.unique(edge_idx, return_counts=True)
+    if (c_edge > 1).any():
+        print("duplicate edge_idx entries:",
+            (c_edge > 1).sum().item(),
+            "max multiplicity:", c_edge.max().item())
+
+    # 2. are there duplicate global coordinates in THIS block?
+    coords_g = torch.stack([rows_all, cols_all], dim=1)
+    u_g, c_g = torch.unique(coords_g, dim=0, return_counts=True)
+    if (c_g > 1).any():
+        print("duplicate GLOBAL coords in block:",
+            (c_g > 1).sum().item(),
+            "max multiplicity:", c_g.max().item())
+
+    # 3. are there duplicate local coordinates?
+    coords_l = torch.stack([local_r, cols_all], dim=1)
+    u_l, c_l = torch.unique(coords_l, dim=0, return_counts=True)
+    if (c_l > 1).any():
+        print("duplicate LOCAL coords in block:",
+            (c_l > 1).sum().item(),
+            "max multiplicity:", c_l.max().item())
+
+    # 4. row_indices uniqueness
+    u_rows, c_rows = torch.unique(row_indices, return_counts=True)
+    if (c_rows > 1).any():
+        print("duplicate row_indices:",
+            (c_rows > 1).sum().item(),
+            "max multiplicity:", c_rows.max().item())
 #       torch.cuda.profiler.start()
     if errZ_obj:
         with torch.cuda.nvtx.range("block_loss_errz"):
             params = relu_bat_tuned.resolve_params(A_block, B)
-            BM = params["BM"]
-            BK = params["BK"]
-            MS = params["num_ms"]
             
-            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, local_r, cols_all, vals_all, BM, BK, MS)
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, local_r, cols_all, vals_all)
     else:
         with torch.cuda.nvtx.range("block_loss_no_errz"):
             mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)

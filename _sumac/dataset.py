@@ -53,22 +53,13 @@ class StochasticRowBlockDataset(Dataset):
     Re-partitions rows into blocks every time .reshuffle() is called.
     """
     def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
-                 m: int, num_blocks: int):
+                 m: int, num_blocks: int, gen: torch.Generator):
         self.S_index = S_index
         self.S_value = S_value
         self.m = m
         self.num_blocks = num_blocks
-        
-        #This takes a minute to build and is not used - disabling it until this is needed
-        # # 1. Build row-to-edge index map once (CPU)
-        # # This allows us to quickly find all non-zeros for a given set of rows
-        # rows = self.S_index[0].detach().cpu()
-        # self.row_to_edges = [[] for _ in range(m)]
-        # for edge_idx, row_idx in enumerate(rows):
-        #     self.row_to_edges[row_idx.item()].append(edge_idx)
-        
-        # # Convert to tensors for faster concatenation
-        # self.row_to_edges = [torch.tensor(e, dtype=torch.long) for e in self.row_to_edges]
+        self.gen = gen
+      
         
         # Initial partition
         self.reshuffle()
@@ -79,7 +70,7 @@ class StochasticRowBlockDataset(Dataset):
         """
         # 1. Randomly permute rows
         dev = self.S_value.device #
-        perm = torch.randperm(self.m, device=dev)
+        perm = torch.randperm(self.m, device=dev, generator=self.gen)
         perm_inv = torch.empty_like(perm)
         perm_inv[perm] = torch.arange(self.m, device=dev)
         

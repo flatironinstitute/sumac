@@ -58,11 +58,12 @@ static std::string read_text_file(const std::string& path) {
     return buffer.str();
 }
 
-static std::string build_source_from_file(const std::string& kernel_path, int BK, int MS, int V) {
+static std::string build_source_from_file(const std::string& kernel_path, int BK, int MS, int V, int NUM_THREADS) {
     std::ostringstream src;
     src << "#define BK " << BK << "\n";
     src << "#define MS " << MS << "\n";
     src << "#define V "  << V  << "\n";
+    src << "#define NUM_THREADS " << NUM_THREADS << "\n";
     src << "\n";
     src << read_text_file(kernel_path);
     return src.str();
@@ -76,7 +77,7 @@ struct ModuleEntry {
 static std::unordered_map<std::string, ModuleEntry> g_cache;
 static bool g_cuda_initialized = false;
 
-static ModuleEntry get_or_build_module(const std::string& kernel_path, int BK, int MS, int V)
+static ModuleEntry get_or_build_module(const std::string& kernel_path, int BK, int MS, int V, int NUM_THREADS)
 {
     std::ostringstream keyss;
     keyss << kernel_path << "|BK=" << BK << "|MS=" << MS << "|V=" << V;
@@ -110,16 +111,16 @@ static ModuleEntry get_or_build_module(const std::string& kernel_path, int BK, i
         cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device),
         "cuDeviceGetAttribute(minor)");
 
-    const std::string src = build_source_from_file(kernel_path, BK, MS, V);
+    const std::string src = build_source_from_file(kernel_path, BK, MS, V, NUM_THREADS);
 
     nvrtcProgram prog;
     checkNvrtc(
         nvrtcCreateProgram(&prog, src.c_str(), kernel_path.c_str(), 0, nullptr, nullptr),
         "nvrtcCreateProgram");
 
-    std::string gpu_arch = "--gpu-architecture=compute_" +
-                           std::to_string(major) + std::to_string(minor);
-
+    // std::string gpu_arch = "--gpu-architecture=compute_" +
+                        //    std::to_string(major) + std::to_string(minor); //Matlabs packaged cuda is too old to know sm120 ... forcing older arch here
+    std::string gpu_arch = "--gpu-architecture=compute_90";
     const char* opts[] = {
         "--std=c++14",
         "--use_fast_math",
@@ -226,7 +227,7 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
     const float* Ct_ptr = static_cast<const float*>(mxGPUGetDataReadOnly(Ct_gpu));
     float* Yt_ptr = static_cast<float*>(mxGPUGetData(Yt_gpu));
 
-    ModuleEntry entry = get_or_build_module(kernel_path, BK, MS, V);
+    ModuleEntry entry = get_or_build_module(kernel_path, BK, MS, V, threads);
 
     void* args[] = {
         (void*)&At_ptr,

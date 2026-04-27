@@ -67,6 +67,7 @@ def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
 
 @dataclass(frozen=True)
 class TuneResult:
+    mode: str 
     params: Dict[str, Any]
     runtime_ms: float
 
@@ -75,6 +76,8 @@ def autotune_cuda_kernel(
     *,
     configs,
     key_fn,
+    fallback_fn: Optional[Callable[..., Any]] = None,
+    constraint_fn: Optional[Callable[..., bool]] = None,
     cache_path="kernel_autotune_cache.json",
     n_trials=24,
     warmup=25,
@@ -83,9 +86,11 @@ def autotune_cuda_kernel(
     force_env_var="KERNEL_AUTOTUNE_FORCE",
     disable_env_var="KERNEL_AUTOTUNE_DISABLE",
     verbose_env_var="KERNEL_AUTOTUNE_VERBOSE",
+    force_fallback_env_var="KERNEL_AUTOTUNE_FORCE_FALLBACK",
+    disable_fallback_env_var="KERNEL_AUTOTUNE_DISABLE_FALLBACK",
 ):
     store = JsonConfigStore(cache_path)
-    memo = {}
+    memo: Dict[Any, Dict[str, Any]] = {}
     default_params = {k: v[0] for k, v in configs.items()}
 
     if sampler is None:
@@ -94,27 +99,51 @@ def autotune_cuda_kernel(
     disable_default = os.getenv(disable_env_var, "0") == "1"
     force_default = os.getenv(force_env_var, "0") == "1"
     verbose_default = os.getenv(verbose_env_var, "0") == "1"
+    force_fallback_default = os.getenv(force_fallback_env_var, "0") == "1"
+    disable_fallback_default = os.getenv(disable_fallback_env_var, "0") == "1"
 
     def decorator(fn):
-        def resolve_params(*args, **kwargs):
-            if disable_default:
-                return dict(default_params)
-
+        def resolve_decision(*args, **kwargs) -> Dict[str, Any]:
             mem_key = key_fn(*args, **kwargs)
-            params = None if force_default else memo.get(mem_key)
-            if params is not None:
-                return params
+
+            if force_fallback_default:
+                if fallback_fn is None:
+                    raise ValueError(
+                        f"{force_fallback_env_var}=1 but no fallback_fn was provided"
+                    )
+                decision = {
+                    "mode": "fallback",
+                    "params": dict(default_params),
+                    "runtime_ms": float("inf"),
+                }
+                memo[mem_key] = decision
+                return decision
+
+            if disable_default:
+                decision = {
+                    "mode": "cuda",
+                    "params": dict(default_params),
+                    "runtime_ms": float("inf"),
+                }
+                memo[mem_key] = decision
+                return decision
+
+            decision = None if force_default else memo.get(mem_key)
+            if decision is not None:
+                return decision
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
             payload = None if force_default else store.get(disk_key)
             if payload is not None:
-                params = payload["params"]
-                memo[mem_key] = params
-                return params
+               
+                memo[mem_key] = payload
+                return payload
 
             result = _run_study(
                 fn=fn,
+                fallback_fn=None if disable_fallback_default else fallback_fn,
+                constraint_fn=constraint_fn,
                 args=args,
                 kwargs=kwargs,
                 configs=configs,
@@ -122,17 +151,22 @@ def autotune_cuda_kernel(
                 warmup=warmup,
                 rep=rep,
                 sampler=sampler,
-                disk_key=disk_key
+                disk_key=disk_key,
             )
 
-            params = result.params
-            memo[mem_key] = params
+            decision = {
+                "mode": result.mode,
+                "params": result.params,
+                "runtime_ms": result.runtime_ms,
+            }
+            memo[mem_key] = decision
 
             store.put(
                 disk_key,
                 {
                     "function": fn.__name__,
-                    "params": params,
+                    "mode": result.mode,
+                    "params": result.params,
                     "runtime_ms": result.runtime_ms,
                 },
             )
@@ -140,17 +174,28 @@ def autotune_cuda_kernel(
             if verbose_default:
                 print(
                     f"[autotune:{fn.__name__}] tuned key={mem_key} "
-                    f"params={params} runtime_ms={result.runtime_ms:.4f}"
+                    f"mode={result.mode} params={result.params} "
+                    f"runtime_ms={result.runtime_ms:.4f}"
                 )
 
-            return params
+            return decision
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            params = resolve_params(*args, **kwargs)
-            return fn(*args, **kwargs, **params)
+            decision = resolve_decision(*args, **kwargs)
 
-        wrapper.resolve_params = resolve_params
+            if decision["mode"] == "fallback":
+                if fallback_fn is None:
+                    raise RuntimeError(
+                        f"Resolved to fallback mode for {fn.__name__}, "
+                        "but no fallback_fn was provided"
+                    )
+                return fallback_fn(*args, **kwargs)
+
+            return fn(*args, **kwargs, **decision["params"])
+
+        wrapper.resolve_decision = resolve_decision
+        wrapper.resolve_params = lambda *args, **kwargs: resolve_decision(*args, **kwargs)["params"]
         wrapper.clear_memo = memo.clear
         return wrapper
 
@@ -160,6 +205,8 @@ def autotune_cuda_kernel(
 def _run_study(
     *,
     fn: Callable[..., Any],
+    fallback_fn: Optional[Callable[..., Any]],
+    constraint_fn: Optional[Callable[..., bool]],
     args: tuple[Any, ...],
     kwargs: Dict[str, Any],
     configs: Dict[str, list],
@@ -171,6 +218,22 @@ def _run_study(
 ) -> TuneResult:
     static_kwargs = dict(kwargs)
 
+    fallback_runtime_ms = float("inf")
+    if fallback_fn is not None:
+        def run_fallback():
+            return fallback_fn(*args, **static_kwargs)
+
+        try:
+            run_fallback()
+            fallback_runtime_ms = _bench_callable(
+                run_fallback,
+                warmup=warmup,
+                rep=rep,
+            )
+        except Exception as e:
+            print(f"[fallback] Error: {e}")
+            fallback_runtime_ms = float("inf")
+
     def objective(trial: optuna.Trial) -> float:
         params = {
             name: trial.suggest_categorical(name, values)
@@ -178,30 +241,47 @@ def _run_study(
         }
         merged = {**static_kwargs, **params}
 
+        if constraint_fn is not None and not constraint_fn(*args, **merged):
+            raise optuna.TrialPruned()
+
         def run():
             return fn(*args, **merged)
 
         try:
             run()
-            torch.cuda.synchronize()
             runtime_ms = _bench_callable(run, warmup=warmup, rep=rep)
             trial.set_user_attr("runtime_ms", runtime_ms)
-
         except Exception as e:
             print(f"[Trial {trial.number}] Error: {e}")
             raise optuna.TrialPruned()
 
         return runtime_ms
-    
+
     study_name = f"{fn.__module__}.{fn.__qualname__}:{disk_key}"
-    study = optuna.create_study(study_name = study_name, direction="minimize", sampler=sampler)
+    study = optuna.create_study(
+        study_name=study_name,
+        direction="minimize",
+        sampler=sampler,
+    )
     study.optimize(objective, n_trials=n_trials)
 
     best = study.best_trial
+    best_cuda_runtime_ms = float(best.user_attrs["runtime_ms"])
+    best_cuda_params = {name: best.params[name] for name in configs}
+
+    if fallback_runtime_ms <= best_cuda_runtime_ms:
+        return TuneResult(
+            mode="fallback",
+            params={},
+            runtime_ms=fallback_runtime_ms,
+        )
+
     return TuneResult(
-        params={name: best.params[name] for name in configs},
-        runtime_ms=float(best.user_attrs["runtime_ms"]),
+        mode="cuda",
+        params=best_cuda_params,
+        runtime_ms=best_cuda_runtime_ms,
     )
+
 
 def relu_bat_c_key(
     A: torch.Tensor,
@@ -225,7 +305,7 @@ def relu_bat_c_key(
 
 def relu_bat_reduce_key(
     A: torch.Tensor,
-    B: torch.Tensor
+    B: torch.Tensor,
 ) -> tuple:
     props = torch.cuda.get_device_properties(A.device)
 
@@ -242,6 +322,8 @@ def relu_bat_reduce_key(
     )
 
 # Environment flags:
-#   KERNEL_AUTOTUNE_DISABLE=1   -  bypass autotuning, use first config in each list
-#   KERNEL_AUTOTUNE_FORCE=1     -  ignore cache and retune
-#   KERNEL_AUTOTUNE_VERBOSE=1   -  print tuning/cache diagnostics
+#   KERNEL_AUTOTUNE_DISABLE=1           -> bypass autotuning, use first config in each list
+#   KERNEL_AUTOTUNE_FORCE=1             -> ignore cache and retune
+#   KERNEL_AUTOTUNE_VERBOSE=1           -> print tuning/cache diagnostics
+#   KERNEL_AUTOTUNE_FORCE_FALLBACK=1    -> always use fallback_fn
+#   KERNEL_AUTOTUNE_DISABLE_FALLBACK=1  -> do not benchmark or select fallback_fn

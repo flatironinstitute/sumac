@@ -11,7 +11,7 @@ def test_relu_batc_kernel(D: int):
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
 
-    BM = 256
+    BM = 128
     BK = 32
     if D == 16:
         MS = 4
