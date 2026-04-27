@@ -120,7 +120,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
             cfg.lr = cfg.lr * torch.cuda.device_count() * 0.75 #TODO: test / better heuristic 
         A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent)
     elif method == 'SALSA':
-        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
+        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, lr, test_flag)
     elif method == 'ALS':
         A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag)
     else:
@@ -355,7 +355,7 @@ def sumac_loop(S_index: torch.LongTensor,
     return A, B, costs
 
 
-def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
+def salsa_loop(S_index, S_value, m, n, d, opts, lrate, test_flag=False):
     """
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
@@ -401,7 +401,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
     rmse_hist = []
     jacc_hist = []
     time_hist = []
-    
+    lrate = torch.tensor(lrate, device=A.device, dtype=A.dtype)
     t_start_loop = time.time()    
     
     momentum = torch.tensor(opts.get("exaggerate", 0.7), device=A.device, dtype=A.dtype)
@@ -424,12 +424,12 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False):
 
             torch.cuda.nvtx.range_push("update_factor_salsa B")
             # --- Update B ---
-            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias)
+            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias, lrate)
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("update_factor_salsa A")
             # --- Update A ---
-            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias)
+            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias, lrate)
             torch.cuda.nvtx.range_pop()
 
         # Metrics and Reporting

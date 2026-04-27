@@ -164,7 +164,8 @@ def lsq_update_single_gpu(
     blk_idx: torch.Tensor,   
     blk_vals: torch.Tensor,  
     momentum: torch.Tensor,
-    unbias: torch.Tensor
+    unbias: torch.Tensor,
+    lrate: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     stepM_blk = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev)
@@ -186,7 +187,7 @@ def lsq_update_single_gpu(
 
     lsqB_blk = B_blk_dev - stepM_blk + stepC_blk
     dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
-    B_blk_new = B_blk_dev + dB_blk_new / unbias
+    B_blk_new = B_blk_dev + lrate * dB_blk_new / unbias
     return B_blk_new, dB_blk_new
 
 
@@ -200,6 +201,7 @@ def batch_update_single_gpu(
     dB: torch.Tensor,
     momentum,
     unbias,
+    lrate,
     m_fixed: int,
 ):
     
@@ -231,6 +233,7 @@ def batch_update_single_gpu(
         blk_vals=blk_vals,
         momentum=momentum,
         unbias=unbias,
+        lrate=lrate,
     )
 
     return B_new, dB_new
@@ -245,7 +248,8 @@ def update_factor_salsa(
     Factor_update,
     dFactor,
     momentum,
-    unbias
+    unbias,
+    lrate,
 ):
     m_fixed = Factor_fixed.shape[0]
     _, edge_idx, row_indices = dataset[block_id]
@@ -264,6 +268,7 @@ def update_factor_salsa(
         dB=dFactor,
         momentum=momentum,
         unbias=unbias,
+        lrate=lrate,
         m_fixed=m_fixed,
     )
     
