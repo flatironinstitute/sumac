@@ -11,7 +11,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 const std::string kernelPath = "../../relu_batc_jit/kernel.cu";
+const std::string kernelPath_mixed = "../../relu_batc_jit/kernel_mixed.cu";
 
 static void fail(const char* id, const std::string& msg) {
     mexErrMsgIdAndTxt(id, "%s", msg.c_str());
@@ -160,6 +162,18 @@ static std::string build_source_from_file(const std::string& kernel_path, int BK
     return src.str();
 }
 
+static std::string build_source_mixed_from_file(const std::string& kernel_path, int BK, int MS, int V, int R, int NUM_THREADS) {
+    std::ostringstream src;
+    src << "#define BK " << BK << "\n";
+    src << "#define MS " << MS << "\n";
+    src << "#define V "  << V  << "\n";
+    src << "#define R "  << R  << "\n";
+    src << "#define NUM_THREADS " << NUM_THREADS << "\n";
+    src << "\n";
+    src << read_text_file(kernel_path);
+    return src.str();
+}
+
 struct ModuleEntry {
     CUmodule module = nullptr;
     CUfunction func = nullptr;
@@ -213,7 +227,7 @@ static ModuleEntry get_or_build_module(int BK, int MS, int V, int NUM_THREADS)
                         //    std::to_string(major) + std::to_string(minor); //Matlabs packaged cuda is too old to know sm120 ... forcing older arch here
     std::string gpu_arch = "--gpu-architecture=compute_90";
     const char* opts[] = {
-        "--std=c++14",
+        "--std=c++17",
         "--use_fast_math",
         gpu_arch.c_str()
     };
@@ -246,6 +260,107 @@ static ModuleEntry get_or_build_module(int BK, int MS, int V, int NUM_THREADS)
     CUfunction func = nullptr;
     checkCudaDrv(
         cuModuleGetFunction(&func, module, "relu_bat_c_fused_kernel_float4_sync"),
+        "cuModuleGetFunction");
+
+    ModuleEntry entry;
+    entry.module = module;
+    entry.func = func;
+    g_cache.emplace(key, entry);
+    return entry;
+}
+
+static std::string cuda_include_option() {
+    const char* cuda_path = std::getenv("CUDA_HOME");
+    if (!cuda_path) cuda_path = std::getenv("CUDA_PATH");
+
+    if (!cuda_path) {
+        fail("nvrtc_relu_bat_c_fused_mex:CUDAPath",
+             "Set CUDA_HOME or CUDA_PATH so NVRTC can find cuda/std headers.");
+    }
+
+    return std::string("--include-path=") + cuda_path + "/include";
+}
+
+static ModuleEntry get_or_build_module_mixed(int BK, int MS, int V, int R, int NUM_THREADS)
+{
+    std::ostringstream keyss;
+    keyss << kernelPath_mixed << "|BK=" << BK << "|MS=" << MS << "|V=" << V << "|R=" << R;
+    const std::string key = keyss.str();
+
+    auto it = g_cache.find(key);
+    if (it != g_cache.end()) {
+        return it->second;
+    }
+
+    if (!g_cuda_initialized) {
+        checkCudaDrv(cuInit(0), "cuInit");
+        g_cuda_initialized = true;
+    }
+
+    CUcontext ctx = nullptr;
+    checkCudaDrv(cuCtxGetCurrent(&ctx), "cuCtxGetCurrent");
+    if (ctx == nullptr) {
+        fail("nvrtc_relu_bat_c_fused_mex:Context",
+             "No active CUDA context. Create a gpuArray or call gpuDevice first.");
+    }
+
+    int device = 0;
+    checkCudaDrv(cuCtxGetDevice(&device), "cuCtxGetDevice");
+
+    int major = 0, minor = 0;
+    checkCudaDrv(
+        cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device),
+        "cuDeviceGetAttribute(major)");
+    checkCudaDrv(
+        cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device),
+        "cuDeviceGetAttribute(minor)");
+
+    const std::string src = build_source_mixed_from_file(kernelPath_mixed, BK, MS, V, R, NUM_THREADS);
+
+    nvrtcProgram prog;
+    checkNvrtc(
+        nvrtcCreateProgram(&prog, src.c_str(), kernelPath_mixed.c_str(), 0, nullptr, nullptr),
+        "nvrtcCreateProgram");
+
+    // std::string gpu_arch = "--gpu-architecture=compute_" +
+                        //    std::to_string(major) + std::to_string(minor); //Matlabs packaged cuda is too old to know sm120 ... forcing older arch here
+    std::string gpu_arch = "--gpu-architecture=compute_90";
+    std::string cuda_inc = cuda_include_option();
+    const char* opts[] = {
+        "--std=c++17",
+        "--use_fast_math",
+        gpu_arch.c_str(),
+        cuda_inc.c_str()
+    };
+
+    nvrtcResult compile_res = nvrtcCompileProgram(prog, 4, opts);
+
+    size_t log_size = 0;
+    checkNvrtc(nvrtcGetProgramLogSize(prog, &log_size), "nvrtcGetProgramLogSize");
+    if (log_size > 1) {
+        std::vector<char> log(log_size);
+        checkNvrtc(nvrtcGetProgramLog(prog, log.data()), "nvrtcGetProgramLog");
+        mexPrintf("%s\n", log.data());
+    }
+
+    if (compile_res != NVRTC_SUCCESS) {
+        checkNvrtc(nvrtcDestroyProgram(&prog), "nvrtcDestroyProgram");
+        fail("nvrtc_relu_bat_c_fused_mex:Compile", "NVRTC compilation failed.");
+    }
+
+    size_t ptx_size = 0;
+    checkNvrtc(nvrtcGetPTXSize(prog, &ptx_size), "nvrtcGetPTXSize");
+
+    std::vector<char> ptx(ptx_size);
+    checkNvrtc(nvrtcGetPTX(prog, ptx.data()), "nvrtcGetPTX");
+    checkNvrtc(nvrtcDestroyProgram(&prog), "nvrtcDestroyProgram");
+
+    CUmodule module = nullptr;
+    checkCudaDrv(cuModuleLoadData(&module, ptx.data()), "cuModuleLoadData");
+
+    CUfunction func = nullptr;
+    checkCudaDrv(
+        cuModuleGetFunction(&func, module, "relu_bat_c_fused_kernel_mixed_sync"),
         "cuModuleGetFunction");
 
     ModuleEntry entry;
@@ -312,11 +427,9 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
     if (D >= 128) {
         run_cublas_relu_fallback(At_ptr, Bt_ptr, Ct_ptr, Yt_ptr, D, N, M);
     } else {
-        if (D != 4 * V) {
-            fail("nvrtc_relu_bat_c_fused_mex:V", "Expected D == 4 * V for this float4 kernel.");
-        }
+        int R = D % 4;
 
-        ModuleEntry entry = get_or_build_module(BK, MS, V, threads);
+        ModuleEntry entry = R == 0 ? get_or_build_module(BK, MS, V, threads) : get_or_build_module_mixed(BK, MS, V, R, threads);
 
         void* args[] = {
             (void*)&At_ptr,
