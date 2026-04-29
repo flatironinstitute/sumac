@@ -130,15 +130,8 @@ function lsqB = lsq_update(S,A,B)
 pseudoInverseAt = A/(A'*A);
 %Mt = max(0,B*A');       
 %stepM = -Mt*pseudoInverseAt;
-kernelPath = '../../relu_batc_jit/kernel.cu';
 
-BK = int32(32);
-MS = int32(4); % This controls how many rows of B are processed per thread. 
-% Rough guideline for H100: D=16 -> MS=4, D=32 -> MS=2, D=64 -> MS=1, D>64 don't use this custom kernel - register spills will ruin performance
-V  = int32(size(A,2) / 4);
-threads = int32(128);
-
-Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.', kernelPath, BK, MS, V, threads);
+Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.');
 
 % CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
 [m,n] = size(S);
