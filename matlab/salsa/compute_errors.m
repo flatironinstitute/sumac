@@ -14,30 +14,32 @@ nnzM = 0;
 sumM = 0;
 ssqM = 0;
 
-At = gpuArray(single(A.'));   
-Bt = gpuArray(single(B.'));
+if canUseGPU
+  At = gpuArray(single(A.'));   
+  Bt = gpuArray(single(B.'));
 
-for b = 1:cols_per_block:n
-    idxB = b:min(n, b + cols_per_block - 1);
+  for b = 1:cols_per_block:n
+      idxB = b:min(n, b + cols_per_block - 1);
 
-    Bt_block = Bt(:, idxB);  
+      Bt_block = Bt(:, idxB);  
 
-    [s, q, z] = relu_bat_reduce_fused_nvrtc_mex(At, Bt_block);
+      [s, q, z] = relu_bat_reduce_fused_nvrtc_mex(At, Bt_block);
 
-    sumM = sumM + s;
-    ssqM = ssqM + q;
-    nnzM = nnzM + double(z);
+      sumM = sumM + s;
+      ssqM = ssqM + q;
+      nnzM = nnzM + double(z);
+  end
+else
+  % COMPUTE M=max(0,A*B') IN BLOCKS
+  for b=1:cols_per_block:n
+    idxB = b:min(n,b+cols_per_block-1);
+    Mt = sparse(max(0,B(idxB,:)*A'));
+    sumM = sumM + sum(Mt,"all");
+    ssqM = ssqM + norm(Mt,"fro")^2;
+    nnzM = nnzM + nnz(Mt);
+  end
+
 end
-
-% % COMPUTE M=max(0,A*B') IN BLOCKS
-% for b=1:cols_per_block:n
-%   idxB = b:min(n,b+cols_per_block-1);
-%   Mt = sparse(max(0,B(idxB,:)*A'));
-%   sumM = sumM + sum(Mt,"all");
-%   ssqM = ssqM + norm(Mt,"fro")^2;
-%   nnzM = nnzM + nnz(Mt);
-% end
-
 % CORRECTION FROM ELEMENTS WITH S>0
 [i,j,Sij] = find(S);
 Lij = zeros(size(Sij));
