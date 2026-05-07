@@ -128,26 +128,44 @@ function lsqB = lsq_update(S,A,B)
 
 % CONTRIBUTION FROM ELEMENTS WITH S=0
 pseudoInverseAt = A/(A'*A);
-%Mt = max(0,B*A');       
-%stepM = -Mt*pseudoInverseAt;
 
-Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.');
+if canUseGPU
 
-% CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
-[m,n] = size(S);
-[i,j,Sij] = find(S);
-% Lij = sum(A(i,:).*B(j,:),2);
-% Lij = zeros(size(Sij));
-% for k=1:size(A,2)
-%   Lij = Lij + A(i,k).*B(j,k);  % LOOP TO SAVE MEMORY
-% end
-Lij = sum(A(i,:).*B(j,:), 2);
-Mij = max(0,Lij);
-Ct = sparse(j,i,Sij-Lij+Mij,n,m);
-stepC = Ct*pseudoInverseAt;
+  Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.');
+  [m,n] = size(S);
+  [i,j,Sij] = find(S);
+  % Lij = sum(A(i,:).*B(j,:),2);
+  % Lij = zeros(size(Sij));
+  % for k=1:size(A,2)
+  %   Lij = Lij + A(i,k).*B(j,k);  % LOOP TO SAVE MEMORY
+  % end
+  Lij = sum(A(i,:).*B(j,:), 2);
+  Mij = max(0,Lij);
+  Ct = sparse(j,i,Sij-Lij+Mij,n,m);
+  stepC = Ct*pseudoInverseAt;
 
-% UPDATE
-lsqB = B - Yt.' + stepC; % - Yt.' instead of +stepM - the kernel needs row major but matlab's layout is column major
+  % UPDATE
+  lsqB = B - Yt.' + stepC; % - Yt.' instead of +stepM - the kernel needs row major but matlab's layout is column major
+else 
+  Mt = max(0,B*A');       
+  stepM = -Mt*pseudoInverseAt;
+
+  % CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
+  [m,n] = size(S);
+  [i,j,Sij] = find(S);
+  % Lij = sum(A(i,:).*B(j,:),2);
+  % Lij = zeros(size(Sij));
+  % for k=1:size(A,2)
+  %   Lij = Lij + A(i,k).*B(j,k);  % LOOP TO SAVE MEMORY
+  % end
+  Lij = sum(A(i,:).*B(j,:), 2);
+  Mij = max(0,Lij);
+  Ct = sparse(j,i,Sij-Lij+Mij,n,m);
+  stepC = Ct*pseudoInverseAt;
+
+  % UPDATE
+  lsqB = B + stepM + stepC; 
+end
 
 end
 
