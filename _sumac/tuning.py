@@ -96,30 +96,34 @@ def autotune_cuda_kernel(
     if sampler is None:
         sampler = optuna.samplers.TPESampler(seed=0)
 
-    disable_default = os.getenv(disable_env_var, "0") == "1"
-    force_default = os.getenv(force_env_var, "0") == "1"
-    verbose_default = os.getenv(verbose_env_var, "0") == "1"
-    force_fallback_default = os.getenv(force_fallback_env_var, "0") == "1"
-    disable_fallback_default = os.getenv(disable_fallback_env_var, "0") == "1"
+    # disable_default = os.getenv(disable_env_var, "0") == "1"
+    # force_default = os.getenv(force_env_var, "0") == "1"
+    # verbose_default = os.getenv(verbose_env_var, "0") == "1"
+    # force_fallback_default = os.getenv(force_fallback_env_var, "0") == "1"
+    # disable_fallback_default = os.getenv(disable_fallback_env_var, "0") == "1"
 
     def decorator(fn):
         def resolve_decision(*args, **kwargs) -> Dict[str, Any]:
-            mem_key = key_fn(*args, **kwargs)
+            force_fallback = os.getenv(force_fallback_env_var, "0") == "1"
+            disable = os.getenv(disable_env_var, "0") == "1"
+            force = os.getenv(force_env_var, "0") == "1"
+            verbose = os.getenv(verbose_env_var, "0") == "1"
+            disable_fallback = os.getenv(disable_fallback_env_var, "0") == "1"
 
-            if force_fallback_default:
+            if force_fallback:
                 if fallback_fn is None:
                     raise ValueError(
                         f"{force_fallback_env_var}=1 but no fallback_fn was provided"
                     )
-                decision = {
+                return {
                     "mode": "fallback",
-                    "params": dict(default_params),
+                    "params": {},
                     "runtime_ms": float("inf"),
                 }
-                memo[mem_key] = decision
-                return decision
 
-            if disable_default:
+            mem_key = key_fn(*args, **kwargs)
+
+            if disable:
                 decision = {
                     "mode": "cuda",
                     "params": dict(default_params),
@@ -128,13 +132,13 @@ def autotune_cuda_kernel(
                 memo[mem_key] = decision
                 return decision
 
-            decision = None if force_default else memo.get(mem_key)
+            decision = None if force else memo.get(mem_key)
             if decision is not None:
                 return decision
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
-            payload = None if force_default else store.get(disk_key)
+            payload = None if force else store.get(disk_key)
             if payload is not None:
                
                 memo[mem_key] = payload
@@ -142,7 +146,7 @@ def autotune_cuda_kernel(
 
             result = _run_study(
                 fn=fn,
-                fallback_fn=None if disable_fallback_default else fallback_fn,
+                fallback_fn=None if disable_fallback else fallback_fn,
                 constraint_fn=constraint_fn,
                 args=args,
                 kwargs=kwargs,
@@ -171,7 +175,7 @@ def autotune_cuda_kernel(
                 },
             )
 
-            if verbose_default:
+            if verbose:
                 print(
                     f"[autotune:{fn.__name__}] tuned key={mem_key} "
                     f"mode={result.mode} params={result.params} "
@@ -288,37 +292,58 @@ def relu_bat_c_key(
     B: torch.Tensor,
     C: torch.Tensor,
 ) -> tuple:
-    props = torch.cuda.get_device_properties(A.device)
-
     N, D = A.shape
     M, _ = B.shape
 
+    if torch.cuda.device_count() > 0:
+        props = torch.cuda.get_device_properties(A.device)
+
+        return (
+            props.major,
+            props.minor,
+            props.multi_processor_count,
+            int(N),
+            int(M),
+            int(D),
+        )
+    
     return (
-        props.major,
-        props.minor,
-        props.multi_processor_count,
+        0,
+        0,
+        0,
         int(N),
         int(M),
-        int(D),
+        int(D)
     )
+    
 
 
 def relu_bat_reduce_key(
     A: torch.Tensor,
     B: torch.Tensor,
 ) -> tuple:
-    props = torch.cuda.get_device_properties(A.device)
-
     N, D = A.shape
     M, _ = B.shape
 
+    if torch.cuda.device_count() > 0:
+        props = torch.cuda.get_device_properties(A.device)
+
+        return (
+            props.major,
+            props.minor,
+            props.multi_processor_count,
+            int(N),
+            int(M),
+            int(D),
+        )
+    
     return (
-        props.major,
-        props.minor,
-        props.multi_processor_count,
+        0,
+        0,
+        0,
         int(N),
         int(M),
-        int(D),
+        int(D)
     )
 
 # Environment flags:

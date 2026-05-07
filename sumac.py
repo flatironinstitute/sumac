@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
-
+import os
 import math
 import time
 import random
@@ -360,6 +360,8 @@ def salsa_loop(S_index, S_value, m, n, d, opts, lrate, test_flag=False):
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
+    if device == "cpu":
+        os.environ["KERNEL_AUTOTUNE_FORCE_FALLBACK"] = "1"
     S_index = S_index.to(device)
     S_value = S_value.to(device)
     
@@ -439,7 +441,8 @@ def salsa_loop(S_index, S_value, m, n, d, opts, lrate, test_flag=False):
                                     eval_loader, device=device, errZ_obj=True)
             
             #if num_gpus > 0:
-            torch.cuda.synchronize() ##timing on gpu
+            if torch.cuda.device_count() > 0:
+                torch.cuda.synchronize() ##timing on gpu
             elapsed = time.time() - t_start
             rmse_hist.append(rmse)
             jacc_hist.append(jacc)
