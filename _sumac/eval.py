@@ -28,6 +28,8 @@ def relu_bat_reduce_constraints(
 
     if A.shape[1] >= 64 and num_ms > 2:  
         return False  
+    if BM <= 0 or (BM & (BM - 1)) != 0:
+        return False
     
     props = torch.cuda.get_device_properties(torch.cuda.current_device)
 
