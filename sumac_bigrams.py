@@ -71,9 +71,15 @@ if __name__ == '__main__':
         S = mat['bigrams']
 
         S = S.tocoo()
+        row_sums = np.asarray(S.sum(axis=1)).ravel().astype(np.float32)
 
+        realmin = np.finfo(np.float32).tiny
+
+        # Normalize each nonzero entry by the sum of its row
+        S_data = S.data.astype(np.float32) / (row_sums[S.row] + realmin)
+    
         S_index = torch.tensor(np.array([S.row, S.col]), dtype=torch.long)
-        S_value = torch.tensor(S.data, dtype=torch.float64 if args.float64 else torch.float32)
+        S_value = torch.tensor(S_data, dtype=torch.float64 if args.float64 else torch.float32)
         m, n = S.shape
 
     else:
