@@ -6,7 +6,7 @@ import math
 
 
 def least_squares_update_fast(
-    S_idx: torch.LongTensor, #shape (2, nmz)
+    S_idx: torch.Tensor, #shape (2, nmz)
     S_vals: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
@@ -54,7 +54,7 @@ def least_squares_update_fast(
     A_devs      = [A_cpu.to(dev, non_blocking=True) for dev in devices]
     pinvA_trans_devs  = [pinvA_trans_cpu.to(dev, non_blocking=True) for dev in devices]
     B_devs      = [B_cpu.to(dev, non_blocking=True) for dev in devices] ##OLD
-    dB   = torch.zeros_like(B_cpu) ##OLD
+    dB: torch.Tensor  = torch.zeros_like(B_cpu) ##OLD
     # ——————————————
     # 5) accumulators
     # on-device metric accumulators (avoid .item() in the loop)
@@ -96,6 +96,7 @@ def least_squares_update_fast(
 
     # final update
     dB += torch.sparse.mm(dZ_pos.transpose(0,1), pinvA_trans_cpu)
+    assert isinstance(dB, torch.Tensor)
     nextB = B_cpu + dB
     # ——————————————
     # 8) metrics
@@ -111,7 +112,8 @@ def least_squares_update_fast(
     ssqS = S_norm**2
     ssqe = ssqS + ssqSr - 2*torch.sum(S_vals * Sr_vals)
     rmse  = math.sqrt(ssqe) / (S_norm + 1e-16)
-    return nextB, rmse, jacc
+    # TODO: Added .item() here, confirm no performance implications given the comment above
+    return nextB, rmse, jacc.item()
 
 
 def refactor(A: torch.Tensor, B: torch.Tensor):
@@ -139,7 +141,7 @@ def refactor(A: torch.Tensor, B: torch.Tensor):
 ###
 
 def least_squares_update(
-    S_idx: torch.LongTensor, #shape (2, nmz)
+    S_idx: torch.Tensor, #shape (2, nmz)
     S_vals: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,

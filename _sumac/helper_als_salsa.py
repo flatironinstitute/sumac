@@ -6,7 +6,7 @@ from typing import Tuple
 from _sumac.train_als import refactor
 
 def _init_factors_salsa(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
@@ -69,7 +69,7 @@ def _init_factors_testcase(
     return A, B
 
 def _init_factors_factor_specific(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
@@ -117,7 +117,7 @@ def _init_factors_factor_agnostic(
 
 
 def als_init_factors(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,

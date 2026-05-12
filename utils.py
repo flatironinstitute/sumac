@@ -58,7 +58,7 @@ class Logger(object):
     def print_statistics(self, run=None):
         if run is not None:
             result = 100 * torch.tensor(self.results[run])
-            argmax = result[:, 1].argmax().item()
+            argmax = int(result[:, 1].argmax().item())  # cast to int s.b. safe for argmax, which returns index
             print(f'Run {run + 1:02d}:')
             print(f'Highest Train: {result[:, 0].max():.2f}')
             print(f'Highest Valid: {result[:, 1].max():.2f}')

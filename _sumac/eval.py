@@ -14,8 +14,8 @@ def relu_AB(A: torch.Tensor, B: torch.Tensor):
 
 @torch.compile(mode="max-autotune-no-cudagraphs")
 def relu_AB_with_Lobs(A: torch.Tensor, B: torch.Tensor,
-                     local_r: torch.LongTensor,
-                     cols_all: torch.LongTensor):
+                     local_r: torch.Tensor,
+                     cols_all: torch.Tensor):
     L = A @ B.T
     Sr_block = torch.relu(L)
     L_obs = L[local_r, cols_all]
@@ -29,10 +29,10 @@ def block_loss_and_pred(
     num_blocks: int,
     m: int,
     n: int,
-    S_index: torch.LongTensor,       # (2, nnz)
+    S_index: torch.Tensor,       # (2, nnz)
     S_value: torch.Tensor,           # (nnz,)
     edge_idx: torch.Tensor,          # indices into S_index/S_value for this block
-    row_indices: torch.Tensor = None, # NEW: explicit row indices for this block
+    row_indices: torch.Tensor | None = None, # NEW: explicit row indices for this block
     errZ_obj: bool = False,          # whether use objective to min ||Z - L|| instead of ||S - Sr||
 ):
     """
@@ -91,7 +91,14 @@ def block_loss_and_pred(
     if errZ_obj: #make equivalent errZ objective;
         # L at observed (local) coordinates
         neg_mask_pos = L_obs < 0                  # only entries that were clamped in Sr
-        if neg_mask_pos.any():
+        ## TODO -- double-check that there isn't something sneaky happening in the orig
+        # (which tested against neg_mask_pos.any() directly)
+        masking_happened = False
+        if isinstance(neg_mask_pos, torch.Tensor):
+            masking_happened = neg_mask_pos.any().item()
+        else:
+            masking_happened = neg_mask_pos
+        if masking_happened:
             S_obs = vals_all[neg_mask_pos]        # S_{ij} at those coords
             L_neg = L_obs[neg_mask_pos]           # L_{ij} (negative values)
             # sum of (L^2 - 2 S L) over the intersection (observed & L<0)
@@ -103,10 +110,15 @@ def block_loss_and_pred(
 ##main eval code; reusing block_loss_and_pred() to compute metric
 @torch.no_grad()
 def eval(
-    A, B, S_index, S_value,
-    m, n, num_blocks,
-    full_block_loader,   # yields (block_id, edge_idx) once per block_id
-    device=None,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
+    m: int,
+    n: int,
+    num_blocks: int,
+    full_block_loader,   # yields (block_id, edge_idx) once per block_id # TODO
+    device: torch.Device | None = None,
     errZ_obj: bool = False,  # whether use objective to min ||Z - L|| instead of ||S - Sr||
 ):
     ssqe = torch.zeros((), device=device, dtype=A.dtype)
@@ -119,9 +131,17 @@ def eval(
             edge_idx = edge_idx.to(device).view(-1)
             block_id = int(block_id)
             ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
-                A, B, block_id, num_blocks, m, n,
-                S_index, S_value, edge_idx, 
-                row_indices=row_indices, errZ_obj=errZ_obj
+                A,
+                B,
+                block_id,
+                num_blocks,
+                m,
+                n,
+                S_index,
+                S_value,
+                edge_idx, 
+                row_indices=row_indices,
+                errZ_obj=errZ_obj
             )
             ssqe += ssqe_b
             sumSr += sumSr_b

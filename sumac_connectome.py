@@ -57,8 +57,8 @@ if __name__ == '__main__':
             print(f"| {key}: {value}")
     # load data (3, E)
     data = np.loadtxt(args.filename).T
-    S_index = torch.LongTensor(data[0:2,:])
-    S_value = torch.FloatTensor(data[2,:])
+    S_index = torch.tensor(data[0:2,:])
+    S_value = torch.tensor(data[2,:])
     m = n = int(S_index[0].max())
     print(f'm=n={m}, E={len(S_value)}')
     # normalize to start at zero-index
@@ -91,7 +91,7 @@ if __name__ == '__main__':
 
         sumac(S_index, S_value, m=m, n=m, d=args.d, 
                 max_iterate=args.iters, factor_init=True,
-                num_blocks=args.num_blocks, mom=args.momentum,
+                num_blocks=args.num_blocks, sgd_momentum=args.momentum,
                 method=method, lr=args.lr, save_path=save_path,
                 GD_latent=GD_latent, optim=args.optim, precondition=precond)
 

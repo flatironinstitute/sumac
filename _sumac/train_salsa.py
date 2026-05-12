@@ -1,12 +1,27 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from torch.cuda import Stream   # TODO: wrap as type check only
 import contextlib
 from contextlib import nullcontext
-from _sumac.dataset import block_span, RowBlockDataset
+from _sumac.dataset import StochasticRowBlockDataset, block_span, RowBlockDataset
 
 
-def update_factor_salsa(S_idx_full, S_val_full, dataset, block_id, Factor_fixed, Factor_update, dFactor, opts, stepnum, multi_gpu=True, streams=None, map_buffers=None):
+def update_factor_salsa(
+    S_idx_full: Tensor,
+    S_val_full: Tensor,
+    dataset: StochasticRowBlockDataset,
+    block_id: int,
+    Factor_fixed: Tensor,
+    Factor_update: Tensor,
+    dFactor: Tensor,
+    opts: dict,
+    stepnum: int,
+    multi_gpu: bool = True,
+    streams: list[Stream] | None = None,
+    map_buffers: list[Tensor] | None = None
+):
     """
     Directly aligns with Matlab: [B,dB] = batch_update(Sr,A(rowsA,:),B,dB,opts,stepnum);
     """
@@ -19,13 +34,35 @@ def update_factor_salsa(S_idx_full, S_val_full, dataset, block_id, Factor_fixed,
     idx_raw = S_idx_full[:, edge_idx].clone()
     val_raw = S_val_full[edge_idx]
     
-    nextF, dF = batch_update_multi_gpu(idx_raw, val_raw, Factor_fixed, row_indices, Factor_update, dFactor, opts, stepnum, m_fixed, streams=streams, map_buffers=map_buffers)
+    nextF, dF = batch_update_multi_gpu(
+        idx_raw,
+        val_raw,
+        Factor_fixed,
+        row_indices,
+        Factor_update,
+        dFactor,
+        opts,
+        stepnum,
+        m_fixed,
+        streams=streams,
+        map_buffers=map_buffers
+    )
     
     return nextF, dF
 
+
 def batch_update_multi_gpu(
-    Sr_idx_raw, Sr_vals, Factor_fixed, row_indices_cpu, B, dB,
-    opts, stepnum, m_fixed, streams=None, map_buffers=None
+    Sr_idx_raw: Tensor,
+    Sr_vals: Tensor,
+    Factor_fixed: Tensor,
+    row_indices_cpu: Tensor,
+    B: Tensor,
+    dB: Tensor,
+    opts: dict,
+    stepnum: int,
+    m_fixed: int,
+    streams: list[Stream] | None = None,
+    map_buffers: list[Tensor] | None = None
 ):
     """
     Asynchronous Multi-GPU version of batch_update_torch.
@@ -51,13 +88,14 @@ def batch_update_multi_gpu(
     # Pre-calculate pseudoinverse. We slice Factor_fixed first.
     Ar_cpu = Factor_fixed[row_indices_cpu, :]
     GramA = Ar_cpu.T @ Ar_cpu
-    pinvAt_cpu = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d)
+    pinvAt_cpu: Tensor = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d)
 
-    momentum = opts.get('exaggerate', 0.7)
+    momentum: float = opts.get('exaggerate', 0.7)
     unbias = 1 - (momentum ** stepnum)
 
-    next_B_blks = [None] * num_gpus
-    next_dB_blks = [None] * num_gpus
+    # TODO: Check if this broke anything
+    next_B_blks: list[Tensor] = [torch.empty(0)] * num_gpus
+    next_dB_blks: list[Tensor] = [torch.empty(0)] * num_gpus
     block_ranges = []
 
     for dev_idx in range(num_gpus):
@@ -70,7 +108,7 @@ def batch_update_multi_gpu(
             # 1. Transfers (async on GPU, normal copies on CPU)
             Ar_dev = Ar_cpu.to(dev, non_blocking=use_cuda)
             row_idx_dev = row_indices_cpu.to(dev, non_blocking=use_cuda)
-            pinvAt_dev = pinvAt_cpu.to(dev, non_blocking=use_cuda)
+            pinvAt_dev: Tensor = pinvAt_cpu.to(dev, non_blocking=use_cuda)
             B_blk_dev = B[start:end, :].to(dev, non_blocking=use_cuda)
             dB_blk_dev = dB[start:end, :].to(dev, non_blocking=use_cuda)
 
@@ -105,7 +143,7 @@ def batch_update_multi_gpu(
                     dtype=dtype
                 ).coalesce()
 
-                stepC_blk = torch.sparse.mm(Ct, pinvAt_dev)
+                stepC_blk: Tensor | float = torch.sparse.mm(Ct, pinvAt_dev)
             else:
                 Mt_blk = torch.clamp(B_blk_dev @ Ar_dev.T, min=0.0)
                 stepM_blk = -Mt_blk @ pinvAt_dev
@@ -115,14 +153,16 @@ def batch_update_multi_gpu(
 
             # 4. Momentum and Back
             dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
-            B_blk_new = B_blk_dev + dB_blk_new / unbias
+            B_blk_new: Tensor = B_blk_dev + dB_blk_new / unbias
 
             next_B_blks[dev_idx] = B_blk_new.to(device_cpu, non_blocking=use_cuda)
             next_dB_blks[dev_idx] = dB_blk_new.to(device_cpu, non_blocking=use_cuda)
+    
 
     # Synchronize only if using CUDA
     if use_cuda:
         for s in active_streams:
+            if s is None: continue
             s.synchronize()
 
     nextB = torch.empty_like(B)

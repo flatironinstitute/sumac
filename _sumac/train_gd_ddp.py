@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch_sparse.tensor import * 
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 import math
@@ -14,7 +13,8 @@ from torch.nn.utils import clip_grad_norm_
 
 from _sumac.dataset import block_span, RowBlockDataset
 from _sumac.model import FactorModel
-from _sumac.train_gd import TrainConfig, block_loss_and_pred 
+from _sumac.train_gd import TrainConfig
+from _sumac.eval import block_loss_and_pred, eval
 
 # -----------------------------
 # TODO: DEBUGGGGG - DDP training loop (FP32)
@@ -22,7 +22,7 @@ from _sumac.train_gd import TrainConfig, block_loss_and_pred
 def GD_loop_ddp(
     rank: int,
     world_size: int,
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
@@ -112,7 +112,7 @@ def GD_loop_ddp(
                 edge_idx = edge_idx.to(device, non_blocking=True).view(-1)
 
                 A, B = ddp.module.A, ddp.module.B
-                mse_block, sumSr_block, jacc_num_block = block_loss_and_pred(
+                mse_block, sumSr_block, jacc_num_block, _ = block_loss_and_pred(
                     A, B,
                     block_id=block_id, num_blocks=cfg.num_blocks, m=m, n=n,
                     S_index=S_index, S_value=S_value, edge_idx=edge_idx,
@@ -122,6 +122,7 @@ def GD_loop_ddp(
                 sumSr_epoch   += sumSr_block
                 jaccN_epoch   += jacc_num_block
 
+                # TODO: THIS DOES NOT EXIST
                 if cfg.l2_reg > 0:
                     start, end = block_span(block_id, m, cfg.num_blocks)
                     touched_rows.append(torch.arange(start, end, device=device))
@@ -176,7 +177,7 @@ def GD_loop_ddp(
                     mask = (S_index[0] >= start) & (S_index[0] < end)
                     edge_idx = torch.nonzero(mask, as_tuple=False).view(-1)
 
-                    mse_full_b, sumSr_b, jaccN_b = block_loss_and_pred(
+                    mse_full_b, sumSr_b, jaccN_b, _ = block_loss_and_pred(
                         A0, B0,
                         block_id=b_id, num_blocks=cfg.num_blocks, m=m, n=n,
                         S_index=S_index, S_value=S_value, edge_idx=edge_idx
@@ -230,7 +231,19 @@ def GD_loop_ddp(
     # EVAL
     if rank == 0:
         devices = [torch.device("cuda:0")]
-        rmse, jacc = eval(S_index.to("cpu"), S_value.to("cpu"), ddp.module.A.detach().cpu(), ddp.module.B.detach().cpu(), devices)
+        # TODO CHECK THIS FIX
+        m = n = int(S_index[0].max())
+        rmse, jacc, _ = eval(
+            ddp.module.A.detach().cpu(),
+            ddp.module.B.detach().cpu(),
+            S_index.to("cpu"),
+            S_value.to("cpu"),
+            m,                  # TODO CHECK ME
+            n,                  # TODO CHECK ME
+            cfg.num_blocks,     # TODO CHECK ME
+            loader,             # TODO CHECK ME
+            devices[0]          # TODO CHECK ME
+        )
         print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}")
 
     dist.destroy_process_group()

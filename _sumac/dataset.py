@@ -22,7 +22,7 @@ class RowBlockDataset(Dataset):
     where edge_idx selects edges with row in this block's span.
     Expects S_index shape == (2, E), S_value shape == (E,)
     """
-    def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
+    def __init__(self, S_index: torch.Tensor, S_value: torch.Tensor,
                  m: int, num_blocks: int):
         assert S_index.dim() == 2 and S_index.size(0) == 2, "S_index must be (2,E)"
         assert S_value.dim() == 1 and S_value.size(0) == S_index.size(1), "size mismatch"
@@ -39,7 +39,7 @@ class RowBlockDataset(Dataset):
             start, end = block_span(block_id, self.m, self.num_blocks)
             mask = (self._rows >= start) & (self._rows < end)
             edge_idx = mask.nonzero(as_tuple=False).flatten()
-            self.block_edge_idx.append(edge_idx)   # CPU LongTensor
+            self.block_edge_idx.append(edge_idx)   # CPU
 
     def __len__(self):
         return self.num_blocks
@@ -54,25 +54,44 @@ class StochasticRowBlockDataset(Dataset):
     Stochastic version of RowBlockDataset
     Re-partitions rows into blocks every time .reshuffle() is called.
     """
-    def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
+
+    S_index: torch.Tensor
+    S_value: torch.Tensor
+    m: int
+    num_blocks: int
+    row_to_edges: list[torch.Tensor]
+    block_edge_idx: list[torch.Tensor]
+    block_row_indices: list[torch.Tensor]
+
+
+    def __init__(self, S_index: torch.Tensor, S_value: torch.Tensor,
                  m: int, num_blocks: int):
         self.S_index = S_index.detach().cpu() #NEW: force CPU
         self.S_value = S_value.detach().cpu() #NEW: force CPU
         self.m = m
         self.num_blocks = num_blocks
         
+        if torch.is_floating_point(self.S_index):
+            raise ValueError("Index tensor is expected to be integer-valued.")
+
+
         # 1. Build row-to-edge index map once (CPU)
         # This allows us to quickly find all non-zeros for a given set of rows
         rows = self.S_index[0].detach().cpu()
-        self.row_to_edges = [[] for _ in range(m)]
+
+        _row_to_edges = [[] for _ in range(m)]
         for edge_idx, row_idx in enumerate(rows):
-            self.row_to_edges[row_idx.item()].append(edge_idx)
+            # TODO: check if this is assured
+            # (call to .item() will throw if row_idx.numel() > 1)
+            row_idx_scalar: int = int(row_idx.item())
+            _row_to_edges[row_idx_scalar].append(edge_idx)
         
         # Convert to tensors for faster concatenation
-        self.row_to_edges = [torch.tensor(e, dtype=torch.long) for e in self.row_to_edges]
+        self.row_to_edges = [torch.tensor(e, dtype=torch.long) for e in _row_to_edges]
         
         # Initial partition
         self.reshuffle()
+
 
     def reshuffle(self):
         """
@@ -105,12 +124,15 @@ class StochasticRowBlockDataset(Dataset):
             self.block_edge_idx.append(sorted_edge_indices[offsets[b]:offsets[b+1]])
             self.block_row_indices.append(perm[b*block_size : min(self.m, (b+1)*block_size)])
 
+
     def __len__(self):
         return self.num_blocks
+
 
     def __getitem__(self, block_id):
         bid = int(block_id)
         return bid, self.block_edge_idx[bid], self.block_row_indices[bid]
+
 
 class MultiGPUStochasticRowBlockDataset(Dataset):
     """
@@ -123,8 +145,13 @@ class MultiGPUStochasticRowBlockDataset(Dataset):
         (bid, edge_idx_local, row_indices_global, S_index_shard, S_value_shard)
       so your per-device compute can index into that shard without cross-GPU transfers.
     """
-    def __init__(self, S_index: torch.LongTensor, S_value: torch.Tensor,
-                 m: int, num_blocks: int, devices: List[torch.device]):
+    def __init__(self,
+        S_index: torch.Tensor,
+        S_value: torch.Tensor,
+        m: int,
+        num_blocks: int,
+        devices: List[torch.device]
+    ):
         self.m = int(m)
         self.num_blocks = int(num_blocks)
         self.devices = list(devices)
@@ -234,7 +261,7 @@ def get_sharded_ds(ds, devices, batch_block_ids):
 
 
 ### OLD: balanced sharded partition
-def nnz_balanced_row_spans(rows_cpu: torch.LongTensor, m: int, num_devices: int) -> List[Tuple[int, int]]:
+def nnz_balanced_row_spans(rows_cpu: torch.Tensor, m: int, num_devices: int) -> List[Tuple[int, int]]:
     """
     Partition rows [0, m) into contiguous spans with approximately equal nnz per span.
     rows_cpu: S_index[0] on CPU (shape: nnz,)

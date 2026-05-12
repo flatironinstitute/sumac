@@ -14,7 +14,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 import pickle
-from typing import Tuple
+from typing import Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 
 from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset, \
@@ -27,12 +27,34 @@ from _sumac.train_als import least_squares_update_fast, least_squares_update, re
 from _sumac.train_salsa import update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
-def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
-          test_flag=False, dtype=torch.float32, opts=None, 
-          mom=0.7, method='GD', lr=1e-1, factor_init=False,
-          save_path=None, GD_latent=False, optim="adam", precondition=False,
-          adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, muon_momentum=0.95,
-          multi_gpu=True, A_init=None, B_init=None):
+
+def sumac(
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
+    m: int,
+    n: int,
+    d: int,
+    max_iterate: int = 25,
+    num_blocks: int | None = None,
+    test_flag: bool = False,
+    dtype: torch.dtype = torch.float32,
+    opts: dict[str, Any] | None = None,   # TODO: fix options
+    sgd_momentum: float = 0.7,
+    method: str = 'GD', # TODO: make enum
+    lr: float = 1e-1,
+    factor_init: bool = False,
+    save_path: str | None = None,   # TODO: handle more rigorously
+    GD_latent: bool = False,
+    optim: str = "adam",    # TODO: enum
+    precondition: bool = False,
+    adam_beta1: float = 0.9,
+    adam_beta2: float = 0.999,
+    adam_eps: float = 1e-8,
+    muon_momentum: float = 0.95,
+    multi_gpu: bool = True,
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
+):
     """
     PyTorch version of sumac algorithm driver function.
 
@@ -73,7 +95,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         'tol_abs': 1e-2, #ALS early stopping
         'tol_rel': 1e-4, #ALS early stopping
         'tol_window': 20, #ALS early stopping
-        'exaggerate': mom, #momentum for SALSA or ALS
+        'exaggerate': sgd_momentum, #momentum for SALSA or ALS
         'momentum_start_iter': 10, #ALS 
         'refactor_interval': 25, #ALS
         'eval_interval': 10, #evaluation per interval for SALSA or ALS
@@ -111,8 +133,8 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
 
     ## NEW: remove all-zero rows and/or columns
     S_index, row_mask, col_mask = prune_zero_rows_cols(S_index, shape=(m,n))
-    m_eff = row_mask.sum() if row_mask is not None else m
-    n_eff = col_mask.sum() if col_mask is not None else n
+    m_eff = row_mask.sum().item if row_mask is not None else m
+    n_eff = col_mask.sum().item if col_mask is not None else n
 
     # set random seed for reproducibility
     random.seed(opts['seed'])
@@ -122,7 +144,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
     S_value = S_value.to(dtype)
     if method == 'GD':
         cfg = TrainConfig(d, num_blocks=num_blocks, epochs=max_iterate, lr=lr,
-                          optim=optim, SGD_mom=mom, precondition=precondition,
+                          optim=optim, SGD_mom=sgd_momentum, precondition=precondition,
                           adam_beta1=adam_beta1, adam_beta2=adam_beta2, adam_eps=adam_eps,
                           muon_momentum=muon_momentum)
         ## NEW: for multi-gpus, scale batch blocks and lr automatically
@@ -156,15 +178,16 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
     print(f'finish for {max_iterate} iterations!')
     return A_ori, B_ori, costs
 
+
 def GD_loop(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
     cfg: TrainConfig,
     GD_latent: bool = False,
-    A_init: torch.Tensor = None,
-    B_init: torch.Tensor = None
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
 ):
     torch.manual_seed(cfg.seed)
     base_device = torch.device(cfg.device)
@@ -344,15 +367,18 @@ def GD_loop(
 
     return A.detach(), B.detach(), history
 
-def sumac_loop(S_index: torch.LongTensor,
-               S_value: torch.Tensor,
-               m: int,
-               n: int,
-               d: int,
-               opts: dict,
-               test_flag: bool = False,
-               A_init: torch.Tensor = None,
-               B_init: torch.Tensor = None):
+
+def sumac_loop(
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
+    m: int,
+    n: int,
+    d: int,
+    opts: dict,
+    test_flag: bool = False,
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
+):
     """
     ALS subroutine to solve the nonlinear low-rank factorization
     S \approx max(0, A B^T) where A is of shape (m, r), B is of shape (n, r)
@@ -439,9 +465,17 @@ def sumac_loop(S_index: torch.LongTensor,
     return A, B, costs
 
 
-def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False,
-               A_init: torch.Tensor = None,
-               B_init: torch.Tensor = None):
+def salsa_loop(
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
+    m: int,
+    n: int,
+    d: int,
+    opts: dict,
+    test_flag: bool = False,
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
+):
     """
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
@@ -499,7 +533,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, test_flag=False,
         #random.shuffle(block_order) -- only used for deterministic minibatch
         
         for mb_idx, block_id in enumerate(block_order):
-            stepnum = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
+            stepnum: int = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
             # --- Update B ---
             B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, opts, stepnum,
                                         multi_gpu=multi_gpu_internal, streams=streams, map_buffers=row_map_buffers)
