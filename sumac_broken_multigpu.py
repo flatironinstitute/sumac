@@ -1,27 +1,36 @@
+import numpy as np
 import torch
-from torch import Tensor
-from torch.utils.data import DataLoader
-import os
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
 import math
 import time
 import random
-from data import prune_zero_rows_cols
+from data import dense_to_sparse, prune_zero_rows_cols
+from dataclasses import dataclass
+import os
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.utils import clip_grad_norm_
 import pickle
-from typing import Any
+from typing import Tuple, Any
 from concurrent.futures import ThreadPoolExecutor
 
-from _sumac.dataset import collate_blocks, StochasticRowBlockDataset, MultiGPUStochasticRowBlockDataset, get_sharded_ds
+from _sumac.dataset import block_span, RowBlockDataset, collate_blocks, StochasticRowBlockDataset, \
+                            MultiGPUStochasticRowBlockDataset, get_sharded_ds
 from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
-                            zero_replica_grads, compute_backward_on_device, wait_streams_before_reduce, \
+                            zero_replica_grads, compute_backward_on_device, sync_all, wait_streams_before_reduce, \
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
-from _sumac.train_als import least_squares_update_fast, refactor
+from _sumac.train_als import least_squares_update_fast, least_squares_update, refactor
 from _sumac.train_salsa import update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
+
 def sumac(
-    S_index: Tensor,
-    S_value: Tensor,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
     m: int,
     n: int,
     d: int,
@@ -42,10 +51,9 @@ def sumac(
     adam_beta2: float = 0.999,
     adam_eps: float = 1e-8,
     muon_momentum: float = 0.95,
-    multi_gpu: bool = False,        # TODO: unused
-    seed: int = 0,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None
+    multi_gpu: bool = True,
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
 ):
     """
     PyTorch version of sumac algorithm driver function.
@@ -66,7 +74,7 @@ def sumac(
       multi_gpu: If true, launch multiple streams, each per device
       A_init, B_init: allow user-specified factor initialization
     Saved Artifacts:
-      A, B    : factors (Tensors)
+      A, B    : factors (torch.Tensors)
       costs   : list or tensor of cost history
       opts    : dict of options used
     """
@@ -80,7 +88,7 @@ def sumac(
         'max_iterate': max_iterate,
         'dtype': dtype,
         'method': method,
-        'seed': seed,
+        'seed': random.randint(0, 2**31 - 1),
         'display': 1,
         'cache_MB': 5000,  
         'time_limit': float('inf'), #ALS early stopping
@@ -128,47 +136,29 @@ def sumac(
     m_eff = row_mask.sum().item if row_mask is not None else m
     n_eff = col_mask.sum().item if col_mask is not None else n
 
-    # TODO: make this less messy
-    device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
-    if device == "cpu":
-        os.environ["KERNEL_AUTOTUNE_FORCE_FALLBACK"] = "1"
     # set random seed for reproducibility
     random.seed(opts['seed'])
-    gen = torch.Generator(device=device)
-    print(f"seed = {opts['seed']}")
-    gen.manual_seed(opts['seed'])
     torch.manual_seed(opts['seed'])
-
 
     # call the core SUMAC loop 
     S_value = S_value.to(dtype)
-    torch.cuda.nvtx.range_push("core SUMAC loop")
     if method == 'GD':
-        cfg = TrainConfig(
-            d,
-            num_blocks=num_blocks,
-            epochs=max_iterate,
-            lr=lr,
-            optim=optim,
-            SGD_mom=sgd_momentum,
-            precondition=precondition,
-            adam_beta1=adam_beta1,
-            adam_beta2=adam_beta2,
-            adam_eps=adam_eps,
-            muon_momentum=muon_momentum
-        )
+        cfg = TrainConfig(d, num_blocks=num_blocks, epochs=max_iterate, lr=lr,
+                          optim=optim, SGD_mom=sgd_momentum, precondition=precondition,
+                          adam_beta1=adam_beta1, adam_beta2=adam_beta2, adam_eps=adam_eps,
+                          muon_momentum=muon_momentum)
         ## NEW: for multi-gpus, scale batch blocks and lr automatically
         if torch.cuda.device_count() > 1:
             cfg.batch_blocks = torch.cuda.device_count() #max(torch.cuda.device_count() * 4, 8) #
             cfg.lr = cfg.lr * torch.cuda.device_count() * 0.75 #TODO: test / better heuristic 
-        A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, gen, GD_latent, A_init, B_init)
+        A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, GD_latent, A_init, B_init)
     elif method == 'SALSA':
-        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, lr, gen, test_flag, A_init, B_init)
+        A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag, A_init, B_init)
     elif method == 'ALS':
-        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, gen, test_flag, A_init, B_init)
+        A, B, costs = sumac_loop(S_index, S_value, m_eff, n_eff, d, opts, test_flag, A_init, B_init)
     else:
         raise NotImplementedError("method must be chosen from GD_ or SALSA or ALS")
-    torch.cuda.nvtx.range_pop()
+
     # NEW: restore zero rows and columns
     if row_mask is not None:
         A_ori = torch.zeros((m, d), dtype=A.dtype, device=A.device)
@@ -190,162 +180,27 @@ def sumac(
 
 
 def GD_loop(
-    S_index: Tensor,
-    S_value: Tensor,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
     m: int,
     n: int,
     cfg: TrainConfig,
-    gen: torch.Generator,
     GD_latent: bool = False,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None
-):
-    torch.manual_seed(cfg.seed)
-    device = torch.device(cfg.device)
-
-    # Move base data to master device first (replicas created later)
-    S_index = S_index.to(device)
-    S_value = S_value.to(device)
-    if A_init is None or B_init is None:
-        scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.d)
-        A = torch.nn.Parameter(torch.rand(m, cfg.d, device=device) * scale)
-        B = torch.nn.Parameter(torch.rand(n, cfg.d, device=device) * scale)
-    else:
-        A = torch.nn.Parameter(A_init.to(device))
-        B = torch.nn.Parameter(B_init.to(device))
-    opt = make_optimizer(
-        cfg.optim,
-        [A, B],
-        lr=cfg.lr,
-        weight_decay=0.0,
-        SGD_momentum=cfg.SGD_mom,
-        adam_betas=(cfg.adam_beta1, cfg.adam_beta2),
-        adam_eps=cfg.adam_eps,
-        muon_momentum=cfg.muon_momentum
-    )
-
-    # DataLoader
-    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen)
-    loader = DataLoader(
-        ds,
-        batch_size=cfg.batch_blocks,
-        shuffle=cfg.shuffle_blocks,
-        collate_fn=collate_blocks
-    )
-
-    # Multi-GPU setup (manual DP, no DDP)
-    devices = select_devices(cfg, device)
-    master = devices[0]
-    if master != device:
-        A.data = A.data.to(master)
-        B.data = B.data.to(master)
-        S_index = S_index.to(master)
-        S_value = S_value.to(master)
-
-    A_devs, B_devs, S_index_devs, S_value_devs, streams = setup_replicas(A, B, S_index, S_value, devices)
-
-    history = []
-    t0 = time.time()
-
-    for epoch in range(1, cfg.epochs + 1):
-        torch.cuda.nvtx.range_push("epoch: " + str(epoch))
-        total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
-        t_start = time.time()
-
-        for blocks in loader:
-            shards = shard_blocks(blocks, len(devices))
-            zero_replica_grads(opt, A_devs, B_devs)
-
-            # compute+backward on each device
-            losses: list[Tensor] = []
-            sumSrs: list[Tensor] = []
-            numjs: list[Tensor]  = []
-
-            for di, dev in enumerate(devices):
-                loss_d, sumSr_d, numj_d = compute_backward_on_device(
-                    di,
-                    dev,
-                    shards[di],
-                    A_devs,
-                    B_devs,
-                    S_index_devs,
-                    S_value_devs,
-                    streams,
-                    cfg,
-                    m,
-                    n,
-                    GD_latent,
-                    block_loss_and_pred,
-                )
-                losses.append(loss_d)
-                sumSrs.append(sumSr_d)
-                numjs.append(numj_d)
-
-            wait_streams_before_reduce(devices, streams)
-            # reduce grads to master and step on master
-            reduce_grads_to_master(A, B, A_devs, B_devs, master, average=True)
-            apply_precondition(A, B, cfg, master)
-            apply_clip_and_step(opt, A, B, cfg)
-            broadcast_params_from_master(A, B, A_devs, B_devs, devices)
-
-            # logging accumulators (sum per-device scalars onto master)
-            total_loss += float(sum(ld.detach().to(master) for ld in losses).item()) # type: ignore
-            sumSr      += float(sum(sd.detach().to(master) for sd in sumSrs).item()) # type: ignore
-            num_jacc   += float(sum(nd.detach().to(master) for nd in numjs).item()) # type: ignore
-
-        time_step = time.time() - t_start
-        denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
-        jacc = 1.0 - num_jacc / denom_jacc
-        S_norm = float(torch.norm(S_value).item())
-        rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
-        log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
-        print(log)
-        history.append(log)
-        torch.cuda.nvtx.range_pop()
-    total = time.time() - t0
-    print(f"\nTotal elapsed time: {total:.2f} sec")
-
-    rmse, jacc, errZ = eval(
-        A,
-        B,
-        S_index,
-        S_value,
-        m,
-        n,
-        num_blocks=cfg.num_blocks,
-        full_block_loader=loader,
-        device=A.device,
-        errZ_obj=True
-    )
-    print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
-
-    return A.detach(), B.detach(), history
-
-
-## NOTE: TODO: This is deprecated, pending decision about multi-gpu support.
-# It is unlikely to be correct as currently written.
-def GD_loop_multi_gpu(
-    S_index: Tensor,
-    S_value: Tensor,
-    m: int,
-    n: int,
-    cfg: TrainConfig,
-    gen: torch.Generator,
-    GD_latent: bool = False,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
 ):
     torch.manual_seed(cfg.seed)
     base_device = torch.device(cfg.device)
-
-    # Keep S on CPU for sharding (avoid parking full S on master GPU)
-    S_index_cpu = S_index.detach().cpu()
-    S_value_cpu = S_value.detach().cpu()
 
     # Multi-GPU setup (manual DP, no DDP)
     devices = select_devices(cfg, base_device)
     master = devices[0]
 
+    # Keep S on CPU for sharding (avoid parking full S on master GPU)
+    S_index_cpu = S_index.detach().cpu()
+    S_value_cpu = S_value.detach().cpu()
+
+    # Parameters on master
     torch.cuda.nvtx.range_push("Declare params and optimizer")
     if A_init is None or B_init is None:
         scale = 0.5 * math.sqrt(S_value_cpu.mean().item() / cfg.d)
@@ -354,37 +209,19 @@ def GD_loop_multi_gpu(
     else:
         A = torch.nn.Parameter(A_init.to(master))
         B = torch.nn.Parameter(B_init.to(master))
-
     opt = make_optimizer(
-        cfg.optim,
-        [A, B],
-        lr=cfg.lr,
-        weight_decay=0.0,
-        SGD_momentum=cfg.SGD_mom,
-        adam_betas=(cfg.adam_beta1, cfg.adam_beta2),
-        adam_eps=cfg.adam_eps,
+        cfg.optim, [A, B], lr=cfg.lr, weight_decay=0.0, SGD_momentum=cfg.SGD_mom,
+        adam_betas=(cfg.adam_beta1, cfg.adam_beta2), adam_eps=cfg.adam_eps,
         muon_momentum=cfg.muon_momentum
     )
     torch.cuda.nvtx.range_pop()
 
-    # TODO: check if this is still necessary
-    if master != base_device:
-        A.data = A.data.to(master)
-        B.data = B.data.to(master)
-        S_index = S_index.to(master)
-        S_value = S_value.to(master)
-
     # Dataset (row-sharded; each shard pinned to its device)
     torch.cuda.nvtx.range_push("MultiGPUStochasticRowBlockDataset init")
-    ds = MultiGPUStochasticRowBlockDataset(S_index_cpu, S_value_cpu, m, cfg.num_blocks, gen, devices)
+    ds = MultiGPUStochasticRowBlockDataset(S_index_cpu, S_value_cpu, m, cfg.num_blocks, devices)
     torch.cuda.nvtx.range_pop()
-    
-    # NOTE: This is essentially the setup_replicas function, but with
-    # a hair of explicit special handling for the master device &
-    # assuming the sharded MultiGpuRowBlockDataset class instead of the
-    # StochasticRowBlockDataset class.
-    # TODO: roll it into the setup_replicas function.
-    # # # # Replicate params
+
+    # Replicate params
     torch.cuda.nvtx.range_push("Multi-GPU setup replicas")
     A_devs = []
     B_devs = []
@@ -402,6 +239,7 @@ def GD_loop_multi_gpu(
     S_value_devs = [sh["S_value"] for sh in ds.shards]
     torch.cuda.nvtx.range_pop()
 
+
     history = []
     t0 = time.time()
 
@@ -411,7 +249,6 @@ def GD_loop_multi_gpu(
     executor = ThreadPoolExecutor(max_workers=len(devices))
 
     for epoch in range(1, cfg.epochs + 1):
-        ## Commented out pending decision about multi-GPU support
         torch.cuda.nvtx.range_push(f"epoch: {epoch}")
         # reshuffle within each local shard 
         ds.reshuffle()
@@ -420,13 +257,11 @@ def GD_loop_multi_gpu(
             if streams[di] is not None:
                 streams[di].wait_stream(torch.cuda.default_stream(dev))
 
-        # # # Use per-device tensors for metric accumulation to avoid cross-device sync issues
-        total_loss_devs = [Tensor(0.0, device=d) for d in devices]
-        sumSr_devs = [Tensor(0.0, device=d) for d in devices]
-        num_jacc_devs = [Tensor(0.0, device=d) for d in devices]
-## TODO PICK UP HERE
-        torch.cuda.nvtx.range_push("epoch: " + str(epoch))
-        total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
+        # Use per-device tensors for metric accumulation to avoid cross-device sync issues
+        total_loss_devs = [torch.tensor(0.0, device=d) for d in devices]
+        sumSr_devs = [torch.tensor(0.0, device=d) for d in devices]
+        num_jacc_devs = [torch.tensor(0.0, device=d) for d in devices]
+
         t_start = time.time()
 
         # manual block order (CPU) 
@@ -510,13 +345,15 @@ def GD_loop_multi_gpu(
         log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
         print(log)
         history.append(log)
+
         torch.cuda.nvtx.range_pop()
-    # # executor.shutdown() # TODO: ??
+    
+    executor.shutdown()
     total = time.time() - t0
     print(f"\nTotal elapsed time: {total:.2f} sec")
 
     # Eval: TODO (faster eval)
-    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen)
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks)
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     S_index_master = S_index_cpu.to(master, non_blocking=True)
     S_value_master = S_value_cpu.to(master, non_blocking=True)
@@ -532,16 +369,15 @@ def GD_loop_multi_gpu(
 
 
 def sumac_loop(
-    S_index: Tensor,
-    S_value: Tensor,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
     m: int,
     n: int,
     d: int,
     opts: dict,
-    gen: torch.Generator,
     test_flag: bool = False,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
 ):
     """
     ALS subroutine to solve the nonlinear low-rank factorization
@@ -551,8 +387,6 @@ def sumac_loop(
     - opts: additional arguments
     Return: A, B, costs (evaluation metrics)
     """
-    ## TODO: remove repetition/handle this more centrally
-
     # 1) start clock
     print(f"test_flag={test_flag}")
     dtype = opts['dtype']
@@ -567,7 +401,7 @@ def sumac_loop(
     random.seed(opts['seed'])
     torch.manual_seed(opts['seed'])
     if A_init is None or B_init is None:
-        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag, gen=gen)
+        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
     else:
         A, B = A_init, B_init
     dA = torch.zeros_like(A)
@@ -578,30 +412,20 @@ def sumac_loop(
     # 4) main loop: every 2 iterations finish update both factors A,B
     t0 = time.time()
     for it in range(max_iter): #range(1, max_iter+1):
-        torch.cuda.nvtx.range_push("Iteration " + str(it) + " start")
         t_start = time.time()
         # update A or B 
         if it % 2 == 1:
-            torch.cuda.nvtx.range_push("Least Square Update B")
             ## TODO: wrap it into a function, input arg - update A or B
             nextB, rmse, jacc = least_squares_update_fast(S_index, S_value, A, B, 
                                                      num_blocks, opts['cols_per_block'])
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_push("apply momentum")
             dB = (nextB - B) + dB * opts['exaggerate']  * (it > opts['momentum_start_iter']) #apply momentum after 10 iterations
             B  = B + dB
-            torch.cuda.nvtx.range_pop()
         else:
-            torch.cuda.nvtx.range_push("Least Square Update A")
             nextA, rmse, jacc = least_squares_update_fast(S_index[[1,0],:], S_value, B, A, 
                                                   num_blocks, opts['cols_per_block'])
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_push("apply momentum")
             dA = (nextA - A) + dA * opts['exaggerate'] * (it > opts['momentum_start_iter']) #apply momentum after 10 iterations
             A  = A + dA
-            torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("record costs")
         # record costs
         torch.cuda.synchronize() ##timing on gpu
         time_step = time.time() - t_start
@@ -609,20 +433,16 @@ def sumac_loop(
         rmse_hist.append(rmse)
         jacc_hist.append(jacc)
         time_hist.append(elapsed)
-        torch.cuda.nvtx.range_pop()
+
         # display progress
         if opts['display']:
             print(f"iter = {it:04d}, rmse = {rmse:.6f},  jacc = {jacc:.6f},  factor_step = {time_step:6.4f}")
-
+        
         # post-processing and early stopping
-        torch.cuda.nvtx.range_push("post_process_and_stop")
         A, B, dA, dB = als_post_process_factors(rmse, it, rmse_hist, A, B, dA, dB)
-        torch.cuda.nvtx.range_pop()
-
         if als_early_stop(it, elapsed, jacc, jacc_hist, opts):
             break
 
-        torch.cuda.nvtx.range_pop()
     # 5) undo the partial update on break, so that the cost (precomputed before update) matches the same model
     if it % 2 == 1:
         # last update was on B
@@ -646,93 +466,80 @@ def sumac_loop(
 
 
 def salsa_loop(
-    S_index: Tensor,
-    S_value: Tensor,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
     m: int,
     n: int,
     d: int,
     opts: dict,
-    lrate: float | Tensor,
-    gen: torch.Generator,
     test_flag: bool = False,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None
+    A_init: torch.Tensor | None = None,
+    B_init: torch.Tensor | None = None
 ):
     """
     Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
     """
+    dtype = opts['dtype']
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
-    if device == "cpu":
-        os.environ["KERNEL_AUTOTUNE_FORCE_FALLBACK"] = "1"
     S_index = S_index.to(device)
     S_value = S_value.to(device)
     
-    gen_rows = torch.Generator(device=device)
-    gen_rows.manual_seed(opts['seed'] + 1)
-    gen_cols = torch.Generator(device=device)
-    gen_cols.manual_seed(opts['seed'] + 2)
-
+    # Initialization using sumac helper
+    random.seed(opts['seed'])
+    torch.manual_seed(opts['seed'])
     if  A_init is None or B_init is None:
-        torch.cuda.nvtx.range_push("als_init_factors")
-        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag, gen=gen)
-        torch.cuda.nvtx.range_pop()
+        A, B = als_init_factors(S_index, S_value, m, n, d, opts, test_flag=test_flag)
     else:
         A, B = A_init, B_init
-
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
 
-    
     # Datasets for row and column blocks
+    #ds_rows = RowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'])
+    S_index_T = S_index[[1, 0], :]
+    #ds_cols = RowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
+    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'])
 
-    torch.cuda.nvtx.range_push("StochasitcRowBlockDataset rows")
-    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, opts['num_blocks'], gen=gen_rows)
-    S_index_T = S_index[[1, 0], :] 
-    torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_push("StochasticRowBlockDataset cols")
-    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, opts['num_blocks'], gen=gen_cols)
-    torch.cuda.nvtx.range_pop()
     ##init evaluation
-
-    torch.cuda.nvtx.range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
                             eval_loader, device=device, errZ_obj=True)
     print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
-    torch.cuda.nvtx.range_pop()
+
     rmse_hist = []
     jacc_hist = []
     time_hist = []
-    lrate = torch.tensor(lrate, device=A.device, dtype=A.dtype)
-    t_start_loop = time.time()    
     
-    momentum = torch.tensor(opts.get("exaggerate", 0.7), device=A.device, dtype=A.dtype)
-    t_start = time.time()
-    for iter_idx in range(1, opts['max_iterate'] + 1):
-        torch.cuda.nvtx.range_push("Iteration " + str(iter_idx))
+    t_start_loop = time.time()
+    # --- PERSISTENT CUDA INFRASTRUCTURE (eliminates launch overhead) ---
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    multi_gpu_internal = (num_gpus > 1) 
+    
+    if num_gpus > 0:
+        devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+        streams = [torch.cuda.Stream(device=d) for d in devices]
+        row_map_buffers = [torch.zeros(m, dtype=torch.long, device=d) for d in devices]
+        col_map_buffers = [torch.zeros(n, dtype=torch.long, device=d) for d in devices]
+    else:
+        streams, row_map_buffers, col_map_buffers = None, None, None
 
+    for iter_idx in range(1, opts['max_iterate'] + 1):
+        t_start = time.time()
         # Truly stochastic sampling: reshuffle partitions every epoch
-        torch.cuda.nvtx.range_push("reshuffle")
         ds_rows.reshuffle()
         ds_cols.reshuffle()
         block_order = list(range(opts['num_blocks']))
-        torch.cuda.nvtx.range_pop()
         #random.shuffle(block_order) -- only used for deterministic minibatch
         
         for mb_idx, block_id in enumerate(block_order):
             stepnum: int = mb_idx + 1 + (iter_idx - 1) * opts['num_blocks']
-            unbias = 1 - (momentum ** stepnum)
-            torch.cuda.nvtx.range_push("update_factor_salsa B")
-
             # --- Update B ---
-            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias, lrate)
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push("update_factor_salsa A")
+            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, opts, stepnum,
+                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=row_map_buffers)
             # --- Update A ---
-            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias, lrate)
-            torch.cuda.nvtx.range_pop()
+            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, opts, stepnum,
+                                        multi_gpu=multi_gpu_internal, streams=streams, map_buffers=col_map_buffers)
 
         # Metrics and Reporting
         if iter_idx % opts['eval_interval'] == 0:
@@ -740,8 +547,7 @@ def salsa_loop(
             rmse, jacc, errZ = eval(A.to(device), B.to(device), S_index, S_value, m, n, opts['num_blocks'], 
                                     eval_loader, device=device, errZ_obj=True)
             
-            #if num_gpus > 0:
-            if torch.cuda.device_count() > 0:
+            if num_gpus > 0:
                 torch.cuda.synchronize() ##timing on gpu
             elapsed = time.time() - t_start
             rmse_hist.append(rmse)
@@ -750,8 +556,7 @@ def salsa_loop(
             
             if opts['display']:
                 print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
-            t_start = time.time()
-        torch.cuda.nvtx.range_pop()
+
     # WRAP UP
     A, B = refactor(A, B)
     

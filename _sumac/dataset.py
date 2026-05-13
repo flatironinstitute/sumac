@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from typing import List, Tuple
-
+from typing import List, Tuple, Any
 
 # ---------- helpers ----------
 def block_span(block_id: int, m: int, num_blocks: int):
@@ -62,15 +61,25 @@ class StochasticRowBlockDataset(Dataset):
     row_to_edges: list[torch.Tensor]
     block_edge_idx: list[torch.Tensor]
     block_row_indices: list[torch.Tensor]
+    gen: torch.Generator
 
+    def __init__(self,
+            S_index: torch.Tensor,
+            S_value: torch.Tensor,
+            m: int,
+            num_blocks: int,
+            gen: torch.Generator
+        ):
 
-    def __init__(self, S_index: torch.Tensor, S_value: torch.Tensor,
-                 m: int, num_blocks: int):
+        ## TODO: consider deleting the force-cpu of S_index, S_value.
         self.S_index = S_index.detach().cpu() #NEW: force CPU
         self.S_value = S_value.detach().cpu() #NEW: force CPU
         self.m = m
         self.num_blocks = num_blocks
-        
+        self.gen = gen
+
+        ## TODO: Note this check and the row-edge map (balance of this fn)
+        # is not present in DBollweg branch        
         if torch.is_floating_point(self.S_index):
             raise ValueError("Index tensor is expected to be integer-valued.")
 
@@ -98,16 +107,15 @@ class StochasticRowBlockDataset(Dataset):
         Vectorized reshuffle: Re-partitions rows into blocks in a single go.
         """
         # 1. Randomly permute rows
-        dev = torch.device("cpu") # self.S_value.device # NEW - change default to cpu  # 
-        perm = torch.randperm(self.m, device=dev)
+        dev = self.S_value.device # TODO: confirm whether to instead do torch.device("cpu")
+        perm = torch.randperm(self.m, device=dev, generator=self.gen)
         perm_inv = torch.empty_like(perm)
-        perm_inv[perm] = torch.arange(self.m)
+        perm_inv[perm] = torch.arange(self.m, device=dev)
         
         # 2. Determine block for each edge based on its row's position in perm
         block_size = (self.m + self.num_blocks - 1) // self.num_blocks
         
-        # We do this calculation on CPU to keep dataset memory light
-        edge_rows = self.S_index[0].detach().cpu()
+        edge_rows = self.S_index[0]
         edge_block_ids = perm_inv[edge_rows] // block_size
         
         # 3. Sort edge indices by their block_id
@@ -115,7 +123,7 @@ class StochasticRowBlockDataset(Dataset):
         
         # 4. Find boundaries and slice
         counts = torch.bincount(edge_block_ids, minlength=self.num_blocks)
-        offsets = torch.zeros(self.num_blocks + 1, dtype=torch.long)
+        offsets = torch.zeros(self.num_blocks + 1, dtype=torch.long, device=dev)
         torch.cumsum(counts, dim=0, out=offsets[1:])
         
         self.block_edge_idx = []
@@ -145,17 +153,32 @@ class MultiGPUStochasticRowBlockDataset(Dataset):
         (bid, edge_idx_local, row_indices_global, S_index_shard, S_value_shard)
       so your per-device compute can index into that shard without cross-GPU transfers.
     """
+
+    # TODO: Typing/data class for shards
+    shards: list[dict[str, Any]]
+    S_index: torch.Tensor
+    S_value: torch.Tensor
+    m: int
+    num_blocks: int
+    device: list[torch.device]
+    num_devices: int
+    row_to_edges: list[torch.Tensor]
+    gen: torch.Generator
+    
+
     def __init__(self,
         S_index: torch.Tensor,
         S_value: torch.Tensor,
         m: int,
         num_blocks: int,
+        gen: torch.Generator,
         devices: List[torch.device]
     ):
         self.m = int(m)
         self.num_blocks = int(num_blocks)
         self.devices = list(devices)
         self.num_devices = len(self.devices)
+        self.gen = gen
 
         # Shard from CPU (recommended; avoids parking full S on one GPU)
         S_index_cpu = S_index.detach().cpu()
@@ -188,6 +211,8 @@ class MultiGPUStochasticRowBlockDataset(Dataset):
             torch.cuda.synchronize(dev)
         self.reshuffle()
 
+
+    # TODO: harmonize repetition with single-GPU version
     def reshuffle(self):
         """
         Local reshuffle per device: partitions ONLY local rows into num_blocks.
@@ -198,7 +223,7 @@ class MultiGPUStochasticRowBlockDataset(Dataset):
             row_start = shard["row_start"]
 
             # 1) permute local rows [0, m_local)
-            perm = torch.randperm(m_local, device=dev)
+            perm = torch.randperm(m_local, device=dev, generator=self.gen)
             perm_inv = torch.empty_like(perm)
             perm_inv[perm] = torch.arange(m_local, device=dev)
 
@@ -230,18 +255,22 @@ class MultiGPUStochasticRowBlockDataset(Dataset):
             shard["block_edge_idx"] = block_edge_idx
             shard["block_row_indices"] = block_row_indices
 
+
     def __len__(self):
         return self.num_blocks
+
 
     def __getitem__(self, block_id: int):
         bid = int(block_id)
         # Return per-device block payloads
         return [
-            (bid,
-             shard["block_edge_idx"][bid],
-             shard["block_row_indices"][bid],
-             shard["S_index"],
-             shard["S_value"])
+            (
+                bid,
+                shard["block_edge_idx"][bid],
+                shard["block_row_indices"][bid],
+                shard["S_index"],
+                shard["S_value"]
+            )
             for shard in self.shards
         ]
 

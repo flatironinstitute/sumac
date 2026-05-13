@@ -1,11 +1,249 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda import Stream   # TODO: wrap as type check only
-import contextlib
-from contextlib import nullcontext
-from _sumac.dataset import StochasticRowBlockDataset, block_span, RowBlockDataset
+from _sumac.dataset import StochasticRowBlockDataset
+from relu_batc_jit.api import relu_bat_c_fused
+from _sumac.tuning import *
+import triton
+import triton.language as tl
+
+@triton.jit
+def round_f32_to_tf32(x):
+    # Round-to-nearest-even to TF32 precision by rounding FP32 mantissa
+    xb = tl.cast(x, tl.uint32, bitcast=True)
+    lsb = (xb >> 13) & 1       #least significant bit that won't be discarded
+    bias = 0x00001000 + lsb    #rounding
+    xb = (xb + bias) & 0xFFFFE000       #xb + rounding bit, zero lower 13 bits  
+    return tl.cast(xb, tl.float32, bitcast=True) #bitcast back to fp32
+
+@triton.autotune(
+configs=[
+        triton.Config({"BM": m, "BN": n}, num_warps=w, num_stages=s)
+        for m in [32, 64, 128]
+        for n in [32, 64, 128]
+        for w in [1, 2, 4, 8]
+        for s in [1, 2]
+    ],
+    key=["M", "N", "D"],
+    cache_results=True
+)
+@triton.jit
+def relu_bat_c_fused_kernel(
+    A_ptr, B_ptr, C_ptr, Y_ptr,
+    N, M, D: tl.constexpr,
+    stride_an: tl.constexpr, stride_ad: tl.constexpr,
+    stride_bm: tl.constexpr, stride_bd: tl.constexpr,
+    stride_ym: tl.constexpr, stride_yd: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr,
+    ROUND_TF32: tl.constexpr, DOT_PREC: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    m = pid_m * BM + tl.arange(0, BM)
+    d = tl.arange(0, D)
+
+    b_ptrs = B_ptr + m[:, None] * stride_bm + d[None, :] * stride_bd
+    b = tl.load(b_ptrs, mask=(m[:, None] < M), other=0.0).to(tl.float32)
+    if ROUND_TF32:
+        b = round_f32_to_tf32(b)
+
+    y = tl.zeros((BM, D), dtype=tl.float32)
+
+    for n0 in tl.range(0, N, BN):
+        n = n0 + tl.arange(0, BN)
+
+        a_ptrs = A_ptr + n[:, None] * stride_an + d[None, :] * stride_ad
+        a = tl.load(a_ptrs, mask=(n[:, None] < N), other=0.0).to(tl.float32)
+        c_ptrs = C_ptr + n[:, None] * stride_an + d[None, :] * stride_ad
+        c  = tl.load(c_ptrs, mask=(n[:,None] < N), other=0.0).to(tl.float32)
+        if ROUND_TF32:
+            a = round_f32_to_tf32(a)
+
+        s = tl.dot(b, tl.trans(a),input_precision=DOT_PREC)
+        s = tl.maximum(s, 0.0)
+
+        y += tl.dot(s, c, input_precision=DOT_PREC)
+
+    y_ptrs = Y_ptr + m[:, None] * stride_ym + d[None, :] * stride_yd
+    tl.store(y_ptrs, y, mask=(m[:, None] < M))
+
+
+def relu_bat_c_fused_triton(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+    if not (A.is_cuda and B.is_cuda and C.is_cuda):
+        raise ValueError("A and B and C must be CUDA tensors.")
+    if A.ndim != 2 or B.ndim != 2 or C.ndim != 2:
+        raise ValueError("A and B and C must be 2D.")
+    if A.shape[1] != B.shape[1]:
+        raise ValueError("Feature dims must match.")
+    if A.shape[0] != C.shape[0]:
+        raise ValueError("A and C must have same dims")
+    if A.shape[1] != C.shape[1]:
+        raise ValueError("A and C must have same dims")
+
+    A = A.contiguous()
+    B = B.contiguous()
+    C = C.contiguous()
+
+    N, D = A.shape
+    M, _ = B.shape
+    Y = torch.empty((M, D), device=A.device, dtype=torch.float32)
+    
+    grid = lambda META: (triton.cdiv(M, META["BM"]),)
+    relu_bat_c_fused_kernel[grid](
+        A, B, C, Y,
+        N=N, M=M, D=D,
+        stride_an=A.stride(0), stride_ad=A.stride(1),
+        stride_bm=B.stride(0), stride_bd=B.stride(1),
+        stride_ym=Y.stride(0), stride_yd=Y.stride(1),
+        ROUND_TF32=True, DOT_PREC="tf32"
+    )
+    return Y
+
+
+def relu_bat_c_constraints(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    BM: int,
+    BK: int,
+    num_ms: int,
+) -> bool:
+    if A.shape[1] >= 32 and num_ms > 2:
+        return False
+
+    if A.shape[1] >= 64 and num_ms > 1:  
+        return False  
+    
+    # NOTE: changed to call current_device() instead of passing the fn handle
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+
+    if props.shared_memory_per_block < 8 * BK * A.shape[1]:
+        return False
+
+    return True
+
+
+@torch.compile(mode='max-autotune-no-cudagraphs')
+def relu_bat_c_fallback(A: torch.Tensor,
+                        B: torch.Tensor,
+                        C: torch.Tensor):
+    return torch.relu(B @ A.T) @ C
+
+
+def relu_bat_c_cuda_launcher():
+    tune_config = {
+        "BM": [32, 64, 128],
+        "BK": [16, 32, 64],
+        "num_ms": [1, 2, 4, 6],
+    }
+
+    @autotune_cuda_kernel(
+        configs=tune_config,
+        fallback_fn=relu_bat_c_fallback,
+        constraint_fn=relu_bat_c_constraints,
+        key_fn=relu_bat_c_key,
+        cache_path="relu_bat_c_jit_autotune.json",
+        n_trials=1000,
+        warmup=1,
+        rep=5,
+        sampler=optuna.samplers.GridSampler(search_space=tune_config),
+    )
+    def relu_batc(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        BM: int,
+        BK: int,
+        num_ms: int,
+    ) -> torch.Tensor:
+        return relu_bat_c_fused(A, B, C, BK=BK, MS=num_ms, BM=BM)
+
+    return relu_batc
+
+
+relu_bat_c_tuned = relu_bat_c_cuda_launcher()
+
+def lsq_update_single_gpu(
+    Ar_dev: Tensor,
+    B_blk_dev: Tensor,
+    pinvAt_dev: Tensor,
+    dB_blk_dev: Tensor,
+    blk_idx: Tensor,   
+    blk_vals: Tensor,  
+    momentum: Tensor,
+    unbias: torch.Tensor,
+    lrate: Tensor | float,
+) -> tuple[Tensor, Tensor]:
+
+    # TODO: note linter is complaining about the partial function application
+    # Confirm this is all ok in practice
+    stepM_blk = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev) # type: ignore
+    edge_i = blk_idx[0]
+    edge_j = blk_idx[1]
+
+    Lij_blk = torch.sum(Ar_dev[edge_i, :] * B_blk_dev[edge_j, :], dim=1)
+    Mij_blk = torch.relu(Lij_blk)
+    Ct_vals = blk_vals - Lij_blk + Mij_blk
+
+    
+    stepC_blk = torch.zeros_like(B_blk_dev)
+    
+    stepC_blk.index_add_(
+        0,
+        edge_j,
+        Ct_vals[:, None] * pinvAt_dev[edge_i, :],
+    )
+
+    lsqB_blk = B_blk_dev - stepM_blk + stepC_blk
+    dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
+    B_blk_new = B_blk_dev + lrate * dB_blk_new / unbias
+    return B_blk_new, dB_blk_new
+
+
+@torch.compile(mode='default',dynamic=True)
+def batch_update_single_gpu(
+    Sr_idx_raw: Tensor,
+    Sr_vals: Tensor,
+    Factor_fixed: Tensor,
+    row_indices: Tensor,
+    B: Tensor,
+    dB: Tensor,
+    momentum: Tensor,
+    unbias: Tensor,
+    lrate: float | Tensor,
+    m_fixed: int,
+):
+    
+    dev = B.device
+
+    m_batch = row_indices.shape[0]
+
+    Ar_dev = Factor_fixed[row_indices, :]
+    GramA = Ar_dev.T @ Ar_dev
+    pinvAt_dev = torch.linalg.solve(GramA, Ar_dev.T).T
+
+    blk_idx = Sr_idx_raw
+    blk_vals = Sr_vals
+
+    row_idx_dev = row_indices
+    local_map = torch.zeros(m_fixed, dtype=torch.long, device=dev)
+
+    local_map[row_idx_dev] = torch.arange(m_batch, device=dev)
+    blk_idx[0] = local_map[blk_idx[0]]
+    
+
+
+    B_new, dB_new = lsq_update_single_gpu(
+        Ar_dev=Ar_dev,
+        B_blk_dev=B,
+        pinvAt_dev=pinvAt_dev,
+        dB_blk_dev=dB,
+        blk_idx=blk_idx,
+        blk_vals=blk_vals,
+        momentum=momentum,
+        unbias=unbias,
+        lrate=lrate,
+    )
+
+    return B_new, dB_new
 
 
 def update_factor_salsa(
@@ -16,196 +254,30 @@ def update_factor_salsa(
     Factor_fixed: Tensor,
     Factor_update: Tensor,
     dFactor: Tensor,
-    opts: dict,
-    stepnum: int,
-    multi_gpu: bool = True,
-    streams: list[Stream] | None = None,
-    map_buffers: list[Tensor] | None = None
+    momentum: Tensor,
+    unbias: Tensor,
+    lrate: float | Tensor,
 ):
-    """
-    Directly aligns with Matlab: [B,dB] = batch_update(Sr,A(rowsA,:),B,dB,opts,stepnum);
-    """
-    # 1) Unpack indices
     m_fixed = Factor_fixed.shape[0]
-    n_update = Factor_update.shape[0]
     _, edge_idx, row_indices = dataset[block_id]
-    
-    # 2) Slicing S (mimics sparse_slice in Matlab)
-    idx_raw = S_idx_full[:, edge_idx].clone()
+    idx_raw = S_idx_full[:, edge_idx]
     val_raw = S_val_full[edge_idx]
-    
-    nextF, dF = batch_update_multi_gpu(
-        idx_raw,
-        val_raw,
-        Factor_fixed,
-        row_indices,
-        Factor_update,
-        dFactor,
-        opts,
-        stepnum,
-        m_fixed,
-        streams=streams,
-        map_buffers=map_buffers
+
+    # TODO: NOTE: Unused
+    params = relu_bat_c_tuned.resolve_params(Factor_fixed[row_indices, :], Factor_update, Factor_fixed[row_indices, :])
+    #need to resolve params outside of the compiled region
+
+    nextF, dF = batch_update_single_gpu(
+        Sr_idx_raw=idx_raw,
+        Sr_vals=val_raw,
+        Factor_fixed=Factor_fixed,
+        row_indices=row_indices,
+        B=Factor_update,
+        dB=dFactor,
+        momentum=momentum,
+        unbias=unbias,
+        lrate=lrate,
+        m_fixed=m_fixed,
     )
     
     return nextF, dF
-
-
-def batch_update_multi_gpu(
-    Sr_idx_raw: Tensor,
-    Sr_vals: Tensor,
-    Factor_fixed: Tensor,
-    row_indices_cpu: Tensor,
-    B: Tensor,
-    dB: Tensor,
-    opts: dict,
-    stepnum: int,
-    m_fixed: int,
-    streams: list[Stream] | None = None,
-    map_buffers: list[Tensor] | None = None
-):
-    """
-    Asynchronous Multi-GPU version of batch_update_torch.
-    Now performs re-mapping in parallel on each GPU.
-    CPU-only fallback: runs the same logic on CPU with a single "device".
-    Update logic (Reference code): lsq_update_torch()
-    """
-    m_batch = row_indices_cpu.shape[0]
-    n = B.shape[0]
-    device_cpu = torch.device("cpu")
-    dtype = Factor_fixed.dtype
-
-    use_cuda = torch.cuda.is_available() and (torch.cuda.device_count() > 0)
-    num_gpus = torch.cuda.device_count() if use_cuda else 1
-    devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)] if use_cuda else [device_cpu]
-
-    # Use provided persistent streams or create temporary ones (fallback)
-    if use_cuda:
-        active_streams = streams if streams is not None else [torch.cuda.Stream(device=d) for d in devices]
-    else:
-        active_streams = [None]  # placeholder
-
-    # Pre-calculate pseudoinverse. We slice Factor_fixed first.
-    Ar_cpu = Factor_fixed[row_indices_cpu, :]
-    GramA = Ar_cpu.T @ Ar_cpu
-    pinvAt_cpu: Tensor = torch.linalg.solve(GramA, Ar_cpu.T).T  # (m_batch, d)
-
-    momentum: float = opts.get('exaggerate', 0.7)
-    unbias = 1 - (momentum ** stepnum)
-
-    # TODO: Check if this broke anything
-    next_B_blks: list[Tensor] = [torch.empty(0)] * num_gpus
-    next_dB_blks: list[Tensor] = [torch.empty(0)] * num_gpus
-    block_ranges = []
-
-    for dev_idx in range(num_gpus):
-        dev = devices[dev_idx]
-        start, end = block_span(dev_idx, n, num_gpus)
-        block_ranges.append((start, end))
-
-        ctx = torch.cuda.stream(active_streams[dev_idx]) if use_cuda else nullcontext()
-        with ctx:
-            # 1. Transfers (async on GPU, normal copies on CPU)
-            Ar_dev = Ar_cpu.to(dev, non_blocking=use_cuda)
-            row_idx_dev = row_indices_cpu.to(dev, non_blocking=use_cuda)
-            pinvAt_dev: Tensor = pinvAt_cpu.to(dev, non_blocking=use_cuda)
-            B_blk_dev = B[start:end, :].to(dev, non_blocking=use_cuda)
-            dB_blk_dev = dB[start:end, :].to(dev, non_blocking=use_cuda)
-
-            # 2. Parallel Masking and Re-mapping
-            mask = (Sr_idx_raw[1] >= start) & (Sr_idx_raw[1] < end)
-
-            if mask.any():
-                blk_idx = Sr_idx_raw[:, mask].to(dev, non_blocking=use_cuda)
-                blk_vals = Sr_vals[mask].to(dev, non_blocking=use_cuda)
-
-                # RE-MAP locally on this device using persistent buffer if available
-                local_map = (map_buffers[dev_idx] if map_buffers is not None else
-                             torch.zeros(m_fixed, dtype=torch.long, device=dev))
-                local_map.zero_()
-                local_map[row_idx_dev] = torch.arange(m_batch, device=dev)
-                blk_idx[0] = local_map[blk_idx[0]]
-                blk_idx[1] -= start
-
-                # 3. LSQ Update
-                Mt_blk = torch.clamp(B_blk_dev @ Ar_dev.T, min=0.0)
-                stepM_blk = -Mt_blk @ pinvAt_dev
-
-                Lij_blk = torch.sum(Ar_dev[blk_idx[0], :] * B_blk_dev[blk_idx[1], :], dim=1)
-                Mij_blk = torch.clamp(Lij_blk, min=0.0)
-
-                Ct_vals = blk_vals - Lij_blk + Mij_blk
-                Ct = torch.sparse_coo_tensor(
-                    torch.stack([blk_idx[1], blk_idx[0]]),
-                    Ct_vals,
-                    (end - start, m_batch),
-                    device=dev,
-                    dtype=dtype
-                ).coalesce()
-
-                stepC_blk: Tensor | float = torch.sparse.mm(Ct, pinvAt_dev)
-            else:
-                Mt_blk = torch.clamp(B_blk_dev @ Ar_dev.T, min=0.0)
-                stepM_blk = -Mt_blk @ pinvAt_dev
-                stepC_blk = 0.0
-
-            lsqB_blk = B_blk_dev + stepM_blk + stepC_blk
-
-            # 4. Momentum and Back
-            dB_blk_new = (lsqB_blk - B_blk_dev) * (1 - momentum) + dB_blk_dev * momentum
-            B_blk_new: Tensor = B_blk_dev + dB_blk_new / unbias
-
-            next_B_blks[dev_idx] = B_blk_new.to(device_cpu, non_blocking=use_cuda)
-            next_dB_blks[dev_idx] = dB_blk_new.to(device_cpu, non_blocking=use_cuda)
-    
-
-    # Synchronize only if using CUDA
-    if use_cuda:
-        for s in active_streams:
-            if s is None: continue
-            s.synchronize()
-
-    nextB = torch.empty_like(B)
-    next_dB = torch.empty_like(dB)
-    for i, (start, end) in enumerate(block_ranges):
-        nextB[start:end] = next_B_blks[i]
-        next_dB[start:end] = next_dB_blks[i]
-
-    return nextB, next_dB
-
-
-def lsq_update_torch(S, A, B):
-    """
-    Computes the least squares update for B given the (sliced) sparse matrix S and (sliced) factor A.
-    """
-    device = A.device
-    dtype = A.dtype
-    m_batch, n = S.shape
-
-    # CONTRIBUTION FROM ELEMENTS WITH S=0
-    GramA = A.T @ A
-    pseudoInverseAt = torch.linalg.solve(GramA, A.T).T # (m_batch, d)
-    Mt = torch.clamp(B @ A.T, min=0.0)
-    stepM = -Mt @ pseudoInverseAt
-
-    # CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
-    indices = S.indices()
-    i = indices[0] # row indices in [0, m_batch)
-    j = indices[1] # column indices in [0, n)
-    Sij = S.values()
-
-    Lij = torch.sum(A[i, :] * B[j, :], dim=1)
-    Mij = torch.clamp(Lij, min=0.0)
-    
-    Ct_vals = Sij - Lij + Mij
-    Ct = torch.sparse_coo_tensor(
-        torch.stack([j, i]),
-        Ct_vals,
-        (n, m_batch),
-        device=device,
-        dtype=dtype
-    ).coalesce()
-    
-    stepC = torch.sparse.mm(Ct, pseudoInverseAt)
-    
-    return B + stepM + stepC

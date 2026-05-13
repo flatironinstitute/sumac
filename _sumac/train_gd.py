@@ -38,7 +38,16 @@ class TrainConfig:
 
 
 #ablate the choice of optimizer
-def make_optimizer(name, params, lr, weight_decay=0.0, SGD_momentum=0.0, adam_betas=(0.9, 0.999), adam_eps=1e-8, muon_momentum=0.95):
+def make_optimizer(
+    name: str, # TODO enum
+    params: list[torch.nn.Parameter],
+    lr: float,
+    weight_decay: float = 0.0,
+    SGD_momentum: float = 0.0,
+    adam_betas: tuple[float, float] = (0.9, 0.999),
+    adam_eps: float = 1e-8,
+    muon_momentum: float = 0.95
+):
     name = name.lower()
     if name == "adam": 
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
@@ -62,7 +71,14 @@ def select_devices(cfg, device: torch.device):
             return [torch.device(f"cuda:0")]
     return [device]
 
-def setup_replicas(A, B, S_index, S_value, devices):
+
+def setup_replicas(
+    A: torch.nn.Parameter,
+    B: torch.nn.Parameter,
+    S_index: torch.Tensor,
+    S_value: torch.Tensor,
+    devices: list[torch.device]
+):
     """
     Create per-device parameter replicas and per-device copies of S_index/S_value.
     Master params are the original A,B (tied to optimizer).

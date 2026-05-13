@@ -1,15 +1,9 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader, Subset
 import math
 import time
-from data import dense_to_sparse, prune_zero_rows_cols
-from dataclasses import dataclass
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.utils import clip_grad_norm_
 
 from _sumac.dataset import block_span, RowBlockDataset
 from _sumac.model import FactorModel
