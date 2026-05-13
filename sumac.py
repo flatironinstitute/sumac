@@ -411,7 +411,6 @@ def GD_loop_multi_gpu(
     executor = ThreadPoolExecutor(max_workers=len(devices))
 
     for epoch in range(1, cfg.epochs + 1):
-        ## Commented out pending decision about multi-GPU support
         torch.cuda.nvtx.range_push(f"epoch: {epoch}")
         # reshuffle within each local shard 
         ds.reshuffle()
@@ -420,11 +419,10 @@ def GD_loop_multi_gpu(
             if streams[di] is not None:
                 streams[di].wait_stream(torch.cuda.default_stream(dev))
 
-        # # # Use per-device tensors for metric accumulation to avoid cross-device sync issues
+        # Use per-device tensors for metric accumulation to avoid cross-device sync issues
         total_loss_devs = [Tensor(0.0, device=d) for d in devices]
         sumSr_devs = [Tensor(0.0, device=d) for d in devices]
         num_jacc_devs = [Tensor(0.0, device=d) for d in devices]
-## TODO PICK UP HERE
         torch.cuda.nvtx.range_push("epoch: " + str(epoch))
         total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
         t_start = time.time()
@@ -511,7 +509,7 @@ def GD_loop_multi_gpu(
         print(log)
         history.append(log)
         torch.cuda.nvtx.range_pop()
-    # # executor.shutdown() # TODO: ??
+    executor.shutdown()
     total = time.time() - t0
     print(f"\nTotal elapsed time: {total:.2f} sec")
 
