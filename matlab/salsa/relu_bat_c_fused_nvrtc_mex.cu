@@ -225,7 +225,10 @@ static ModuleEntry get_or_build_module(int BK, int MS, int V, int NUM_THREADS)
 
     std::string gpu_arch = "--gpu-architecture=compute_" +
                            std::to_string(major) + std::to_string(minor);
-    // std::string gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    // mexPrintf("%d", major);
+    if (major >= 12) {
+        gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    }
     const char* opts[] = {
         "--std=c++17",
         "--use_fast_math",
@@ -325,6 +328,10 @@ static ModuleEntry get_or_build_module_mixed(int BK, int MS, int V, int R, int N
     std::string gpu_arch = "--gpu-architecture=compute_" +
                            std::to_string(major) + std::to_string(minor);
     // std::string gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... forcing older arch here if needed
+    // std::cout << "gpu_arch = " << major << "." << minor << std::endl;
+    if (major >= 12) {
+        gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    }
     std::string cuda_inc = cuda_include_option();
     const char* opts[] = {
         "--std=c++17",

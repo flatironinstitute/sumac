@@ -19,7 +19,7 @@
 #include <vector>
 
 const std::string kernelPath = "../../relu_bat_reduce_jit/kernel_nnz.cu";
-const std::string kernelPath_mixed = "../../relu_batc_jit/kernel_nnz_mixed.cu";
+const std::string kernelPath_mixed = "../../relu_bat_reduce_jit/kernel_nnz_mixed.cu";
 
 static void fail(const char* id, const std::string& msg) {
     mexErrMsgIdAndTxt(id, "%s", msg.c_str());
@@ -298,7 +298,9 @@ static ModuleEntry get_or_build_module(int BK, int MS, int V)
 
     std::string gpu_arch = "--gpu-architecture=compute_" +
                            std::to_string(major) + std::to_string(minor);
-    // std::string gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    if (major >= 12) {
+        gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    }
     const char* opts[] = {
         "--std=c++17",
         "--use_fast_math",
@@ -398,6 +400,9 @@ static ModuleEntry get_or_build_module_mixed(int BK, int MS, int V, int R)
     std::string gpu_arch = "--gpu-architecture=compute_" +
                            std::to_string(major) + std::to_string(minor);
     // std::string gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... forcing older arch here if needed
+    if (major >= 12) {
+        gpu_arch = "--gpu-architecture=compute_90"; //Matlabs packaged cuda is too old to know sm120 ... force older arch here if running on new gpu
+    }
     std::string cuda_inc = cuda_include_option();
     const char* opts[] = {
         "--std=c++17",
@@ -433,7 +438,7 @@ static ModuleEntry get_or_build_module_mixed(int BK, int MS, int V, int R)
 
     CUfunction func = nullptr;
     checkCudaDrv(
-        cuModuleGetFunction(&func, module, "relu_bat_reduce_fused_kernel_mixed_sync"),
+        cuModuleGetFunction(&func, module, "relu_bat_reduce_kernel_mixed_sync"),
         "cuModuleGetFunction");
 
     ModuleEntry entry;
