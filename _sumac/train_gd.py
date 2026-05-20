@@ -27,6 +27,7 @@ class TrainConfig:
     pin_memory: bool = False
     seed: int = 0
     eval_errZ_interval: int = 5 #eval errZ every 5 epochs
+    eval_interval: int = 100 #run clean eval() every N epochs in GD_loop
     optim: str = "adam"
     SGD_mom: float = 0.7
     adam_beta1: float = 0.9

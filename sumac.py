@@ -62,21 +62,22 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         raise ValueError("sumac: the input matrix should be nonnegative.")
 
     # default options / user-provided opts
+    default_eval_interval = 100 if method == 'GD' else 10
     opts_default = {
         'max_iterate': max_iterate,
         'dtype': dtype,
         'method': method,
         'seed': random.randint(0, 2**31 - 1),
         'display': 1,
-        'cache_MB': 5000,  
+        'cache_MB': 5000,
         'time_limit': float('inf'), #ALS early stopping
         'tol_abs': 1e-2, #ALS early stopping
         'tol_rel': 1e-4, #ALS early stopping
         'tol_window': 20, #ALS early stopping
         'exaggerate': mom, #momentum for SALSA or ALS
-        'momentum_start_iter': 10, #ALS 
+        'momentum_start_iter': 10, #ALS
         'refactor_interval': 25, #ALS
-        'eval_interval': 10, #evaluation per interval for SALSA or ALS
+        'eval_interval': default_eval_interval, #eval cadence: 100 for GD, 10 for SALSA/ALS
         'factor_init': factor_init, #ALS; if True: A,B specific initialization
         'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
     }
@@ -124,7 +125,8 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         cfg = TrainConfig(d, num_blocks=num_blocks, epochs=max_iterate, lr=lr,
                           optim=optim, SGD_mom=mom, precondition=precondition,
                           adam_beta1=adam_beta1, adam_beta2=adam_beta2, adam_eps=adam_eps,
-                          muon_momentum=muon_momentum)
+                          muon_momentum=muon_momentum,
+                          eval_interval=opts['eval_interval'])
         ## NEW: for multi-gpus, scale batch blocks and lr automatically
         if torch.cuda.device_count() > 1:
             cfg.batch_blocks = torch.cuda.device_count() #max(torch.cuda.device_count() * 4, 8) #
@@ -217,8 +219,15 @@ def GD_loop(
     torch.cuda.nvtx.range_pop()
 
 
+    # Hoisted eval setup (reused for both periodic and end-of-training eval)
+    ds_rows_eval = StochasticRowBlockDataset(S_index_cpu, S_value_cpu, m, cfg.num_blocks)
+    eval_loader = DataLoader(ds_rows_eval, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+    S_index_master = S_index_cpu.to(master, non_blocking=True)
+    S_value_master = S_value_cpu.to(master, non_blocking=True)
+
     history = []
     t0 = time.time()
+    eval_time_total = 0.0  # exclude eval overhead from abs_time
 
     all_block_ids = list(range(cfg.num_blocks))
     batch_blocks = int(cfg.batch_blocks)
@@ -319,22 +328,35 @@ def GD_loop(
         jacc = 1.0 - num_jacc / denom_jacc
         S_norm = float(torch.norm(S_value_cpu).item())
         rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
-        log = f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
+        abs_time = time.time() - t0 - eval_time_total
+        log = (f"[epoch {epoch}/{cfg.epochs}]: rmse={rmse:.6f}, jacc={jacc:.6f}, "
+               f"factor_step={time_step:6.4f}, abs_time={abs_time:.2f}s")
         print(log)
         history.append(log)
 
+        # Periodic clean eval
+        if epoch % cfg.eval_interval == 0:
+            t_eval = time.time()
+            rmse_eval, jacc_eval, errZ_eval = eval(
+                A, B, S_index_master, S_value_master,
+                m, n, num_blocks=cfg.num_blocks,
+                full_block_loader=eval_loader, device=A.device, errZ_obj=True
+            )
+            eval_time_total += time.time() - t_eval
+            abs_time = time.time() - t0 - eval_time_total
+            eval_log = (f"EVAL [epoch {epoch}]: rmse={rmse_eval:.6f}, "
+                        f"jacc={jacc_eval:.6f}, errZ={errZ_eval:.6f}, "
+                        f"abs_time={abs_time:.2f}s")
+            print(eval_log)
+            history.append(eval_log)
+
         torch.cuda.nvtx.range_pop()
-    
+
     executor.shutdown()
     total = time.time() - t0
     print(f"\nTotal elapsed time: {total:.2f} sec")
 
-    # Eval: TODO (faster eval)
-    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks)
-    eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
-    S_index_master = S_index_cpu.to(master, non_blocking=True)
-    S_value_master = S_value_cpu.to(master, non_blocking=True)
-
+    # Final eval (reuses hoisted eval_loader / S_*_master)
     rmse, jacc, errZ = eval(
         A, B, S_index_master, S_value_master,
         m, n, num_blocks=cfg.num_blocks,
@@ -410,7 +432,7 @@ def sumac_loop(S_index: torch.LongTensor,
 
         # display progress
         if opts['display']:
-            print(f"iter = {it:04d}, rmse = {rmse:.6f},  jacc = {jacc:.6f},  factor_step = {time_step:6.4f}")
+            print(f"iter = {it:04d}, rmse = {rmse:.6f},  jacc = {jacc:.6f},  factor_step = {time_step:6.4f}, abs_time = {elapsed:.2f}s")
         
         # post-processing and early stopping
         A, B, dA, dB = als_post_process_factors(rmse, it, rmse_hist, A, B, dA, dB)
