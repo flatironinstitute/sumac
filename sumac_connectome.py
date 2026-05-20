@@ -25,6 +25,8 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['ALS','SALSA','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--optim', type=str, default='adam', choices=['adam','sgd', 'adamw', 'muon'], help='diffenrent optimizer for GD')
+    parser.add_argument('--eval_interval', type=int, default=None,
+                        help='clean-eval cadence (default: 100 for GD, 10 for SALSA/ALS)')
     parser.add_argument('--eval_only', action='store_true', help='eval only')
     parser.add_argument('--eval_path', type=str, default='connectome_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'connectome.txt'
     parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'connectome.txt'
@@ -120,6 +122,7 @@ if __name__ == '__main__':
                 " MASTER_ADDR=", os.environ.get("MASTER_ADDR"),
                 " MASTER_PORT=", os.environ.get("MASTER_PORT"))
 
+        opts = {'eval_interval': args.eval_interval} if args.eval_interval is not None else None
         sumac(
             S_index,
             S_value,
@@ -135,7 +138,8 @@ if __name__ == '__main__':
             save_path=save_path,
             GD_latent=GD_latent,
             optim=args.optim,
-            precondition=precond
+            precondition=precond,
+            opts=opts
         )
 
         sys.stdout = old_stdout
