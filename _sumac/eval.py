@@ -298,7 +298,7 @@ def eval(
     n: int,
     num_blocks: int,
     full_block_loader,   # yields (block_id, edge_idx) once per block_id # TODO
-    device: torch.Device | None = None,
+    device: torch.device | None = None,
     errZ_obj: bool = False,  # whether use objective to min ||Z - L|| instead of ||S - Sr||
 ):
     if device is None:

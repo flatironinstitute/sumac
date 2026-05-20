@@ -126,8 +126,8 @@ def sumac(
 
     ## NEW: remove all-zero rows and/or columns
     S_index, row_mask, col_mask = prune_zero_rows_cols(S_index, shape=(m,n))
-    m_eff = row_mask.sum().item if row_mask is not None else m
-    n_eff = col_mask.sum().item if col_mask is not None else n
+    m_eff = row_mask.sum().item() if row_mask is not None else m
+    n_eff = col_mask.sum().item() if col_mask is not None else n
 
     # TODO: make this less messy
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device

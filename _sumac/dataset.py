@@ -70,33 +70,12 @@ class StochasticRowBlockDataset(Dataset):
             num_blocks: int,
             gen: torch.Generator
         ):
-
-        ## TODO: consider deleting the force-cpu of S_index, S_value.
-        self.S_index = S_index.detach().cpu() #NEW: force CPU
-        self.S_value = S_value.detach().cpu() #NEW: force CPU
+        #keep tensors on device for faster shuffles
+        self.S_index = S_index#.detach.cpu()
+        self.S_value = S_value#.detach.cpu()
         self.m = m
         self.num_blocks = num_blocks
-        self.gen = gen
-
-        ## TODO: Note this check and the row-edge map (balance of this fn)
-        # is not present in DBollweg branch        
-        if torch.is_floating_point(self.S_index):
-            raise ValueError("Index tensor is expected to be integer-valued.")
-
-
-        # 1. Build row-to-edge index map once (CPU)
-        # This allows us to quickly find all non-zeros for a given set of rows
-        rows = self.S_index[0].detach().cpu()
-
-        _row_to_edges = [[] for _ in range(m)]
-        for edge_idx, row_idx in enumerate(rows):
-            # TODO: check if this is assured
-            # (call to .item() will throw if row_idx.numel() > 1)
-            row_idx_scalar: int = int(row_idx.item())
-            _row_to_edges[row_idx_scalar].append(edge_idx)
-        
-        # Convert to tensors for faster concatenation
-        self.row_to_edges = [torch.tensor(e, dtype=torch.long) for e in _row_to_edges]
+        self.gen = gen       
         
         # Initial partition
         self.reshuffle()
