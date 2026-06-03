@@ -6,28 +6,30 @@ function [A,B,stats] = salsa_loop(S,A,B,opts)
 tLoop = tic;
 
 % INITIALIZE
-useGPU = canUseGPU();
+if (~canUseGPU())
+  error('salsa_loop:GPURequired',...
+    'salsa_loop requires a GPU.');
+end
 T = transpose(S);
-Scoo = sparse_coo_metadata(S,useGPU);
-Tcoo = sparse_coo_metadata(T,useGPU);
+Scoo = sparse_coo_metadata(S);
+Tcoo = sparse_coo_metadata(T);
 clear T;
 dA = zeros(size(A),"single");
 dB = zeros(size(B),"single");
 minCost = Inf;
 cost = Inf;
 
-% GPU?
-if (useGPU)
-  S = gpuArray(S);
-  A = gpuArray(A);
-  B = gpuArray(B);
-  dA = gpuArray(dA);
-  dB = gpuArray(dB);
-end
+S = gpuArray(S);
+A = gpuArray(A);
+B = gpuArray(B);
+dA = gpuArray(dA);
+dB = gpuArray(dB);
 
 % MINIBATCH INDICES
 batchIdxA = batch_split(size(A,1),opts.nbatch);
 batchIdxB = batch_split(size(B,1),opts.nbatch);
+batchMetaA = batch_position_metadata(size(A,1),batchIdxA);
+batchMetaB = batch_position_metadata(size(B,1),batchIdxB);
 
 % LOOP
 for iter=1:opts.max_iterate
@@ -35,16 +37,16 @@ for iter=1:opts.max_iterate
   % PERMUTE
   permuteA = randperm(size(A,1));
   permuteB = randperm(size(B,1));
-  Spart = partition_coo_blocks(Scoo,permuteA,batchIdxA,useGPU);
-  Tpart = partition_coo_blocks(Tcoo,permuteB,batchIdxB,useGPU);
+  Spart = partition_coo_blocks(Scoo,permuteA,batchMetaA);
+  Tpart = partition_coo_blocks(Tcoo,permuteB,batchMetaB);
 
   % MINIBATCH UPDATES
   for mb=1:opts.nbatch
     stepnum = mb + (iter-1)*opts.nbatch;
     rowsA = permuteA(batchIdxA{mb});
     rowsB = permuteB(batchIdxB{mb});
-    SrMeta = block_metadata(Spart,mb);
-    TrMeta = block_metadata(Tpart,mb);
+    SrMeta = Spart{mb};
+    TrMeta = Tpart{mb};
     [B,dB] = batch_update(SrMeta,A(rowsA,:),B,dB,opts,stepnum);
     [A,dA] = batch_update(TrMeta,B(rowsB,:),A,dA,opts,stepnum);
   end
@@ -93,18 +95,42 @@ end
 end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PRECOMPUTE POSITION-TO-BLOCK MAPS FOR A FIXED BATCH SPLIT
+
+function meta = batch_position_metadata(nrows,batchIdx)
+
+nbatch = length(batchIdx);
+blockRows = zeros(nbatch,1);
+blockOfPos = zeros(nrows,1);
+localOfPos = zeros(nrows,1);
+
+for b=1:nbatch
+  idx = batchIdx{b};
+  nblockRows = length(idx);
+  blockRows(b) = nblockRows;
+  blockOfPos(idx) = b;
+  localOfPos(idx) = 1:nblockRows;
+end
+
+blockOfPos = gpuArray(blockOfPos);
+localOfPos = gpuArray(localOfPos);
+
+meta = struct('blockOfPos',blockOfPos,'localOfPos',localOfPos,...
+  'blockRows',blockRows,'nbatch',nbatch);
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % CACHE FULL SPARSE MATRIX TRIPLETS
 
-function Scoo = sparse_coo_metadata(S,useGPU)
+function Scoo = sparse_coo_metadata(S)
 
 [m,n] = size(S);
 [i,j,v] = find(S);
 
-if (useGPU)
-  i = gpuArray(i);
-  j = gpuArray(j);
-  v = gpuArray(v);
-end
+i = gpuArray(i);
+j = gpuArray(j);
+v = gpuArray(v);
 
 Scoo = struct('i',i,'j',j,'v',v,'m',m,'n',n);
 
@@ -112,85 +138,75 @@ end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % PARTITION ALL NONZEROS INTO CURRENT RANDOM ROW BLOCKS
+%
+% Builds CSR metadata for the fused GPU kernel.  Within
+% each minibatch, nonzeros are grouped by the row of the factor being
+% updated (j) and sorted by local fixed-factor row (i).
 
-function part = partition_coo_blocks(Scoo,permuteRows,batchIdx,useGPU)
+function part = partition_coo_blocks(Scoo,permuteRows,batchMeta)
 
-nbatch = length(batchIdx);
-blockOfRow = zeros(Scoo.m,1);
-localOfRow = zeros(Scoo.m,1);
-blockRows = zeros(nbatch,1);
-
-for b=1:nbatch
-  rows = permuteRows(batchIdx{b});
-  nrows = length(rows);
-  blockOfRow(rows) = b;
-  localOfRow(rows) = 1:nrows;
-  blockRows(b) = nrows;
-end
-
-if (useGPU)
-  blockOfRow = gpuArray(blockOfRow);
-  localOfRow = gpuArray(localOfRow);
-end
+nbatch = batchMeta.nbatch;
+permuteRows = gpuArray(permuteRows(:));
+blockRows = batchMeta.blockRows;
+blockOfRow = zeros(Scoo.m,1,'gpuArray');
+localOfRow = zeros(Scoo.m,1,'gpuArray');
+blockOfRow(permuteRows) = batchMeta.blockOfPos;
+localOfRow(permuteRows) = batchMeta.localOfPos;
 
 edgeBlock = blockOfRow(Scoo.i);
 edgeLocal = localOfRow(Scoo.i);
-[edgeBlockSorted,order] = sort(edgeBlock);
 
-part.i = edgeLocal(order);
-part.j = Scoo.j(order);
-part.Sij = Scoo.v(order);
-part.m = blockRows;
-part.n = Scoo.n;
-part.offset = block_offsets(edgeBlockSorted,nbatch,useGPU);
+rowBase = double(Scoo.m) + 1;
+colBase = rowBase * double(Scoo.n);
+sortKey = double(edgeLocal) + rowBase * (double(Scoo.j)-1) + colBase * (double(edgeBlock)-1);
+[~,order] = sort(sortKey);
+
+edgeBlockSorted = edgeBlock(order);
+edgeLocalSorted = edgeLocal(order);
+edgeJSorted = Scoo.j(order);
+edgeValSorted = Scoo.v(order);
+
+[rowPtr,edgeI,edgeVal,rowPtrBase,edgeBase] = sparse_kernel_metadata_gpu(edgeBlockSorted, edgeJSorted, edgeLocalSorted, edgeValSorted,nbatch,Scoo.n);
+
+part = cell(nbatch,1);
+for mb=1:nbatch
+  part{mb} = struct('m',blockRows(mb),'n',Scoo.n,'rowPtr',rowPtr, 'edgeI',edgeI,'edgeVal',edgeVal,'rowPtrBase',rowPtrBase(mb), 'edgeBase',edgeBase(mb));
+end
 
 end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% COMPUTE BLOCK OFFSETS FROM SORTED BLOCK IDS
+% BUILD CSR METADATA FOR THE FUSED KERNEL ON THE GPU
 
-function offset = block_offsets(edgeBlockSorted,nbatch,useGPU)
+function [rowPtr,edgeI,edgeVal,rowPtrBase,edgeBase] = sparse_kernel_metadata_gpu(edgeBlock,edgeJ,edgeLocal,edgeVal,nbatch,n)
 
-counts = zeros(nbatch,1);
-nedge = length(edgeBlockSorted);
+nedge = length(edgeBlock);
+
+blockCounts = zeros(nbatch,1,'gpuArray');
+rowCounts = zeros(nbatch*n,1,'gpuArray');
 
 if (nedge > 0)
-  changeIdx = find(diff(edgeBlockSorted) ~= 0);
-  if (useGPU)
-    changeIdx = gather(changeIdx);
-  end
-  changeIdx = changeIdx(:);
+  blockChangeIdx = find(diff(edgeBlock) ~= 0);
+  blockStarts = [gpuArray(1); blockChangeIdx+1];
+  blockEnds = [blockChangeIdx; gpuArray(nedge)];
+  blocks = edgeBlock(blockStarts);
+  blockCounts(blocks) = blockEnds-blockStarts+1;
 
-  blockStarts = [1; changeIdx+1];
-  blockEnds = [changeIdx; nedge];
-  blocks = edgeBlockSorted(blockStarts);
-  if (useGPU)
-    blocks = gather(blocks);
-  end
-  blocks = blocks(:);
-
-  counts(blocks) = blockEnds-blockStarts+1;
+  linearRows = edgeJ + (edgeBlock-1)*n;
+  rowChangeIdx = find(diff(linearRows) ~= 0);
+  rowStarts = [gpuArray(1); rowChangeIdx+1];
+  rowEnds = [rowChangeIdx; gpuArray(nedge)];
+  rows = linearRows(rowStarts);
+  rowCounts(rows) = rowEnds-rowStarts+1;
 end
 
-offset = [1; cumsum(counts)+1];
-
-end
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% SELECT LOCAL TRIPLETS FOR ONE MINIBATCH
-
-function Smeta = block_metadata(part,mb)
-
-first = part.offset(mb);
-last = part.offset(mb+1)-1;
-if (first <= last)
-  idx = (first:last)';
-else
-  idx = zeros(0,1);
-end
-
-Smeta = struct('i',part.i(idx),'j',part.j(idx),'Sij',part.Sij(idx),...
-  'm',part.m(mb),'n',part.n);
+rowCounts = reshape(rowCounts,n,nbatch);
+rowPtrByBlock = [zeros(1,nbatch,'gpuArray'); cumsum(rowCounts,1)];
+rowPtr = int64(rowPtrByBlock(:));
+edgeI = int64(edgeLocal - 1);
+edgeVal = single(edgeVal);
+rowPtrBase = int64((0:(nbatch-1))' * (n+1));
+edgeBase = int64(gather([gpuArray(0); cumsum(blockCounts(1:end-1))]));
 
 end
 
@@ -210,28 +226,6 @@ B = B + opts.lrate*dB/unbias;
 end
 
 
-function w = edge_weight_arrayfun(i,j,Sij,A,B)
-
-d = size(A,2);
-w = arrayfun(@edge_weight,i,j,Sij);
-
-  function wij = edge_weight(ii,jj,sij)
-    lij = sij - sij;  % zero with same type as sij
-
-    for k = 1:d
-      lij = lij + A(ii,k) * B(jj,k);
-    end
-
-    % sij - lij + max(0,lij) == sij + max(0,-lij)
-    if (lij < 0)
-      wij = sij - lij;
-    else
-      wij = sij;
-    end
-  end
-
-end
-
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % LEAST SQUARES UPDATE
 %
@@ -247,41 +241,8 @@ Gcpu = gather(G);
 Ginv = inv(Gcpu); % solve small inv on CPU due to Matlab's GPU path slowness.
 pseudoInverseAt = A * gpuArray(Ginv);
 
-i = Smeta.i;
-j = Smeta.j;
-Sij = Smeta.Sij;
-m = Smeta.m;
-n = Smeta.n;
-
-if isgpuarray(A)
-
-  Yt = relu_bat_c_fused_nvrtc_mex(A.', B.', pseudoInverseAt.');
-  % baseline
-  % Lij = sum(A(i,:).*B(j,:), 2);
-  % Mij = max(0,Lij);
-  % Ct = sparse(j,i,Sij-Lij+Mij,n,m);
-  % stepC = Ct*pseudoInverseAt;
-
-  %arrayfun version
-  w = edge_weight_arrayfun(i,j,Sij,A,B);
-  Ct = sparse(j,i,w,n,m);
-  stepC = Ct*pseudoInverseAt;
-
-  % UPDATE
-  lsqB = B - Yt.' + stepC; % - Yt.' instead of +stepM - the kernel needs row major but matlab's layout is column major
-else 
-  Mt = max(0,B*A');       
-  stepM = -Mt*pseudoInverseAt;
-
-  % CONTRIBUTION AND CORRECTION FROM ELEMENTS WITH S>0
-  Lij = sum(A(i,:).*B(j,:), 2);
-  Mij = max(0,Lij);
-  Ct = sparse(j,i,Sij-Lij+Mij,n,m);
-  stepC = Ct*pseudoInverseAt;
-
-  % UPDATE
-  lsqB = B + stepM + stepC; 
-end
+Yt = relu_bat_c_sparse_fused_nvrtc_mex(A.', B.', pseudoInverseAt.', Smeta.rowPtr, Smeta.edgeI, Smeta.edgeVal, Smeta.rowPtrBase, Smeta.edgeBase);
+lsqB = B - Yt.';
 
 end
 
