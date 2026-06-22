@@ -72,61 +72,50 @@ def relu_bat_c_tf32_sync_tune_config(D: int) -> dict:
 
 
 def relu_bat_c_tf32_wgmma_tune_config(D: int) -> dict:
-    if D == 16:
+    if D <= 16:
         return {
-            "BM": [256, 320],
-            "BN": [64, 128],
-            "WGMMA_S_N": [64],
+            "BM": [192, 256, 320],
+            "BN": [64, 128, 256],
+            "WGMMA_S_N": [32, 64],
             "WGMMA_Y_N": [16],
             "num_stages": [2],
             "wgmma_mode": ["RS"],
         }
-    if D == 32:
+    if D <= 32:
         return {
             "BM": [192, 256, 320],
-            "BN": [64, 128],
-            "WGMMA_S_N": [64],
-            "WGMMA_Y_N": [32],
+            "BN": [64, 128, 256],
+            "WGMMA_S_N": [32, 64],
+            "WGMMA_Y_N": [16, 32],
             "num_stages": [2],
             "wgmma_mode": ["RS"],
         }
-    if D == 64:
+    if D <= 72:
         return {
             "BM": [128, 192, 256],
-            "BN": [64, 128],
-            "WGMMA_S_N": [64],
-            "WGMMA_Y_N": [64],
+            "BN": [64, 128, 256],
+            "WGMMA_S_N": [32, 64, 128],
+            "WGMMA_Y_N": [32, 64],
             "num_stages": [2],
             "wgmma_mode": ["RS"],
         }
-    if D == 128:
+    if D <= 144:
         return {
             "BM": [128, 192, 256],
             "BN": [32, 64, 128],
-            "WGMMA_S_N": [32, 64],
+            "WGMMA_S_N": [32, 64, 128],
             "WGMMA_Y_N": [64, 128],
             "num_stages": [2],
-            "wgmma_mode": ["SS"],
-        }
-    if D == 256:
-        return {
-            "BM": [64, 128, 192],
-            "BN": [16, 32, 64],
-            "WGMMA_S_N": [16, 32],
-            "WGMMA_Y_N": [64, 128],
-            "num_stages": [2],
-            "wgmma_mode": ["SS"],
+            "wgmma_mode": ["RS", "SS"],
         }
 
-    wgmma_n_values = [16, 32, 64, 128]
-    y_shapes = [n for n in wgmma_n_values if D % n == 0] or [16]
     return {
-        "BM": [64, 128, 192, 256, 320],
-        "BN": [16, 32, 64, 128, 256],
-        "WGMMA_S_N": wgmma_n_values,
-        "WGMMA_Y_N": y_shapes,
-        "num_stages": [1, 2],
-        "wgmma_mode": ["RS", "SS"],
+        "BM": [64, 128, 192, 256],
+        "BN": [16, 32, 64, 128],
+        "WGMMA_S_N": [16, 32, 64],
+        "WGMMA_Y_N": [64, 128],
+        "num_stages": [2],
+        "wgmma_mode": ["SS"],
     }
 
 
@@ -208,13 +197,13 @@ def relu_bat_c_tf32_wgmma_constraints(
 
     if props.major != 9:
         return False
+    if D < 1:
+        return False
     if WGMMA_S_N not in (16, 32, 64, 128):
         return False
     if WGMMA_Y_N not in (16, 32, 64, 128):
         return False
     if BN % WGMMA_S_N != 0:
-        return False
-    if D % WGMMA_Y_N != 0:
         return False
     if num_stages not in (1, 2, 3):
         return False
@@ -230,9 +219,11 @@ def relu_bat_c_tf32_wgmma_constraints(
     if threads_per_block > getattr(props, "max_threads_per_block", 1024):
         return False
 
-    smem_elems = num_stages * 2 * BN * D
+    D_k_pad = round_up(D, 8)
+    D_y_pad = round_up(D, WGMMA_Y_N)
+    smem_elems = num_stages * BN * (D_k_pad + D_y_pad)
     if wgmma_mode == "SS":
-        smem_elems += BM * D
+        smem_elems += BM * D_k_pad
     smem_bytes = smem_elems * 4 + 127
     return smem_bytes <= max_dynamic_smem_bytes(props)
 

@@ -11,8 +11,9 @@
 
 // Hopper/SM90+ warp-group async MMA variant of Y=ReLU(B A.T)C
 //
-// A and C are row-major contiguous [N, D_f] tensors, B is row-major
-// contiguous [M, D_f], and Y is row-major contiguous [M, D_f].
+// A, B, and C are row-major contiguous with runtime leading dimension D.
+// A/B K tiles use compile-time padded width D_K_F. C/Y output tiles use
+// compile-time padded width D_Y_F.
 //
 // This kernel does a two-level contraction:
 //     S = ReLU(B @ A.T)
@@ -39,11 +40,12 @@ static constexpr int WARPS_PER_WARPGROUP = 4;
 static constexpr int COMPUTE_WARPGROUPS_PER_BLOCK = BM / WGMMA_M;
 static constexpr int THREADS_PER_BLOCK = (COMPUTE_WARPGROUPS_PER_BLOCK + 1) * WARPGROUP_NTHREADS;
 
-static constexpr int K_TILES = D_f / WGMMA_K;
-static constexpr int OUT_TILES = D_f / WGMMA_Y_N;
+static constexpr int K_TILES = D_K_F / WGMMA_K;
+static constexpr int OUT_TILES = D_Y_F / WGMMA_Y_N;
 static constexpr int N_TILES = BN / WGMMA_S_N;
 static constexpr int S_SUBK_TILES = WGMMA_S_N / WGMMA_K;
-static constexpr int PANEL_ELEMS = BN * D_f;
+static constexpr int A_PANEL_ELEMS = BN * D_K_F;
+static constexpr int C_PANEL_ELEMS = BN * D_Y_F;
 
 // No-swizzle TF32 K-major descriptor tiles for WGMMA B operands.
 static constexpr int GMMA_TF32_PER_128B = 4;
@@ -81,19 +83,27 @@ static constexpr cuda::std::uint64_t WGMMA_Y_B_PANEL_K_DESC_DELTA = OUT_TILES * 
 static constexpr cuda::std::uint64_t WGMMA_A_K_DESC_DELTA = (static_cast<cuda::std::uint64_t>(WGMMA_A_TILE_ELEMS) * 4) >> 4;
 static constexpr cuda::std::uint64_t B_SMEM_WG_DESC_DELTA = K_TILES * WGMMA_A_K_DESC_DELTA;
 
-static constexpr int PACKED_PANEL_ELEMS = 2 * PANEL_ELEMS;
+static constexpr int PACKED_PANEL_ELEMS = A_PANEL_ELEMS + C_PANEL_ELEMS;
 static constexpr int B_SMEM_WG_ELEMS = K_TILES * WGMMA_A_TILE_ELEMS;
 static constexpr int B_PACK_ROW_BLOCKS_PER_WG = WARPS_PER_WARPGROUP;
 static constexpr int B_PACK_ROWS_PER_WARP = WGMMA_M / B_PACK_ROW_BLOCKS_PER_WG;
 static constexpr int B_PACK_TILES_PER_WG = K_TILES * B_PACK_ROW_BLOCKS_PER_WG;
-static constexpr int PANEL_BYTES = PANEL_ELEMS * sizeof(cuda::std::uint32_t);
+static constexpr int A_PANEL_BYTES = A_PANEL_ELEMS * sizeof(cuda::std::uint32_t);
+static constexpr int C_PANEL_BYTES = C_PANEL_ELEMS * sizeof(cuda::std::uint32_t);
+static constexpr int PACKED_PANEL_BYTES = A_PANEL_BYTES + C_PANEL_BYTES;
 
-static constexpr cuda::std::uint64_t PANEL_DESC_DELTA = (PANEL_BYTES >> 4);
-static constexpr cuda::std::uint64_t PACKED_PANEL_DESC_DELTA = ((2 * PANEL_BYTES) >> 4);
-static constexpr int PACK_LOAD_COLS = ((D_f >= 32) && ((D_f % 16) == 0)) ? 16 : WGMMA_K;
-static constexpr int PACK_LOAD_ROWS = WARP_NTHREADS / PACK_LOAD_COLS;
+static constexpr cuda::std::uint64_t A_PANEL_DESC_DELTA = (A_PANEL_BYTES >> 4);
+static constexpr cuda::std::uint64_t PACKED_PANEL_DESC_DELTA = (PACKED_PANEL_BYTES >> 4);
+static constexpr int A_PACK_LOAD_COLS = ((D_K_F >= 32) && ((D_K_F % 16) == 0)) ? 16 : WGMMA_K;
+static constexpr int C_PACK_LOAD_COLS = ((D_Y_F >= 32) && ((D_Y_F % 16) == 0)) ? 16 : WGMMA_K;
+static constexpr int A_PACK_LOAD_ROWS = WARP_NTHREADS / A_PACK_LOAD_COLS;
+static constexpr int C_PACK_LOAD_ROWS = WARP_NTHREADS / C_PACK_LOAD_COLS;
+static constexpr int PACK_PANEL_WORK_ELEMS =
+    A_PANEL_ELEMS > C_PANEL_ELEMS ? A_PANEL_ELEMS : C_PANEL_ELEMS;
 
 static_assert(COMPUTE_WARPGROUPS_PER_BLOCK <= 7, "named barriers support up to seven compute warpgroups");
+static_assert((D_K_F % WGMMA_K) == 0, "D_K_F must be divisible by 8");
+static_assert((D_Y_F % WGMMA_Y_N) == 0, "D_Y_F must be divisible by WGMMA_Y_N");
 
 
 using uint32_t = cuda::std::uint32_t;
@@ -353,18 +363,21 @@ __device__ __forceinline__ void sync_compute_warpgroup(int compute_wg)
 
 __device__ __forceinline__ void pack_coords_from_linear(
     int idx,
+    int padded_d,
+    int load_cols,
+    int load_rows,
     int& n_local,
     int& d)
 {
     const int elem = idx % WARP_NTHREADS;
     const int tile = idx / WARP_NTHREADS;
-    const int row = elem / PACK_LOAD_COLS;
-    const int col = elem - row * PACK_LOAD_COLS;
-    const int col_tile = tile % (D_f / PACK_LOAD_COLS);
-    const int row_tile = tile / (D_f / PACK_LOAD_COLS);
+    const int row = elem / load_cols;
+    const int col = elem - row * load_cols;
+    const int col_tile = tile % (padded_d / load_cols);
+    const int row_tile = tile / (padded_d / load_cols);
 
-    n_local = row_tile * PACK_LOAD_ROWS + row;
-    d = col_tile * PACK_LOAD_COLS + col;
+    n_local = row_tile * load_rows + row;
+    d = col_tile * load_cols + col;
 }
 
 __device__ __forceinline__ void pack_panel_element_tf32(
@@ -374,44 +387,68 @@ __device__ __forceinline__ void pack_panel_element_tf32(
     uint32_t* __restrict__ C_packed,
     int n0,
     int N,
+    int D,
     int raw_idx)
 {
-    int n_local;
-    int d;
-    pack_coords_from_linear(raw_idx, n_local, d);
+    if (raw_idx < A_PANEL_ELEMS) {
+        int n_local;
+        int d;
+        pack_coords_from_linear(
+            raw_idx,
+            D_K_F,
+            A_PACK_LOAD_COLS,
+            A_PACK_LOAD_ROWS,
+            n_local,
+            d);
 
-    float av = 0.0f;
-    float cv = 0.0f;
-    const int n = n0 + n_local;
-    if (n < N) {
-        const long long offset = static_cast<long long>(n) * D_f + d;
-        av = A[offset];
-        cv = C[offset];
+        float av = 0.0f;
+        const int n = n0 + n_local;
+        if (n < N && d < D) {
+            av = A[static_cast<long long>(n) * D + d];
+        }
+
+        const int nb = n_local / WGMMA_S_N;
+        const int n_in_tile = n_local - nb * WGMMA_S_N;
+        const int d_tile = d / WGMMA_K;
+        const int d_in_tile = d - d_tile * WGMMA_K;
+        const int a_elem = wgmma_b_smem_index_from_coords(
+            d_in_tile,
+            perm_logical_to_phys_n(n_in_tile),
+            WGMMA_S_B_LBO_ELEMS);
+
+        A_packed[(nb * K_TILES + d_tile) * WGMMA_S_B_TILE_ELEMS + a_elem] =
+            tf32_from_float(av);
     }
 
-    const int nb = n_local / WGMMA_S_N;
-    const int n_in_tile = n_local - nb * WGMMA_S_N;
-    const int panel_k = n_local / WGMMA_K;
-    const int k_in_panel = n_local - panel_k * WGMMA_K;
-    const int d_tile = d / WGMMA_K;
-    const int d_in_tile = d - d_tile * WGMMA_K;
-    const int out_tile = d / WGMMA_Y_N;
-    const int d_in_out_tile = d - out_tile * WGMMA_Y_N;
+    if (raw_idx < C_PANEL_ELEMS) {
+        int n_local;
+        int d;
+        pack_coords_from_linear(
+            raw_idx,
+            D_Y_F,
+            C_PACK_LOAD_COLS,
+            C_PACK_LOAD_ROWS,
+            n_local,
+            d);
 
-    const int a_elem = wgmma_b_smem_index_from_coords(
-        d_in_tile,
-        perm_logical_to_phys_n(n_in_tile),
-        WGMMA_S_B_LBO_ELEMS);
-    const int c_elem = wgmma_b_smem_index_from_coords(
-        k_in_panel,
-        d_in_out_tile,
-        WGMMA_Y_B_LBO_ELEMS);
+        float cv = 0.0f;
+        const int n = n0 + n_local;
+        if (n < N && d < D) {
+            cv = C[static_cast<long long>(n) * D + d];
+        }
 
-    const uint32_t av_tf32 = tf32_from_float(av);
-    const uint32_t cv_tf32 = tf32_from_float(cv);
+        const int panel_k = n_local / WGMMA_K;
+        const int k_in_panel = n_local - panel_k * WGMMA_K;
+        const int out_tile = d / WGMMA_Y_N;
+        const int d_in_out_tile = d - out_tile * WGMMA_Y_N;
+        const int c_elem = wgmma_b_smem_index_from_coords(
+            k_in_panel,
+            d_in_out_tile,
+            WGMMA_Y_B_LBO_ELEMS);
 
-    A_packed[(nb * K_TILES + d_tile) * WGMMA_S_B_TILE_ELEMS + a_elem] = av_tf32;
-    C_packed[(panel_k * OUT_TILES + out_tile) * WGMMA_Y_B_TILE_ELEMS + c_elem] = cv_tf32;
+        C_packed[(panel_k * OUT_TILES + out_tile) * WGMMA_Y_B_TILE_ELEMS + c_elem] =
+            tf32_from_float(cv);
+    }
 }
 
 #define WGMMA_D_LIST_16 "{%0, %1, %2, %3, %4, %5, %6, %7}"
@@ -692,7 +729,8 @@ void WGMMA_TF32_PACK_KERNEL_NAME(
     const float* __restrict__ C,
     uint32_t* __restrict__ A_packed,
     uint32_t* __restrict__ C_packed,
-    int N)
+    int N,
+    int D)
 {
     const int raw_global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int raw_stride = blockDim.x * gridDim.x;
@@ -704,14 +742,15 @@ void WGMMA_TF32_PACK_KERNEL_NAME(
     }
 
     const int n0 = panel * BN;
-    for (int raw_idx = raw_global_idx; raw_idx < PANEL_ELEMS; raw_idx += raw_stride) {
+    for (int raw_idx = raw_global_idx; raw_idx < PACK_PANEL_WORK_ELEMS; raw_idx += raw_stride) {
         pack_panel_element_tf32(
             A,
             C,
-            A_packed + panel * PANEL_ELEMS,
-            C_packed + panel * PANEL_ELEMS,
+            A_packed + panel * A_PANEL_ELEMS,
+            C_packed + panel * C_PANEL_ELEMS,
             n0,
             N,
+            D,
             raw_idx);
     }
 }
@@ -728,9 +767,6 @@ void WGMMA_TF32_KERNEL_NAME(
     int M,
     int D)
 {
-
-    (void)D;
-
     const int tid = threadIdx.x;
     const int warpgroup_id = tid >> 7;
     const bool is_producer_warpgroup = warpgroup_id == COMPUTE_WARPGROUPS_PER_BLOCK;
@@ -792,7 +828,7 @@ void WGMMA_TF32_KERNEL_NAME(
 
                 const int stage = panel % SMEM_COPY_STAGES;
                 uint32_t* stage_a = smem_panels + stage * PACKED_PANEL_ELEMS;
-                uint32_t* stage_c = stage_a + PANEL_ELEMS;
+                uint32_t* stage_c = stage_a + A_PANEL_ELEMS;
 
                 if (panel >= SMEM_COPY_STAGES) {
                     mbarrier_wait_shared(
@@ -800,20 +836,20 @@ void WGMMA_TF32_KERNEL_NAME(
                         stage_done_state[stage]);
                 }
                 stage_done_state[stage] = mbarrier_arrive_expect_tx_shared(&stage_done[stage], 0);
-                stage_ready_state[stage] = mbarrier_arrive_expect_tx_shared(&stage_ready[stage], 2 * PANEL_BYTES);
+                stage_ready_state[stage] = mbarrier_arrive_expect_tx_shared(&stage_ready[stage], PACKED_PANEL_BYTES);
                 __threadfence_block();
 
                 stage_ready_panel[stage] = panel;
                 cp_async_bulk_shared_global(
                     stage_a,
-                    A_packed_global + panel * PANEL_ELEMS,
-                    PANEL_BYTES,
+                    A_packed_global + panel * A_PANEL_ELEMS,
+                    A_PANEL_BYTES,
                     &stage_ready[stage]);
 
                 cp_async_bulk_shared_global(
                     stage_c,
-                    C_packed_global + panel * PANEL_ELEMS,
-                    PANEL_BYTES,
+                    C_packed_global + panel * C_PANEL_ELEMS,
+                    C_PANEL_BYTES,
                     &stage_ready[stage]);
             }
         }
@@ -836,7 +872,15 @@ void WGMMA_TF32_KERNEL_NAME(
 
         float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
         if (m < M) {
-            v = reinterpret_cast<const float4*>(&B[static_cast<long long>(m) * D_f + d])[0];
+            const float* row_ptr = B + static_cast<long long>(m) * D;
+            if ((D % 4) == 0 && d + 3 < D) {
+                v = reinterpret_cast<const float4*>(&row_ptr[d])[0];
+            } else {
+                v.x = d + 0 < D ? row_ptr[d + 0] : 0.0f;
+                v.y = d + 1 < D ? row_ptr[d + 1] : 0.0f;
+                v.z = d + 2 < D ? row_ptr[d + 2] : 0.0f;
+                v.w = d + 3 < D ? row_ptr[d + 3] : 0.0f;
+            }
         }
 
         const uint4 v_tf32 = tf32_from_float4(v);
@@ -866,8 +910,8 @@ void WGMMA_TF32_KERNEL_NAME(
             const int d = kp * WGMMA_K + col;
 
             float v = 0.0f;
-            if (m < M) {
-                v = B[static_cast<long long>(m) * D_f + d];
+            if (m < M && d < D) {
+                v = B[static_cast<long long>(m) * D + d];
             }
 
             b_regs[kp][q] = tf32_from_float(v);
@@ -900,7 +944,7 @@ void WGMMA_TF32_KERNEL_NAME(
         //A matrix descriptors below
         const uint64_t stage_a_start = (smem_panels_start + stage * PACKED_PANEL_DESC_DELTA) & GMMA_DESC_START_MASK;
         const uint64_t stage_a_desc_base = stage_a_start | WGMMA_S_B_DESC_CONST;
-        const uint64_t stage_c_desc_base = (stage_a_start + PANEL_DESC_DELTA) | WGMMA_Y_B_DESC_CONST;
+        const uint64_t stage_c_desc_base = (stage_a_start + A_PANEL_DESC_DELTA) | WGMMA_Y_B_DESC_CONST;
 
         float s_pipe[WGMMA_S_ACC_REGS] = {0.f};
 
@@ -975,7 +1019,7 @@ void WGMMA_TF32_KERNEL_NAME(
             const int d = col;
 
             if (m < M) {
-                reinterpret_cast<float2*>(&Y[m * D_f + d])[0] = make_float2(y[jc][e], y[jc][e + 1]);
+                reinterpret_cast<float2*>(&Y[static_cast<long long>(m) * D_Y_F + d])[0] = make_float2(y[jc][e], y[jc][e + 1]);
             }
         }
     }

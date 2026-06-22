@@ -46,12 +46,18 @@ def _make_header_wgmma_tf32(
     pack_kernel_name: str,
     wgmma_mode: str = "RS",
     pack_only: bool = False,
+    D_y_f: int | None = None,
 ) -> str:
     wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
+    D_k_f = D_f
+    if D_y_f is None:
+        D_y_f = D_f
     return f"""
 #define BM {BM}
 #define BN {BN}
-#define D_f {D_f}
+#define D_f {D_y_f}
+#define D_K_F {D_k_f}
+#define D_Y_F {D_y_f}
 #define WGMMA_S_N_SHAPE {WGMMA_S_N}
 #define WGMMA_Y_N_SHAPE {WGMMA_Y_N}
 #define SMEM_COPY_STAGES {num_stages}
@@ -68,15 +74,28 @@ def _dynamic_smem_bytes(
     *,
     BM: int,
     BN: int,
-    D: int,
+    D: int | None = None,
+    D_k: int | None = None,
+    D_y: int | None = None,
     num_stages: int,
     wgmma_mode: str,
 ) -> int:
     wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
-    elems = num_stages * 2 * BN * D
+    if D_k is None:
+        D_k = D
+    if D_y is None:
+        D_y = D
+    if D_k is None or D_y is None:
+        raise ValueError("Either D or both D_k and D_y must be provided")
+
+    elems = num_stages * BN * (D_k + D_y)
     if wgmma_mode == "SS":
-        elems += BM * D
+        elems += BM * D_k
     return elems * 4 + 127
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
 
 
 def _packed_panel_elems(*, BN: int, D: int) -> int:
@@ -181,7 +200,8 @@ def _compile_or_print_full_error(
 def get_relu_bat_c_kernel_wgmma_tf32_tma(
     BM: int,
     BN: int,
-    D_f: int,
+    D_k_f: int,
+    D_y_f: int,
     WGMMA_S_N: int,
     WGMMA_Y_N: int,
     num_stages: int,
@@ -202,7 +222,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
         _make_header_wgmma_tf32(
             BM,
             BN,
-            D_f,
+            D_k_f,
             WGMMA_S_N,
             WGMMA_Y_N,
             num_stages,
@@ -210,6 +230,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
             pack_kernel_name,
             wgmma_mode,
             False,
+            D_y_f=D_y_f,
         )
         + "\n"
         + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
@@ -222,7 +243,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
     if DEBUG:
         print(
             "compiling relu_bat_c TF32 WGMMA direct kernel "
-            f"with BM={BM}, BN={BN}, D_f={D_f}, "
+            f"with BM={BM}, BN={BN}, D_k_f={D_k_f}, D_y_f={D_y_f}, "
             f"WGMMA_S_N={WGMMA_S_N}, WGMMA_Y_N={WGMMA_Y_N}, "
             f"num_stages={num_stages}, wgmma_mode={wgmma_mode}, "
             "prepacked A/C, producer warpgroup, setmaxnreg"
@@ -234,7 +255,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
         header_code=header_code,
         debug_context=(
             "compute kernel "
-            f"BM={BM} BN={BN} D_f={D_f} "
+            f"BM={BM} BN={BN} D_k_f={D_k_f} D_y_f={D_y_f} "
             f"WGMMA_S_N={WGMMA_S_N} WGMMA_Y_N={WGMMA_Y_N} "
             f"num_stages={num_stages} "
             f"wgmma_mode={wgmma_mode} "
@@ -248,7 +269,8 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
 def get_relu_bat_c_pack_kernel_wgmma_tf32(
     BM: int,
     BN: int,
-    D_f: int,
+    D_k_f: int,
+    D_y_f: int,
     WGMMA_S_N: int,
     WGMMA_Y_N: int,
 ):
@@ -265,7 +287,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
         _make_header_wgmma_tf32(
             BM,
             BN,
-            D_f,
+            D_k_f,
             WGMMA_S_N,
             WGMMA_Y_N,
             2,
@@ -273,6 +295,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
             pack_kernel_name,
             "RS",
             True,
+            D_y_f=D_y_f,
         )
         + "\n"
         + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
@@ -285,7 +308,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
     if DEBUG:
         print(
             "compiling relu_bat_c TF32 WGMMA A/C pack kernel "
-            f"with BN={BN}, D_f={D_f}, "
+            f"with BN={BN}, D_k_f={D_k_f}, D_y_f={D_y_f}, "
             f"WGMMA_S_N={WGMMA_S_N}, WGMMA_Y_N={WGMMA_Y_N}"
         )
 
@@ -295,7 +318,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
         header_code=header_code,
         debug_context=(
             "pack kernel "
-            f"BM={BM} BN={BN} D_f={D_f} "
+            f"BM={BM} BN={BN} D_k_f={D_k_f} D_y_f={D_y_f} "
             f"WGMMA_S_N={WGMMA_S_N} WGMMA_Y_N={WGMMA_Y_N} "
             f"kernel_name={pack_kernel_name}"
         ),
@@ -347,11 +370,8 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
     _check_num_stages(num_stages)
     wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
 
-    if D % WGMMA_Y_N != 0:
-        raise ValueError(
-            "TF32 WGMMA output path requires "
-            f"D % WGMMA_Y_N == 0, got D={D}, WGMMA_Y_N={WGMMA_Y_N}"
-        )
+    if D < 1:
+        raise ValueError("D must be >= 1")
     if BN % WGMMA_S_N != 0:
         raise ValueError(
             "TF32 WGMMA S path requires "
@@ -369,23 +389,30 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
         raise ValueError(
             "A CTA cannot contain more than 1024 threads"
         )
-    Y = torch.empty((M, D), device=A.device, dtype=torch.float32)
+    D_k_pad = _round_up(D, 8)
+    D_y_pad = _round_up(D, WGMMA_Y_N)
+    Y = torch.empty((M, D_y_pad), device=A.device, dtype=torch.float32)
     num_panels = (N + BN - 1) // BN
 
-    packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D))
-    A_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
-    C_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
+    A_packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D_k_pad))
+    C_packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D_y_pad))
+    A_packed = torch.empty(A_packed_shape, device=A.device, dtype=torch.int32)
+    C_packed = torch.empty(C_packed_shape, device=A.device, dtype=torch.int32)
 
     if num_panels > 0:
         pack_kernel = get_relu_bat_c_pack_kernel_wgmma_tf32(
             BM,
             BN,
-            D,
+            D_k_pad,
+            D_y_pad,
             WGMMA_S_N,
             WGMMA_Y_N,
         )
         pack_threads = 256
-        panel_elems = _packed_panel_elems(BN=BN, D=D)
+        panel_elems = max(
+            _packed_panel_elems(BN=BN, D=D_k_pad),
+            _packed_panel_elems(BN=BN, D=D_y_pad),
+        )
         pack_grid = (
             (panel_elems + pack_threads - 1) // pack_threads,
             num_panels,
@@ -400,13 +427,15 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
                 A_packed,
                 C_packed,
                 int(N),
+                int(D),
             ],
         )
 
     kernel = get_relu_bat_c_kernel_wgmma_tf32_tma(
         BM,
         BN,
-        D,
+        D_k_pad,
+        D_y_pad,
         WGMMA_S_N,
         WGMMA_Y_N,
         num_stages,
@@ -415,7 +444,8 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
     smem_bytes = _dynamic_smem_bytes(
         BM=BM,
         BN=BN,
-        D=D,
+        D_k=D_k_pad,
+        D_y=D_y_pad,
         num_stages=num_stages,
         wgmma_mode=wgmma_mode,
     )
@@ -439,7 +469,7 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
         ],
     )
 
-    return Y
+    return Y[:, :D]
 
 
 @torch.library.custom_op(
@@ -487,6 +517,8 @@ def _(
         raise RuntimeError("expected rank-2 tensors")
     M = B.shape[0]
     D = A.shape[1]
+    if D < 1:
+        raise RuntimeError("D must be >= 1")
     if WGMMA_S_N not in (16, 32, 64, 128):
         raise RuntimeError("WGMMA_S_N must be one of 16, 32, 64, or 128")
     if WGMMA_Y_N not in (16, 32, 64, 128):
@@ -505,7 +537,8 @@ def _(
         raise RuntimeError("BM must cover at least one warpgroup")
     if (compute_warpgroups_per_block + 1) * 128 > 1024:
         raise RuntimeError("A CTA cannot contain more than 1024 threads")
-    return A.new_empty((M, D))
+    D_y_pad = _round_up(D, WGMMA_Y_N)
+    return A.new_empty_strided((M, D), (D_y_pad, 1))
 
 
 def launch_relu_bat_c_wgmma_tf32_tma(
