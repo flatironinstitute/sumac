@@ -68,7 +68,7 @@ extern "C" __global__ void relu_bat_c_fused_kernel_float4_sync(
     }
     __syncthreads();
 
-    #pragma unroll
+    #pragma unroll 16
     for (int kk = 0; kk < BK; ++kk) {
       #pragma unroll
       for (int i = 0; i < V; ++i) {

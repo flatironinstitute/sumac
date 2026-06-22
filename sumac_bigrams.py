@@ -13,7 +13,6 @@ import sys
 from utils import _ensure_nccl_env
 
 if __name__ == '__main__':
-    torch.set_float32_matmul_precision('high')
     #torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
 
     parser = argparse.ArgumentParser()
@@ -31,7 +30,10 @@ if __name__ == '__main__':
     parser.add_argument('--eval_path', type=str, default='bigrams_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'bigrams.txt'
     parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'bigrams.txt'
     parser.add_argument('--compile_cache_path', type=str, default='sumac_compile_cache')
+    parser.add_argument('--allow_TF32', action='store_true',
+                        help='allow PyTorch and SUMAC custom kernels to use TF32')
     args = parser.parse_args()
+    torch.set_float32_matmul_precision('high' if args.allow_TF32 else 'highest')
     
     # log experiment configuration
     args_dict = vars(args)
@@ -125,7 +127,8 @@ if __name__ == '__main__':
                 max_iterate=args.iters, factor_init=True,
                 num_blocks=args.num_blocks, mom=args.momentum,
                 method=method, lr=args.lr, save_path=save_path,
-                GD_latent=GD_latent, optim=args.optim, precondition=precond, seed=args.seed)
+                GD_latent=GD_latent, optim=args.optim, precondition=precond,
+                seed=args.seed, allow_TF32=args.allow_TF32)
 
         sys.stdout = old_stdout
         log_file.close()

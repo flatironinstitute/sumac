@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 import torch
 
+from _sumac.compile_utils import compile_cuda_kernel
 from torch.utils.cpp_extension import include_paths
 DEBUG = False
 
@@ -12,7 +13,7 @@ _KERNEL_PATH = Path(__file__).with_name("kernel.cu")
 _KERNEL_PATH_MIXED = Path(__file__).with_name("kernel_mixed.cu")
 _KERNEL_MARKER = "// KERNEL_START"
 
-KERNEL_SOURCE_START_LINE = 19
+KERNEL_SOURCE_START_LINE = 104
 KERNEL_SOURCE_START_LINE_MIXED = 127 #Using these markers to ~mostly~ fix the source-line->instruction correlation in nsight-compute
 
 def _make_header(BK, V, MS):
@@ -55,13 +56,14 @@ def get_relu_bat_c_kernel_float4(BK, V, MS):
     if DEBUG:
         print(f"compiling relu_bat_c (float4 variant) with BK={BK}, V={V}, MS={MS}")
     
-    return torch.cuda._compile_kernel(
+    return compile_cuda_kernel(
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_float4_sync",
         header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
+
 
 @lru_cache(maxsize=None)
 def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
@@ -77,13 +79,14 @@ def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
     if DEBUG:
         print(f"compiling relu_bat_c (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
 
-    return torch.cuda._compile_kernel(
+    return compile_cuda_kernel(
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_mixed_sync",
         header_code= header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
+
 
 def relu_bat_c_fused(
     A: torch.Tensor,
@@ -123,6 +126,10 @@ def relu_bat_c_fused(
     block = (BM, 1, 1)
     
     with torch.cuda.nvtx.range("launch kernel"):
-        kernel(grid, block, (A, B, C, Y, N, M, D))
+        kernel(
+            grid=grid,
+            block=block,
+            args=[A, B, C, Y, N, M, D],
+        )
 
     return Y

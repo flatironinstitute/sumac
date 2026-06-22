@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 import torch
 
+from _sumac.compile_utils import compile_cuda_kernel
 from torch.utils.cpp_extension import include_paths
 DEBUG = False
 
@@ -52,7 +53,7 @@ def get_relu_bat_reduce_kernel_float4(BK, V, MS):
     if DEBUG:
         print(f"compiling relu_bat_reduce with BK={BK}, V={V}, MS={MS}")
 
-    return torch.cuda._compile_kernel(
+    return compile_cuda_kernel(
         kernel_source,
         kernel_name="relu_bat_reduce_kernel_float4_sync",
         header_code=header_code,
@@ -74,8 +75,8 @@ def get_relu_bat_reduce_kernel_mixed(BK, V, R, MS):
     if DEBUG:
         print(f"compiling relu_bat_reduce (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
 
-    return torch.cuda._compile_kernel(
-        kernel_source=kernel_source,
+    return compile_cuda_kernel(
+        kernel_source,
         kernel_name="relu_bat_reduce_kernel_mixed_sync",
         header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
@@ -121,6 +122,11 @@ def relu_bat_reduce_fused(
     block = (BM, 1, 1)
     
     with torch.cuda.nvtx.range("launch kernel"):
-        kernel(grid, block, (A, B, out_sum, out_sum2, M, N, D), shared_mem=dynamic_shared_mem_bytes)
+        kernel(
+            grid=grid,
+            block=block,
+            shared_mem=dynamic_shared_mem_bytes,
+            args=[A, B, out_sum, out_sum2, M, N, D],
+        )
 
     return out_sum.float(), out_sum2.float()

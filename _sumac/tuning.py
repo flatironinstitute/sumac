@@ -65,6 +65,25 @@ def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
     )
 
 
+def _brief_exception(exc: Exception) -> str:
+    text = str(exc).strip()
+    if not text:
+        return exc.__class__.__name__
+    return text.splitlines()[0]
+
+
+def _print_trial_pruned(
+    trial: optuna.Trial,
+    reason: str,
+    params: Dict[str, Any],
+    exc: Optional[Exception] = None,
+) -> None:
+    message = f"[Trial {trial.number}] pruned: {reason}; params={params}"
+    if exc is not None:
+        message += f"; error={_brief_exception(exc)}"
+    print(message)
+
+
 @dataclass(frozen=True)
 class TuneResult:
     mode: str 
@@ -241,19 +260,58 @@ def _run_study(
         }
         merged = {**static_kwargs, **params}
 
-        if constraint_fn is not None and not constraint_fn(*args, **merged):
-            raise optuna.TrialPruned()
+        if constraint_fn is not None:
+            try:
+                constraint_ok = constraint_fn(*args, **merged)
+            except Exception as e:
+                _print_trial_pruned(
+                    trial,
+                    "constraint_fn error",
+                    params,
+                    e,
+                )
+                raise optuna.TrialPruned() from e
+
+            if not constraint_ok:
+                _print_trial_pruned(trial, "constraint rejected config", params)
+                raise optuna.TrialPruned()
 
         def run():
             return fn(*args, **merged)
 
         try:
             run()
+        except Exception as e:
+            _print_trial_pruned(
+                trial,
+                "jit compile or kernel launch failure",
+                params,
+                e,
+            )
+            raise optuna.TrialPruned() from e
+
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            _print_trial_pruned(
+                trial,
+                "runtime failure after warmup launch",
+                params,
+                e,
+            )
+            raise optuna.TrialPruned() from e
+
+        try:
             runtime_ms = _bench_callable(run, warmup=warmup, rep=rep)
             trial.set_user_attr("runtime_ms", runtime_ms)
         except Exception as e:
-            print(f"[Trial {trial.number}] Error: {e}")
-            raise optuna.TrialPruned()
+            _print_trial_pruned(
+                trial,
+                "runtime or benchmark failure",
+                params,
+                e,
+            )
+            raise optuna.TrialPruned() from e
 
         return runtime_ms
 

@@ -13,7 +13,14 @@ def relu_bat_c_fused_op(
     BK: int,
     MS: int,
 ) -> torch.Tensor:
-    return _relu_bat_c_fused_impl(A, B, C, BM=BM, BK=BK, MS=MS)
+    return _relu_bat_c_fused_impl(
+        A,
+        B,
+        C,
+        BM=BM,
+        BK=BK,
+        MS=MS,
+    )
 
 
 @relu_bat_c_fused_op.register_fake

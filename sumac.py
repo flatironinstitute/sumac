@@ -13,7 +13,7 @@ from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_r
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
 from _sumac.train_als import least_squares_update_fast, refactor
-from _sumac.train_salsa import update_factor_salsa
+from _sumac.train_salsa import configure_kernel_prec, update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
 def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
@@ -21,7 +21,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
           mom=0.7, method='GD', lr=1e-1, factor_init=False,
           save_path=None, GD_latent=False, optim="adam", precondition=False,
           adam_beta1=0.9, adam_beta2=0.999, adam_eps=1e-8, muon_momentum=0.95,
-          multi_gpu=True, seed=0):
+          multi_gpu=True, seed=0, allow_TF32=False):
     """
     PyTorch version of sumac algorithm driver function.
 
@@ -39,6 +39,7 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
       precondition: default False. If true, precondition the gradient of factors by A.grad = A.grad @ (B^T B)^{-1}
       optimizer args: adam_, muon_
       multi_gpu: If true, launch multiple streams, each per device
+      allow_TF32: If true, allow TF32 matmuls and SALSA TF32 relu_bat_c kernels
     Saved Artifacts:
       A, B    : factors (torch.Tensors)
       costs   : list or tensor of cost history
@@ -64,9 +65,10 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         'exaggerate': mom, #momentum for SALSA or ALS
         'momentum_start_iter': 10, #ALS 
         'refactor_interval': 25, #ALS
-        'eval_interval': 10, #evaluation per interval for SALSA or ALS
+        'eval_interval': 100, #evaluation per interval for SALSA or ALS
         'factor_init': factor_init, #ALS; if True: A,B specific initialization
         'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
+        'allow_TF32': allow_TF32,
     }
 
     if opts is None:
@@ -75,6 +77,9 @@ def sumac(S_index, S_value, m, n, d, max_iterate=25, num_blocks=None,
         # fill in any missing keys
         for k, v in opts_default.items():
             opts.setdefault(k, v)
+
+    allow_TF32 = bool(opts.get('allow_TF32', False))
+    torch.set_float32_matmul_precision('high' if allow_TF32 else 'highest')
 
     if num_blocks is None:
         max_bytes = opts['cache_MB'] * 1e6
@@ -362,6 +367,19 @@ def salsa_loop(S_index, S_value, m, n, d, opts, lrate, test_flag=False):
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
     if device == "cpu":
         os.environ["KERNEL_AUTOTUNE_FORCE_FALLBACK"] = "1"
+    device_obj = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device == "cuda"
+        else torch.device("cpu")
+    )
+    configure_kernel_prec(
+        allow_tf32=(
+            bool(opts.get('allow_TF32', False)) and
+            opts.get('dtype', torch.float32) == torch.float32
+        ),
+        device=device_obj,
+        D=d,
+    )
     S_index = S_index.to(device)
     S_value = S_value.to(device)
     
@@ -453,7 +471,7 @@ def salsa_loop(S_index, S_value, m, n, d, opts, lrate, test_flag=False):
             t_start = time.time()
         torch.cuda.nvtx.range_pop()
     # WRAP UP
-    A, B = refactor(A, B)
+    #A, B = refactor(A, B)
     
     costs = {
         'rmse': rmse_hist,

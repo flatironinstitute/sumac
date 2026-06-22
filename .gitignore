@@ -11,3 +11,7 @@ _sumac/__pycache__/
 connectome/
 
 inductor_cache/
+
+*autotune.json
+
+*.mexa64
