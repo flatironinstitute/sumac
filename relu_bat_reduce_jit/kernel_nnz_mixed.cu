@@ -113,6 +113,7 @@ extern "C" __global__ void relu_bat_reduce_kernel_mixed_sync(
 
   float local_sum  = 0.f;
   float local_sum2 = 0.f;
+  unsigned local_nnz = {0};
 
   #pragma unroll
   for (int j = 0; j < MS; ++j) {

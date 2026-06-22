@@ -16,7 +16,7 @@ from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_r
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
 from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
 from _sumac.train_als import least_squares_update_fast, refactor
-from _sumac.train_salsa import update_factor_salsa
+from _sumac.train_salsa import configure_kernel_prec, update_factor_salsa
 from _sumac.eval import block_loss_and_pred, eval
 
 def sumac(
@@ -45,7 +45,8 @@ def sumac(
     multi_gpu: bool = False,        # TODO: unused
     seed: int = 0,
     A_init: Tensor | None = None,
-    B_init: Tensor | None = None
+    B_init: Tensor | None = None,
+    allow_TF32: bool =False
 ):
     """
     PyTorch version of sumac algorithm driver function.
@@ -65,6 +66,7 @@ def sumac(
       optimizer args: adam_, muon_
       multi_gpu: If true, launch multiple streams, each per device
       A_init, B_init: allow user-specified factor initialization
+      allow_TF32: If true, allow TF32 matmuls and SALSA TF32 relu_bat_c kernels
     Saved Artifacts:
       A, B    : factors (Tensors)
       costs   : list or tensor of cost history
@@ -94,6 +96,7 @@ def sumac(
         'eval_interval': default_eval_interval, #eval cadence: 100 for GD, 10 for SALSA/ALS
         'factor_init': factor_init, #ALS; if True: A,B specific initialization
         'optim': optim, #GD optimizer; default adam, also support sgd, adamw, muon
+        'allow_TF32': allow_TF32,
     }
 
     if opts is None:
@@ -102,6 +105,9 @@ def sumac(
         # fill in any missing keys
         for k, v in opts_default.items():
             opts.setdefault(k, v)
+
+    allow_TF32 = bool(opts.get('allow_TF32', False))
+    torch.set_float32_matmul_precision('high' if allow_TF32 else 'highest')
 
     if num_blocks is None:
         max_bytes = opts['cache_MB'] * 1e6
@@ -700,6 +706,19 @@ def salsa_loop(
     device = "cuda" if torch.cuda.device_count() > 0 else "cpu" #S_value.device
     if device == "cpu":
         os.environ["KERNEL_AUTOTUNE_FORCE_FALLBACK"] = "1"
+    device_obj = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device == "cuda"
+        else torch.device("cpu")
+    )
+    configure_kernel_prec(
+        allow_tf32=(
+            bool(opts.get('allow_TF32', False)) and
+            opts.get('dtype', torch.float32) == torch.float32
+        ),
+        device=device_obj,
+        D=d,
+    )
     S_index = S_index.to(device)
     S_value = S_value.to(device)
     
@@ -789,7 +808,7 @@ def salsa_loop(
             t_start = time.time()
         torch.cuda.nvtx.range_pop()
     # WRAP UP
-    A, B = refactor(A, B)
+    #A, B = refactor(A, B)
     
     costs = {
         'rmse': rmse_hist,

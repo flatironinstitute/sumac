@@ -5,7 +5,6 @@ import numpy as np
 import scipy.io as sio
 from data import *
 from torch.utils.data import DataLoader
-import h5py
 from sumac import sumac 
 from _sumac.dataset import RowBlockDataset, collate_blocks
 from _sumac.eval import eval 
@@ -13,7 +12,6 @@ import sys
 from utils import _ensure_nccl_env
 
 if __name__ == '__main__':
-    torch.set_float32_matmul_precision('high')
     #torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
 
     parser = argparse.ArgumentParser()
@@ -27,11 +25,16 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['ALS','SALSA','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
     parser.add_argument('--lr', type=float, default=1e-2)
     parser.add_argument('--optim', type=str, default='adam', choices=['adam','sgd', 'adamw', 'muon'], help='diffenrent optimizer for GD')
+    parser.add_argument('--eval_interval', type=int, default=None,
+                        help='clean-eval cadence (default: 100 for GD, 10 for SALSA/ALS)')
     parser.add_argument('--eval_only', action='store_true', help='eval only')
     parser.add_argument('--eval_path', type=str, default='bigrams_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'bigrams.txt'
     parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'bigrams.txt'
     parser.add_argument('--compile_cache_path', type=str, default='sumac_compile_cache')
+    parser.add_argument('--allow_TF32', action='store_true',
+                        help='allow PyTorch and SUMAC custom kernels to use TF32')
     args = parser.parse_args()
+    torch.set_float32_matmul_precision('high' if args.allow_TF32 else 'highest')
     
     # log experiment configuration
     args_dict = vars(args)
@@ -111,29 +114,46 @@ if __name__ == '__main__':
 
     else: #TRAIN FROM SCRATCH
         method = args.mode if args.mode in ['ALS', 'SALSA'] else 'GD'
-        GD_latent = True if args.mode in ['GDlatent_sumac', 'GDlatent_prec_sumac'] else False
-        precond = True if args.mode == 'GDlatent_prec_sumac' else False
+        GD_latent = args.mode in ['GDlatent_sumac', 'GDlatent_prec_sumac']
+        precond = args.mode == 'GDlatent_prec_sumac'
         if method == 'GD':
             _ensure_nccl_env() #for cluster job run
             print("NCCL_SOCKET_IFNAME=", os.environ.get("NCCL_SOCKET_IFNAME"),
                 " MASTER_ADDR=", os.environ.get("MASTER_ADDR"),
                 " MASTER_PORT=", os.environ.get("MASTER_PORT"))
-        print("s_index and value from outside of main loop:")
-        print(S_index[:, 0], S_value[0])
-        print(S_index[:, -1], S_value[-1])
-        sumac(S_index, S_value, m=m, n=m, d=args.d, 
-                max_iterate=args.iters, factor_init=True,
-                num_blocks=args.num_blocks, mom=args.momentum,
-                method=method, lr=args.lr, save_path=save_path,
-                GD_latent=GD_latent, optim=args.optim, precondition=precond, seed=args.seed)
+
+        opts = {'eval_interval': args.eval_interval} if args.eval_interval is not None else None
+        sumac(
+            S_index,
+            S_value,
+            m=m,
+            n=m,
+            d=args.d,
+            max_iterate=args.iters,
+            factor_init=True,
+            num_blocks=args.num_blocks,
+            sgd_momentum=args.momentum,
+            method=method,
+            lr=args.lr,
+            save_path=save_path,
+            GD_latent=GD_latent,
+            optim=args.optim,
+            precondition=precond,
+            opts=opts,
+            seed=args.seed,
+            allow_TF32=args.allow_TF32
+        )
 
         sys.stdout = old_stdout
         log_file.close()
     
     if not os.path.exists(args.compile_cache_path):
             os.makedirs(args.compile_cache_path, exist_ok=True)
-    artifact_bytes, cache_info = torch.compiler.save_cache_artifacts()
-    open(os.path.join(args.compile_cache_path,compile_artifact_file), "wb").write(artifact_bytes)
+    artifacts = torch.compiler.save_cache_artifacts()
+    artifact_bytes, cache_info = artifacts if artifacts is not None else (None, None)
+    if artifact_bytes is not None:
+        with open(os.path.join(args.compile_cache_path,compile_artifact_file), "wb") as fh:
+            fh.write(artifact_bytes)
 
 ##launch scripts
 #GPU: python sumac_bigrams.py --iters 1000  --num_blocks 100 
