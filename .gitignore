@@ -1,0 +1,50 @@
+.git/
+
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+sumac*=*
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+coverage.lcov
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+python/test/unit/plots/*
+
+# Environments
+.env
+.venv
+.venv/
+.venv_*/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+uv.lock
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# sumac temps
+_sumac/__pycache__/
+connectome/
+
+inductor_cache/
+
+*autotune.json
+
+*.mexa64

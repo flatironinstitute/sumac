@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch_sparse.tensor import * 
 import torch.nn.functional as F
 
 

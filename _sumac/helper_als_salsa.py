@@ -6,11 +6,12 @@ from typing import Tuple
 from _sumac.train_als import refactor
 
 def _init_factors_salsa(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
     d: int,
+    gen: torch.Generator
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Direct translation of salsa_init.m logic.
@@ -24,8 +25,8 @@ def _init_factors_salsa(
     S = torch.sparse_coo_tensor(
         S_index.to(device=device, dtype=torch.long), S_value,
         size=(m, n), device=device, dtype=dtype).coalesce()  # important for possible duplicate entries
-    R_A = torch.rand((n, d), device=device, dtype=dtype) #dense random matrix in U(0,1)
-    R_B = torch.rand((m, d), device=device, dtype=dtype) #dense random matrix in U(0,1)
+    R_A = torch.rand((n, d), device=device, dtype=dtype, generator=gen) #dense random matrix in U(0,1)
+    R_B = torch.rand((m, d), device=device, dtype=dtype, generator=gen) #dense random matrix in U(0,1)
     A = torch.sqrt(torch.sparse.mm(S, R_A))
     B = -torch.sqrt(torch.sparse.mm(S.T, R_B))
 
@@ -69,7 +70,7 @@ def _init_factors_testcase(
     return A, B
 
 def _init_factors_factor_specific(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
@@ -117,13 +118,14 @@ def _init_factors_factor_agnostic(
 
 
 def als_init_factors(
-    S_index: torch.LongTensor,
+    S_index: torch.Tensor,
     S_value: torch.Tensor,
     m: int,
     n: int,
     d: int,
     opts: dict,
     test_flag: bool,
+    gen: torch.Generator
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Single entry point for init. Chooses:
@@ -133,7 +135,7 @@ def als_init_factors(
     """
     if opts.get('method', '').upper() == 'SALSA':
         print('salsa init...')
-        return _init_factors_salsa(S_index, S_value, m, n, d)
+        return _init_factors_salsa(S_index, S_value, m, n, d, gen)
     if test_flag:
         return _init_factors_testcase(m, d)
     if opts.get("factor_init", False):

@@ -1,7 +1,5 @@
-import torch 
-import torch.nn as nn
+import torch
 import torch.nn.functional as F
-from torch import optim
 
 from utils import *
 
@@ -34,7 +32,7 @@ def dense_to_sparse(S, sparse_rate=True):
         print(f'sparse rate = {rate}')
     return idx, val.float()
 
-def sparse_to_dense(idx: torch.tensor, val: torch.tensor, m: int, n: int):
+def sparse_to_dense(idx: torch.Tensor, val: torch.Tensor, m: int, n: int):
     '''
     Given idx, val (COO) format, return a dense matrix
     '''
@@ -48,10 +46,14 @@ def prune_zero_rows_cols(S_index, shape):
         print(f"no all-zero row or col")
         return S_index, None, None # nothing to drop
     dev = S_index.device
-    row_mask = torch.zeros(m, dtype=torch.bool, device=dev); row_mask[r] = True
-    col_mask = torch.zeros(n, dtype=torch.bool, device=dev); col_mask[c] = True
-    row_new = torch.full((m,), -1, dtype=torch.long, device=dev); row_new[row_mask] = torch.arange(row_mask.sum(), device=dev)
-    col_new = torch.full((n,), -1, dtype=torch.long, device=dev); col_new[col_mask] = torch.arange(col_mask.sum(), device=dev)
+    row_mask = torch.zeros(m, dtype=torch.bool, device=dev)
+    row_mask[r] = True
+    col_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+    col_mask[c] = True
+    row_new = torch.full((m,), -1, dtype=torch.long, device=dev)
+    row_new[row_mask] = torch.arange(row_mask.sum().item(), device=dev)
+    col_new = torch.full((n,), -1, dtype=torch.long, device=dev)
+    col_new[col_mask] = torch.arange(col_mask.sum().item(), device=dev)
     new_idx = torch.stack([row_new[r], col_new[c]])
     print(f"{int(row_mask.sum())} rows, {int(col_mask.sum())} cols")
     return new_idx, row_mask, col_mask

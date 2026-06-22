@@ -13,12 +13,13 @@ from utils import _ensure_nccl_env
 
 if __name__ == '__main__':
     #torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--d', type=int, default=16)
     parser.add_argument('--iters', type=int, default=50)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num_blocks', type=int, default=100, help='number of blocks')
-    parser.add_argument('--filename', type=str, default='/mnt/home/dbollweg/sumac_data/connectome_matrix.mat')  #OLD: 'connectome.txt'
+    parser.add_argument('--filename', type=str, default='/mnt/home/dbollweg/sumac_data/digits_graph_70K.mat')  #OLD: 'digits.txt'
     parser.add_argument('--momentum', type=float, default=0.9, help='use momentum to update W and H')
     parser.add_argument('--float64', action='store_true', help='use torch.float64 (default use float32)')
     parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['ALS','SALSA','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
@@ -27,27 +28,28 @@ if __name__ == '__main__':
     parser.add_argument('--eval_interval', type=int, default=None,
                         help='clean-eval cadence (default: 100 for GD, 10 for SALSA/ALS)')
     parser.add_argument('--eval_only', action='store_true', help='eval only')
-    parser.add_argument('--eval_path', type=str, default='connectome_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'connectome.txt'
-    parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'connectome.txt'
+    parser.add_argument('--eval_path', type=str, default='digits_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'digits.txt'
+    parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'digits.txt'
     parser.add_argument('--compile_cache_path', type=str, default='sumac_compile_cache')
     parser.add_argument('--allow_TF32', action='store_true',
                         help='allow PyTorch and SUMAC custom kernels to use TF32')
     args = parser.parse_args()
     torch.set_float32_matmul_precision('high' if args.allow_TF32 else 'highest')
+    
     # log experiment configuration
     args_dict = vars(args)
     ngpus = torch.cuda.device_count()
     if args.eval_only == False:
         if args.mode == "GD_sumac":
-            save_dir = "connectome_GD_errZ"  
+            save_dir = "digits_GD_errZ"  
         elif args.mode == "GDlatent_sumac":
-            save_dir = "connectome_GDlatent_errZ"
+            save_dir = "digits_GDlatent_errZ"
         elif args.mode == "GDlatent_prec_sumac":
-            save_dir = "connectome_GDlatent_prec_errZ"
+            save_dir = "digits_GDlatent_prec_errZ"
         elif args.mode == 'SALSA':
-            save_dir = "connectome_SALSA"
+            save_dir = "digits_SALSA"
         else:
-            save_dir = "connectome"
+            save_dir = "digits"
         save_path = f"./{save_dir}/sumac_d={args.d}_mom={args.momentum}_seed={args.seed}_iters={args.iters}_ngpus={ngpus}_nblocks={args.num_blocks}_lr={args.lr}_optim={args.optim}_v2" #v2: dated 11/04/2025, testing new changes to matlab
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
@@ -66,47 +68,37 @@ if __name__ == '__main__':
         artifact_bytes = open(os.path.join(args.compile_cache_path,compile_artifact_file), "rb").read()
         torch.compiler.load_cache_artifacts(artifact_bytes)
     
+    # load data (3, E)
     if args.filename.endswith('.mat'):
         mat = sio.loadmat(args.filename)
-        S = mat['connectome']
+        S = mat['S']
 
         S = S.tocoo()
 
         S_index = torch.tensor(np.array([S.row, S.col]), dtype=torch.long)
         S_value = torch.tensor(S.data, dtype=torch.float64 if args.float64 else torch.float32)
         m, n = S.shape
-        assert isinstance(m, int)
-        assert isinstance(n, int)
-        
+
     else:
         data = np.loadtxt(args.filename).T
 
         S_index = torch.LongTensor(data[0:2,:])
         S_value = torch.FloatTensor(data[2,:])
+        S_index -= 1 #This is only correct if the indexing is 1-based in text file! 
+        m = int(S_index[0].max().item()) + 1
+        n = int(S_index[1].max().item()) + 1
 
-        m = n = int(S_index[0].max())
-        print(f'm=n={m}, E={len(S_value)}')
-        # print(torch._inductor.list_options())
-        # normalize to start at zero-index
-        S_index -= 1
-
+    print(f'm=n={m}, E={len(S_value)}')
+   
     dtype = torch.float64 if args.float64 else torch.float32
     # NEW: EVAL ONLY
     if args.eval_only:
         A, B = torch.load(f"{args.eval_path}/AB.pt")
         ds = RowBlockDataset(S_index, S_value, m=m, num_blocks=args.num_blocks)
         loader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=collate_blocks)
-        rmse, jacc, errZ = eval(
-            A.detach().cpu(),
-            B.detach().cpu(),
-            S_index,
-            S_value, 
-            m,
-            n,
-            num_blocks=args.num_blocks, 
-            full_block_loader=loader,
-            device="cpu"
-        )
+        rmse, jacc, errZ = eval(A.detach().cpu(), B.detach().cpu(), S_index, S_value, 
+                            m, n, num_blocks=args.num_blocks, 
+                            full_block_loader=loader, device="cpu")
         print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
         #saving to txt 
         if args.eval_save:
@@ -129,7 +121,7 @@ if __name__ == '__main__':
             S_index,
             S_value,
             m=m,
-            n=m,    # TODO: sic?
+            n=m,
             d=args.d,
             max_iterate=args.iters,
             factor_init=True,
@@ -158,5 +150,5 @@ if __name__ == '__main__':
             fh.write(artifact_bytes)
 
 ##launch scripts
-#GPU: python sumac_connectome.py --iters 1000  --num_blocks 100 
-#EVAL: python sumac_connectome.py --eval_only
+#GPU: python sumac_digits.py --iters 1000  --num_blocks 100 
+#EVAL: python sumac_digits.py --eval_only
