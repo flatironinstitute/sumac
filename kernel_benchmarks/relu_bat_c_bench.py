@@ -138,16 +138,6 @@ def relu_bat_c_fp32_cuda_launcher(
     return relu_bat_c_fp32_cuda
 
 
-def _neighbor_values(base, allowed):
-    idx = allowed.index(base)
-    values = [base]
-    if idx > 0:
-        values.append(allowed[idx - 1])
-    if idx + 1 < len(allowed):
-        values.append(allowed[idx + 1])
-    return values
-
-
 def _grid_size(config: dict) -> int:
     size = 1
     for values in config.values():
@@ -167,54 +157,34 @@ def _max_dynamic_smem_bytes(props) -> int:
     return max(candidates)
 
 
-def relu_bat_c_tf32_sync_baseline(D: int) -> dict:
-    params = {
-        "BM": 256,
-        "BN": 32,
-        "M_TILES": 4,
-        "num_stages": 2,
-    }
-
-    if D == 32:
-        params.update(
-            BM=256,
-            BN=32,
-            M_TILES=4,
-            num_stages=2,
-        )
-    if D == 64:
-        params.update(
-            BM=256,
-            BN=64,
-            M_TILES=2,
-            num_stages=2,
-        )
-    if D == 128:
-        params.update(
-            BM=128,
-            BN=16,
-            M_TILES=2,
-            num_stages=2,
-        )
-    if D == 256:
-        params.update(
-            BM=128,
-            BN=8,
-            M_TILES=1,
-            num_stages=1,
-        )
-
-    return params
-
-
 def relu_bat_c_tf32_sync_tune_config(D: int) -> dict:
-    baseline = relu_bat_c_tf32_sync_baseline(D)
+    if D == 64:
+        return {
+            "BM": [128, 256],
+            "BN": [32, 64, 128],
+            "M_TILES": [1, 2, 4],
+            "num_stages": [1, 2, 3],
+        }
+    if D == 128:
+        return {
+            "BM": [64, 128, 256],
+            "BN": [8, 16, 32],
+            "M_TILES": [1, 2, 4],
+            "num_stages": [1, 2, 3],
+        }
+    if D == 256:
+        return {
+            "BM": [64, 128, 256],
+            "BN": [8, 16],
+            "M_TILES": [1, 2],
+            "num_stages": [1, 2],
+        }
 
     return {
-        "BM": _neighbor_values(baseline["BM"], [64, 128, 256]),
-        "BN": _neighbor_values(baseline["BN"], [8, 16, 32, 64, 128]),
-        "M_TILES": _neighbor_values(baseline["M_TILES"], [1, 2, 4]),
-        "num_stages": _neighbor_values(baseline["num_stages"], [1, 2, 3]),
+        "BM": [128, 256],
+        "BN": [16, 32, 64],
+        "M_TILES": [2, 4],
+        "num_stages": [1, 2, 3],
     }
 
 
@@ -298,48 +268,6 @@ def relu_bat_c_tf32_sync_launcher(
         )
 
     return relu_bat_c_tf32_sync_cuda
-
-
-def relu_bat_c_tf32_wgmma_baseline(D: int) -> dict:
-    params = {
-        "BM": 256,
-        "BN": 32,
-        "WGMMA_S_N": 16,
-        "WGMMA_Y_N": 16,
-        "num_stages": 2,
-        "wgmma_mode": "RS",
-    }
-
-    if D == 32:
-        params.update(
-            BM=256,
-            BN=64,
-            WGMMA_S_N=32,
-            WGMMA_Y_N=32,
-        )
-    if D == 64:
-        params.update(
-            BM=256,
-            BN=128,
-            WGMMA_S_N=128,
-            WGMMA_Y_N=64,
-        )
-    if D == 128:
-        params.update(
-            BM=128,
-            BN=128,
-            WGMMA_S_N=128,
-            WGMMA_Y_N=128,
-        )
-    if D == 256:
-        params.update(
-            BM=128,
-            BN=128,
-            WGMMA_S_N=128,
-            WGMMA_Y_N=128,
-        )
-
-    return params
 
 
 def relu_bat_c_tf32_wgmma_tune_config(D: int) -> dict:
