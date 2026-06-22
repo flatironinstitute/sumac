@@ -62,6 +62,10 @@ def _dynamic_smem_bytes(
     return 2 * num_stages * BN * D * 4 + 127
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 def _packed_panel_elems(*, BN: int, D: int) -> int:
     return BN * D
 
@@ -230,8 +234,8 @@ def _launch_relu_batc_mma_sync_tf32_impl(
         raise ValueError(f"B has D={DB}, expected {D}")
     if NC != N or DC != D:
         raise ValueError(f"C must have shape [{N}, {D}], got {tuple(C.shape)}")
-    if D % 8 != 0:
-        raise ValueError("TF32 m16n8k8 path requires D % 8 == 0")
+    if D < 1:
+        raise ValueError("D must be >= 1")
     if BN % 8 != 0:
         raise ValueError("BN must be divisible by MMA_N=8")
     if num_stages < 1:
@@ -244,10 +248,11 @@ def _launch_relu_batc_mma_sync_tf32_impl(
     compute_warps_per_block = BM // warp_m_rows
     threads_per_block = compute_warps_per_block * 32
 
-    Y = torch.empty((M, D), device=A.device, dtype=torch.float32)
     num_panels = (N + BN - 1) // BN
+    D_pad = _round_up(D, 8)
+    Y = torch.empty((M, D_pad), device=A.device, dtype=torch.float32)
 
-    packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D))
+    packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D_pad))
     A_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
     C_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
 
@@ -255,12 +260,12 @@ def _launch_relu_batc_mma_sync_tf32_impl(
         pack_kernel = get_relu_bat_c_pack_kernel_mma_sync_tf32(
             BM,
             BN,
-            D,
+            D_pad,
             M_TILES,
             num_stages,
         )
         pack_threads = 256
-        panel_pairs = _packed_panel_pairs(BN=BN, D=D)
+        panel_pairs = _packed_panel_pairs(BN=BN, D=D_pad)
         pack_grid = (
             (panel_pairs + pack_threads - 1) // pack_threads,
             num_panels,
@@ -275,19 +280,20 @@ def _launch_relu_batc_mma_sync_tf32_impl(
                 A_packed,
                 C_packed,
                 int(N),
+                int(D),
             ],
         )
 
     kernel = get_relu_bat_c_kernel_mma_sync_tf32(
         BM,
         BN,
-        D,
+        D_pad,
         M_TILES,
         num_stages,
     )
     smem_bytes = _dynamic_smem_bytes(
         BN=BN,
-        D=D,
+        D=D_pad,
         num_stages=num_stages,
     )
     _maybe_opt_in_dynamic_smem(kernel, smem_bytes)
@@ -310,7 +316,7 @@ def _launch_relu_batc_mma_sync_tf32_impl(
         ],
     )
 
-    return Y
+    return Y[:, :D]
 
 
 @torch.library.custom_op(
@@ -352,6 +358,8 @@ def _(
         raise RuntimeError("expected rank-2 tensors")
     M = B.shape[0]
     D = A.shape[1]
+    if D < 1:
+        raise RuntimeError("D must be >= 1")
     if BN % 8 != 0:
         raise RuntimeError("BN must be divisible by MMA_N=8")
     if num_stages < 1:
@@ -360,7 +368,8 @@ def _(
     warp_m_rows = M_TILES * 16
     if BM % warp_m_rows != 0:
         raise RuntimeError("BM must be divisible by M_TILES * 16")
-    return A.new_empty((M, D))
+    D_pad = _round_up(D, 8)
+    return A.new_empty_strided((M, D), (D_pad, 1))
 
 
 def launch_relu_batc_mma_sync_tf32(

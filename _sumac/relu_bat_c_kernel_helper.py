@@ -28,6 +28,10 @@ def max_dynamic_smem_bytes(props) -> int:
     return max(candidates)
 
 
+def round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 def relu_bat_c_fp32_tune_config() -> dict:
     return {
         "BM": [32, 64, 128, 256],
@@ -159,7 +163,7 @@ def relu_bat_c_tf32_sync_constraints(
 
     if props.major < 8:
         return False
-    if D % 8 != 0:
+    if D < 1:
         return False
     if BN % 8 != 0:
         return False
@@ -179,7 +183,7 @@ def relu_bat_c_tf32_sync_constraints(
         "shared_memory_per_block_optin",
         props.shared_memory_per_block,
     )
-    smem_bytes = 2 * num_stages * BN * D * 4 + 127
+    smem_bytes = 2 * num_stages * BN * round_up(D, 8) * 4 + 127
     return smem_bytes <= max_smem
 
 

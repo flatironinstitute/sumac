@@ -213,6 +213,7 @@ __device__ __forceinline__ void pack_panel_pair_tf32(
     uint32_t* __restrict__ C_packed,
     int n0,
     int N,
+    int D,
     int packed_pair_idx)
 {
     const int lane = packed_pair_idx & (WARP_NTHREADS - 1);
@@ -231,24 +232,22 @@ __device__ __forceinline__ void pack_panel_pair_tf32(
     uint2 a_pair = {0u, 0u};
     uint2 c_pair = {0u, 0u};
 
-    if (a_n < N) {
-        a_pair.x = f32_to_tf32_bits(
-            A[static_cast<long long>(a_n) * D_f +
-              inner_tile * MMA_K + kk_low]);
-        a_pair.y = f32_to_tf32_bits(
-            A[static_cast<long long>(a_n) * D_f +
-              inner_tile * MMA_K + kk_low + 4]);
+    const int a_d0 = inner_tile * MMA_K + kk_low;
+    const int a_d1 = a_d0 + 4;
+    if (a_n < N && a_d0 < D) {
+        a_pair.x = f32_to_tf32_bits(A[static_cast<long long>(a_n) * D + a_d0]);
+    }
+    if (a_n < N && a_d1 < D) {
+        a_pair.y = f32_to_tf32_bits(A[static_cast<long long>(a_n) * D + a_d1]);
     }
 
     const int c_n0 = n0 + n_tile * MMA_N + kk_low;
-    if (c_n0 < N) {
-        c_pair.x = f32_to_tf32_bits(
-            C[static_cast<long long>(c_n0) * D_f + c_col]);
+    if (c_n0 < N && c_col < D) {
+        c_pair.x = f32_to_tf32_bits(C[static_cast<long long>(c_n0) * D + c_col]);
     }
     const int c_n1 = c_n0 + 4;
-    if (c_n1 < N) {
-        c_pair.y = f32_to_tf32_bits(
-            C[static_cast<long long>(c_n1) * D_f + c_col]);
+    if (c_n1 < N && c_col < D) {
+        c_pair.y = f32_to_tf32_bits(C[static_cast<long long>(c_n1) * D + c_col]);
     }
 
     reinterpret_cast<uint2*>(A_packed)[packed_pair_idx] = a_pair;
@@ -355,7 +354,8 @@ void MMA_SYNC_TF32_PACK_KERNEL_NAME(
     const float* __restrict__ C,
     uint32_t* __restrict__ A_packed,
     uint32_t* __restrict__ C_packed,
-    int N)
+    int N,
+    int D)
 {
     const int packed_pair_global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int packed_pair_stride = blockDim.x * gridDim.x;
@@ -377,6 +377,7 @@ void MMA_SYNC_TF32_PACK_KERNEL_NAME(
             C_packed + panel * PACKED_PANEL_ELEMS,
             n0,
             N,
+            D,
             packed_pair_idx);
     }
 }
@@ -424,8 +425,8 @@ void MMA_SYNC_TF32_KERNEL_NAME(
                 const int d = k_tile * MMA_K + col;
 
                 float v = 0.0f;
-                if (m < M) {
-                    v = B[m * D_f + d];
+                if (m < M && d < D) {
+                    v = B[static_cast<long long>(m) * D + d];
                 }
 
                 b_regs[m_tile][k_tile][fragment_elem] = f32_to_tf32_bits(v);
@@ -502,11 +503,11 @@ void MMA_SYNC_TF32_KERNEL_NAME(
             const int col  = k_tile * MMA_N + 2 * (lane & 3);
 
             if (row0 < M) {
-                reinterpret_cast<float2*>(&Y[row0 * D_f + col])[0] =
+                reinterpret_cast<float2*>(&Y[static_cast<long long>(row0) * D_f + col])[0] =
                     make_float2(y[m_tile][k_tile][0], y[m_tile][k_tile][1]);
             }
             if (row1 < M) {
-                reinterpret_cast<float2*>(&Y[row1 * D_f + col])[0] =
+                reinterpret_cast<float2*>(&Y[static_cast<long long>(row1) * D_f + col])[0] =
                     make_float2(y[m_tile][k_tile][2], y[m_tile][k_tile][3]);
             }
         }
