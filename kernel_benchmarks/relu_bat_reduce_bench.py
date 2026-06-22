@@ -5,6 +5,11 @@ import optuna
 import torch
 import triton
 
+from _sumac.relu_bat_reduce_kernel_helper import (
+    grid_size as _grid_size,
+    relu_bat_reduce_constraints,
+    relu_bat_reduce_tune_config,
+)
 from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
 from relu_bat_reduce_jit.custom_op import relu_bat_reduce_fused_op
 
@@ -14,25 +19,12 @@ def torch_impl(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return S.sum(), (S * S).sum()
 
 
-
-
 def ms_to_tflops(M: int, N: int, D: int, ms: float) -> float:
     num_outputs = M * N
     dot_flops = num_outputs * (D + D - 1)
     sum_flops = (num_outputs - 1) + num_outputs + (num_outputs - 1)
     flops = dot_flops + sum_flops
     return flops / (ms * 1e-3) / 1e12
-
-
-def _grid_size(config: dict) -> int:
-    size = 1
-    for values in config.values():
-        size *= len(values)
-    return size
-
-
-def _is_power_of_two(value: int) -> bool:
-    return value > 0 and (value & (value - 1)) == 0
 
 
 def _abs_errs(
@@ -85,45 +77,19 @@ def print_perf_summary(result: dict) -> None:
     print()
 
 
-def relu_bat_reduce_fp32_constraints(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    BM: int,
-    BK: int,
-    num_ms: int,
-) -> bool:
-    _, D = A.shape
-    props = torch.cuda.get_device_properties(A.device)
-
-    if D >= 32 and num_ms > 4:
-        return False
-    if D >= 64 and num_ms > 2:
-        return False
-    if not _is_power_of_two(BM):
-        return False
-    if BM > getattr(props, "max_threads_per_block", 1024):
-        return False
-
-    return 4 * BK * D + 2 * BM * 8 <= props.shared_memory_per_block
-
-
 @lru_cache(maxsize=None)
 def relu_bat_reduce_fp32_launcher(
     n_trials: int,
     warmup: int,
     rep: int,
 ):
-    tune_config = {
-        "BM": [32, 64, 128, 256],
-        "BK": [16, 32, 64, 128],
-        "num_ms": [1, 2, 4, 6],
-    }
+    tune_config = relu_bat_reduce_tune_config()
     n_trials = max(n_trials, _grid_size(tune_config))
 
     @autotune_cuda_kernel(
         configs=tune_config,
         key_fn=relu_bat_reduce_key,
-        constraint_fn=relu_bat_reduce_fp32_constraints,
+        constraint_fn=relu_bat_reduce_constraints,
         cache_path="relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
         n_trials=n_trials,
         warmup=warmup,
@@ -170,7 +136,7 @@ def bench_one(
     fp32_params = fp32_decision["params"]
     _require_valid_params(
         "cuda fused FP32",
-        relu_bat_reduce_fp32_constraints,
+        relu_bat_reduce_constraints,
         (A, B),
         fp32_params,
     )

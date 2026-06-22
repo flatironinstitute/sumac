@@ -1,76 +1,7 @@
 import torch
 
 from _sumac.dataset import block_span
-from relu_bat_reduce_jit.api import relu_bat_reduce_fused
-from _sumac.tuning import *
-
-
-@torch.compile
-def relu_bat_reduce_fallback(
-    A: torch.Tensor,
-    B: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    A64 = A.to(torch.float64)
-    B64 = B.to(torch.float64)
-    Sr = torch.relu(A64 @ B64.T)
-    
-    sum_sr = Sr.sum()
-    sum_sr2 = (Sr * Sr).sum()
-    return sum_sr, sum_sr2
-
-
-def relu_bat_reduce_constraints(
-    A: torch.Tensor,
-    B: torch.Tensor,    # NOTE UNUSED
-    BM: int,
-    BK: int,
-    num_ms: int,
-) -> bool:
-    if A.shape[1] >= 32 and num_ms > 4:
-        return False
-
-    if A.shape[1] >= 64 and num_ms > 2:  
-        return False  
-    if BM <= 0 or (BM & (BM - 1)) != 0:
-        return False
-    
-    # NOTE: called fn
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-
-    if props.shared_memory_per_block < 4 * BK * A.shape[1]:
-        return False
-
-    return True
-
-
-def relu_bat_reduce_launcher():
-    tune_config = {
-        "BM": [32, 64, 128, 256],
-        "BK": [16, 32, 64, 128],
-        "num_ms": [1, 2, 4, 6],
-    }
-
-    @autotune_cuda_kernel(
-        configs=tune_config,
-        fallback_fn=relu_bat_reduce_fallback,
-        constraint_fn=relu_bat_reduce_constraints,
-        key_fn=relu_bat_reduce_key,
-        cache_path="relu_bat_reduce_jit_autotune.json",
-        n_trials=1000,
-        warmup=1,
-        rep=5,
-        sampler=optuna.samplers.GridSampler(search_space=tune_config),
-    )
-    def relu_bat_reduce(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        BM: int,
-        BK: int,
-        num_ms: int,
-    ) -> tuple[torch.Tensor,torch.Tensor]:
-        return relu_bat_reduce_fused(A, B, BM, BK, num_ms)
-    
-    return relu_bat_reduce
+from _sumac.relu_bat_reduce_kernel_helper import relu_bat_reduce_launcher
 
 
 relu_bat_tuned = relu_bat_reduce_launcher()
