@@ -20,7 +20,7 @@ from relu_batc_jit.api import relu_bat_c_fused_op
 from relu_batc_tf32_jit.jit_kernel_tf32_sync import launch_relu_batc_mma_sync_tf32
 from relu_batc_tf32_jit.jit_kernel_tf32_wgmma import launch_relu_bat_c_wgmma_tf32_tma
 
-#@torch.compile(mode='max-autotune-no-cudagraphs')
+@torch.compile(mode='max-autotune-no-cudagraphs')
 def torch_impl(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
     return torch.relu(B @ A.T) @ C
 
@@ -387,11 +387,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     torch.manual_seed(0)
+    torch.set_float32_matmul_precision('high')
     assert torch.cuda.is_available()
 
     r = bench_one(
-        M=288768,
-        N=1408,
+        M=250000,
+        N=2500,
         D=16,
         dtype=torch.float32,
         wm_iters=args.warmup_iters,
@@ -399,8 +400,8 @@ if __name__ == "__main__":
     )
     print_perf_summary(r)
     r = bench_one(
-        M=288768,
-        N=1408,
+        M=250000,
+        N=2500,
         D=32,
         dtype=torch.float32,
         wm_iters=args.warmup_iters,
@@ -408,8 +409,8 @@ if __name__ == "__main__":
     )
     print_perf_summary(r)
     r = bench_one(
-        M=288768,
-        N=1408,
+        M=250000,
+        N=2500,
         D=64,
         dtype=torch.float32,
         wm_iters=args.warmup_iters,
@@ -417,8 +418,8 @@ if __name__ == "__main__":
     )
     print_perf_summary(r)
     r = bench_one(
-        M=288768,
-        N=1408,
+        M=250000,
+        N=2500,
         D=128,
         dtype=torch.float32,
         wm_iters=args.warmup_iters,
@@ -426,8 +427,8 @@ if __name__ == "__main__":
     )
     print_perf_summary(r)
     r = bench_one(
-        M=288768, 
-        N=1408, 
+        M=250000, 
+        N=2500, 
         D=256, 
         dtype=torch.float32, 
         wm_iters=args.warmup_iters, 

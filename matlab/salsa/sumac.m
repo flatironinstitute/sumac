@@ -18,6 +18,7 @@
 %       .initfile = filename (*.mat) with user-initialized A,B
 %       .nbatch (default: 100)
 %       .lrate (default: 1)
+%       .allow_tf32 (default: false)
 % 
 % ****** Output ******
 %   A,B    : m-by-d and n-by-d matrices
@@ -65,7 +66,8 @@ function opts = set_options(user_opts)
 opts_default = ...
   struct('max_iterate',1000,'time_limit',Inf,'tol_abs',1e-2,...
     'seed',randi(intmax),'stats_interval',5,...
-    'momentum',0.9,'block_size_MB',250,'nbatch',100,'lrate',1);
+    'momentum',0.9,'block_size_MB',250,'nbatch',100,'lrate',1,...
+    'allow_tf32',false);
 
 % NO USER INPUT?
 if (isempty(user_opts))

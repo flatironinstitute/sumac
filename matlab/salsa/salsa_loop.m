@@ -216,7 +216,7 @@ end
 function [B,dB] = batch_update(Smeta,A,B,dB,opts,stepnum)
 
 % COMPUTE UPDATE
-lsqB = lsq_update(Smeta,A,B);
+lsqB = lsq_update(Smeta,A,B,opts);
 dB = (lsqB-B)*(1-opts.momentum) + dB*opts.momentum;
 
 % UNBIAS FOR EARLY STEPS
@@ -231,7 +231,7 @@ end
 %
 % Computes the least squares update for B given the minibatch of A.
 
-function lsqB = lsq_update(Smeta,A,B)
+function lsqB = lsq_update(Smeta,A,B,opts)
 
 % CONTRIBUTION FROM ELEMENTS WITH S=0
 %pseudoInverseAt = A/(A'*A);
@@ -241,8 +241,36 @@ Gcpu = gather(G);
 Ginv = inv(Gcpu); % solve small inv on CPU due to Matlab's GPU path slowness.
 pseudoInverseAt = A * gpuArray(Ginv);
 
-Yt = relu_bat_c_sparse_fused_nvrtc_mex(A.', B.', pseudoInverseAt.', Smeta.rowPtr, Smeta.edgeI, Smeta.edgeVal, Smeta.rowPtrBase, Smeta.edgeBase);
+if (use_tf32_relu_bat_c(opts))
+  Yt = relu_bat_c_sparse_tf32_nvrtc_mex(A.', B.', pseudoInverseAt.', Smeta.rowPtr, Smeta.edgeI, Smeta.edgeVal, Smeta.rowPtrBase, Smeta.edgeBase);
+else
+  Yt = relu_bat_c_sparse_fused_nvrtc_mex(A.', B.', pseudoInverseAt.', Smeta.rowPtr, Smeta.edgeI, Smeta.edgeVal, Smeta.rowPtrBase, Smeta.edgeBase);
+end
 lsqB = B - Yt.';
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function tf32 = use_tf32_relu_bat_c(opts)
+
+persistent gpu_supports_tf32;
+
+requested = isfield(opts,'allow_tf32') && isscalar(opts.allow_tf32) && logical(opts.allow_tf32);
+if (~requested)
+  tf32 = false;
+  return;
+end
+
+if (isempty(gpu_supports_tf32))
+  gpu_supports_tf32 = false;
+  if (canUseGPU())
+    cc = sscanf(gpuDevice().ComputeCapability,'%d.%d');
+    gpu_supports_tf32 = ~isempty(cc) && cc(1) >= 8;
+  end
+end
+
+tf32 = gpu_supports_tf32;
 
 end
 

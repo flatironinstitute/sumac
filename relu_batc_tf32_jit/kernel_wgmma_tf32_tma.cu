@@ -234,16 +234,6 @@ __device__ __forceinline__ void wgmma_wait_group_0()
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
 
-template <int Regs>
-__device__ __forceinline__ void setmaxnreg_dec()
-{
-    asm volatile(
-        "setmaxnreg.dec.sync.aligned.u32 %0;\n"
-        :
-        : "n"(Regs)
-        : "memory");
-}
-
 __device__ __forceinline__ bool elect_sync(unsigned membermask)
 {
     unsigned is_leader;
@@ -814,12 +804,6 @@ void WGMMA_TF32_KERNEL_NAME(
     if (num_panels == 0) {
         return;
     }
-
-#if WGMMA_USE_SETMAXNREG
-    if (is_producer_warpgroup) {
-        setmaxnreg_dec<WGMMA_PRODUCER_MAX_REGS>();
-    }
-#endif
 
     if (is_producer_warpgroup) {
         if (elect_one_from_warpgroup_warp0(producer_tid)) {

@@ -17,7 +17,6 @@ _KERNEL_MARKER = "// KERNEL_START"
 _KERNEL_PATH_WGMMA_TF32_TMA = Path(__file__).with_name(
     "kernel_wgmma_tf32_tma.cu"
 )
-WGMMA_PRODUCER_MAX_REGS = 40
 
 
 def _split_kernel_file(path: Path) -> tuple[str, str, int]:
@@ -65,8 +64,6 @@ def _make_header_wgmma_tf32(
 #define WGMMA_TF32_PACK_KERNEL_NAME {pack_kernel_name}
 #define WGMMA_TF32_PACK_ONLY {1 if pack_only else 0}
 #define WGMMA_FIRST_MMA_SS {1 if wgmma_mode == "SS" else 0}
-#define WGMMA_PRODUCER_MAX_REGS {WGMMA_PRODUCER_MAX_REGS}
-#define WGMMA_USE_SETMAXNREG 1
 """
 
 
@@ -246,7 +243,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
             f"with BM={BM}, BN={BN}, D_k_f={D_k_f}, D_y_f={D_y_f}, "
             f"WGMMA_S_N={WGMMA_S_N}, WGMMA_Y_N={WGMMA_Y_N}, "
             f"num_stages={num_stages}, wgmma_mode={wgmma_mode}, "
-            "prepacked A/C, producer warpgroup, setmaxnreg"
+            "prepacked A/C, producer warpgroup"
         )
 
     return _compile_or_print_full_error(
@@ -259,7 +256,6 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
             f"WGMMA_S_N={WGMMA_S_N} WGMMA_Y_N={WGMMA_Y_N} "
             f"num_stages={num_stages} "
             f"wgmma_mode={wgmma_mode} "
-            f"producer_regs={WGMMA_PRODUCER_MAX_REGS} "
             f"kernel_name={kernel_name}"
         ),
     )
