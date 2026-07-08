@@ -5,10 +5,10 @@ import time
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from _sumac.dataset import block_span, RowBlockDataset
-from _sumac.model import FactorModel
-from _sumac.train_gd import TrainConfig
-from _sumac.eval import block_loss_and_pred, eval
+from ..datasets import block_span, RowBlockDataset
+from .model import FactorModel
+from .gd import TrainConfig
+from ..eval import block_loss_and_pred, eval
 
 # -----------------------------
 # TODO: DEBUGGGGG - DDP training loop (FP32)

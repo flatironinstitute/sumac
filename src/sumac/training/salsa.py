@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor
-from _sumac.dataset import StochasticRowBlockDataset
-from _sumac.cuda_utils import cuda_is_available
-from _sumac.relu_bat_c_kernel_helper import relu_bat_c_fallback_launcher
+from ..datasets import StochasticRowBlockDataset
+from ..kernels.cuda_utils import cuda_is_available
+from ..kernels.relu_bat_c import relu_bat_c_fallback_launcher
 
 
 relu_bat_c_tuned = relu_bat_c_fallback_launcher()
@@ -28,7 +28,7 @@ def configure_kernel_prec(
             relu_bat_c_kernel_d = D
         return
 
-    from _sumac.relu_bat_c_kernel_helper import (
+    from ..kernels.relu_bat_c import (
         relu_bat_c_cuda_launcher,
         relu_bat_c_tf32_sync_launcher,
         relu_bat_c_tf32_wgmma_launcher,

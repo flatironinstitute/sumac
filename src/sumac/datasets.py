@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from typing import List, Tuple, Any
 
-from _sumac.cuda_utils import synchronize_if_cuda
+from .kernels.cuda_utils import synchronize_if_cuda
 
 # ---------- helpers ----------
 def block_span(block_id: int, m: int, num_blocks: int):

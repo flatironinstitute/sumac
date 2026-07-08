@@ -3,7 +3,7 @@ import torch
 import math
 from typing import Tuple
 
-from _sumac.train_als import refactor
+from .als import refactor
 
 def _init_factors_salsa(
     S_index: torch.Tensor,

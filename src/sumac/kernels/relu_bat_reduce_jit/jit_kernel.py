@@ -4,17 +4,16 @@ from functools import lru_cache
 from pathlib import Path
 import torch
 
-from _sumac.compile_utils import compile_cuda_kernel
+from ..compile_utils import compile_cuda_kernel
 from torch.utils.cpp_extension import include_paths
 DEBUG = False
-
 
 _KERNEL_PATH = Path(__file__).with_name("kernel.cu")
 _KERNEL_PATH_MIXED = Path(__file__).with_name("kernel_mixed.cu")
 _KERNEL_MARKER = "// KERNEL_START"
 
-KERNEL_SOURCE_START_LINE = 104
-KERNEL_SOURCE_START_LINE_MIXED = 127 #Using these markers to ~mostly~ fix the source-line->instruction correlation in nsight-compute
+KERNEL_SOURCE_START_LINE = 10 #this is only used for source-line->instruction correlation in nsight-compute
+KERNEL_SOURCE_START_LINE_MIXED = 85
 
 def _make_header(BK, V, MS):
     return f"""
@@ -22,14 +21,13 @@ def _make_header(BK, V, MS):
 #define V  {V}
 #define MS {MS}
 """
-
 def _make_header_mixed(BK, V, R, MS):
     return f"""
 #define BK {BK}
 #define V  {V}
 #define R  {R}
 #define MS {MS}
-""" 
+"""
 
 def _split_kernel_file(path: Path) -> tuple[str, str]:
     src = path.read_text()
@@ -40,11 +38,10 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
     return header_code, kernel_source
 
 
-
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_float4(BK, V, MS):
+def get_relu_bat_reduce_kernel_float4(BK, V, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
- 
+
     header_code = (
         f'#line 1 "{_KERNEL_PATH}"\n'
         + header_code
@@ -54,82 +51,82 @@ def get_relu_bat_c_kernel_float4(BK, V, MS):
         + f'#line {KERNEL_SOURCE_START_LINE} "{_KERNEL_PATH}"\n'
     )
     if DEBUG:
-        print(f"compiling relu_bat_c (float4 variant) with BK={BK}, V={V}, MS={MS}")
-    
+        print(f"compiling relu_bat_reduce with BK={BK}, V={V}, MS={MS}")
+
     return compile_cuda_kernel(
         kernel_source,
-        kernel_name="relu_bat_c_fused_kernel_float4_sync",
+        kernel_name="relu_bat_reduce_kernel_float4_sync",
         header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
-
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
+def get_relu_bat_reduce_kernel_mixed(BK, V, R, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
     header_code = (
         f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
-        + _make_header_mixed(BK, V, R, MS) #This ordering matters since header_code uses them
+        + _make_header_mixed(BK, V, R, MS)
         + "\n"
         + header_code
         + "\n"
         + f'#line {KERNEL_SOURCE_START_LINE_MIXED} "{_KERNEL_PATH_MIXED}"\n'
     )
     if DEBUG:
-        print(f"compiling relu_bat_c (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
+        print(f"compiling relu_bat_reduce (mixed variant) with BK={BK}, V={V}, R={R}, MS={MS}")
 
     return compile_cuda_kernel(
         kernel_source,
-        kernel_name="relu_bat_c_fused_kernel_mixed_sync",
-        header_code= header_code,
+        kernel_name="relu_bat_reduce_kernel_mixed_sync",
+        header_code=header_code,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
 
-def relu_bat_c_fused(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BK: int,
-    MS: int,
-    BM: int,
-) -> torch.Tensor:
+def relu_bat_reduce_fused(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        BM: int,
+        BK: int,
+        MS: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.cuda.nvtx.range_push("Prep kernel")
-    if not (A.is_cuda and B.is_cuda and C.is_cuda):
-        raise ValueError("A, B, and C must be CUDA tensors")
-    if not (A.dtype == B.dtype == C.dtype == torch.float32):
-        raise ValueError("A, B, and C must be float32")
-    if not (A.is_contiguous() and B.is_contiguous() and C.is_contiguous()):
-        raise ValueError("A, B, and C must be contiguous")
-    if not (A.ndim == B.ndim == C.ndim == 2):
-        raise ValueError("A, B, and C must be 2D")
+    if not (A.is_cuda and B.is_cuda):
+        raise ValueError("A and B must be CUDA tensors")
+    if not (A.dtype == B.dtype == torch.float32):
+        raise ValueError("A and B must be float32")
+    if not (A.is_contiguous() and B.is_contiguous()):
+        raise ValueError("A and B must be contiguous")
+    if not (A.ndim == B.ndim == 2):
+        raise ValueError("A and B must be 2D")
 
-    N, D = A.shape
-    M, DB = B.shape
-    NC, DC = C.shape
-    V = D//4
+    M, D = A.shape
+    N, DB = B.shape
+    if D != DB:
+        raise ValueError(f"Inner dimensions must match, got {D} and {DB}")
+    V = D // 4
     R = D % 4
-    if DB != D:
-        raise ValueError(f"B.shape[1] must equal A.shape[1], got {DB} vs {D}")
-    if (NC, DC) != (N, D):
-        raise ValueError(f"C must have shape {(N, D)}, got {tuple(C.shape)}")
-   
 
-
-    Y = torch.empty((M, D), device=A.device, dtype=A.dtype)
-    kernel = get_relu_bat_c_kernel_float4(BK, V, MS) if R==0 else get_relu_bat_c_kernel_mixed(BK, V, R, MS)
+    dynamic_shared_mem_bytes = 2 * BM * 4
+    out_sum = torch.zeros(1, device=A.device, dtype=torch.float64)
+    out_sum2 = torch.zeros(1, device=A.device, dtype=torch.float64)
+    kernel = get_relu_bat_reduce_kernel_float4(BK, V, MS) if R==0 else get_relu_bat_reduce_kernel_mixed(BK, V, R, MS)
     torch.cuda.nvtx.range_pop()
     
-    grid = ((M + BM * MS - 1) // (BM * MS), 1, 1)  
+    grid = (
+        (M + BM * MS - 1) // (BM * MS),
+        (N + BK - 1) // BK,
+        1,
+    )
     block = (BM, 1, 1)
     
     with torch.cuda.nvtx.range("launch kernel"):
         kernel(
             grid=grid,
             block=block,
-            args=[A, B, C, Y, N, M, D],
+            shared_mem=dynamic_shared_mem_bytes,
+            args=[A, B, out_sum, out_sum2, M, N, D],
         )
 
-    return Y
+    return out_sum.float(), out_sum2.float()

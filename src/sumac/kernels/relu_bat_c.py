@@ -4,7 +4,7 @@ from functools import lru_cache
 
 import torch
 
-from _sumac.cuda_utils import cuda_is_available
+from .cuda_utils import cuda_is_available
 
 
 class FallbackReluBatC:
@@ -25,7 +25,7 @@ def relu_bat_c_fallback_launcher() -> FallbackReluBatC:
 
 
 def autotune_deps():
-    from _sumac.tuning import autotune_cuda_kernel, relu_bat_c_key
+    from .tuning import autotune_cuda_kernel, relu_bat_c_key
 
     try:
         import optuna
@@ -270,7 +270,7 @@ def relu_bat_c_cuda_launcher():
         return relu_bat_c_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
-    from relu_batc_jit.api import relu_bat_c_fused
+    from .relu_batc_jit.api import relu_bat_c_fused
 
     tune_config = relu_bat_c_fp32_tune_config()
 
@@ -311,7 +311,7 @@ def relu_bat_c_tf32_sync_launcher(D: int):
         return relu_bat_c_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
-    from relu_batc_tf32_jit.jit_kernel_tf32_sync import (
+    from .relu_batc_tf32_jit.jit_kernel_tf32_sync import (
         launch_relu_batc_mma_sync_tf32,
     )
 
@@ -355,7 +355,7 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
         return relu_bat_c_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
-    from relu_batc_tf32_jit.jit_kernel_tf32_wgmma import (
+    from .relu_batc_tf32_jit.jit_kernel_tf32_wgmma import (
         launch_relu_bat_c_wgmma_tf32_tma,
     )
 

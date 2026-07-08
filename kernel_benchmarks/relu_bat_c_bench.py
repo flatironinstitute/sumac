@@ -5,7 +5,7 @@ import optuna
 
 from functools import lru_cache
 
-from _sumac.relu_bat_c_kernel_helper import (
+from sumac.kernels.relu_bat_c import (
     grid_size as _grid_size,
     relu_bat_c_fp32_constraints,
     relu_bat_c_fp32_tune_config,
@@ -15,10 +15,10 @@ from _sumac.relu_bat_c_kernel_helper import (
     relu_bat_c_tf32_wgmma_constraints,
     relu_bat_c_tf32_wgmma_tune_config,
 )
-from _sumac.tuning import autotune_cuda_kernel, relu_bat_c_key
-from relu_batc_jit.api import relu_bat_c_fused_op
-from relu_batc_tf32_jit.jit_kernel_tf32_sync import launch_relu_batc_mma_sync_tf32
-from relu_batc_tf32_jit.jit_kernel_tf32_wgmma import launch_relu_bat_c_wgmma_tf32_tma
+from sumac.kernels.tuning import autotune_cuda_kernel, relu_bat_c_key
+from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused_op
+from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_sync import launch_relu_batc_mma_sync_tf32
+from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_wgmma import launch_relu_bat_c_wgmma_tf32_tma
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def torch_impl(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:

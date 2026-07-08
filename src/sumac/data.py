@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from utils import *
+from .utils import *
 
 
 def generate_testdata(seed, m, n, r=3, val_max=10):

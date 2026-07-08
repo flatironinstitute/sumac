@@ -4,27 +4,27 @@ from torch.utils.data import DataLoader
 import math
 import time
 import random
-from data import prune_zero_rows_cols
+from .data import prune_zero_rows_cols
 import pickle
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 
-from _sumac.cuda_utils import (
+from .kernels.cuda_utils import (
     cuda_device_count,
     current_cuda_device,
     nvtx_range_pop,
     nvtx_range_push,
     synchronize_if_cuda,
 )
-from _sumac.dataset import collate_blocks, StochasticRowBlockDataset, MultiGPUStochasticRowBlockDataset, get_sharded_ds
-from _sumac.train_gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
+from .datasets import collate_blocks, StochasticRowBlockDataset, MultiGPUStochasticRowBlockDataset, get_sharded_ds
+from .training.gd import TrainConfig, make_optimizer, select_devices, setup_replicas, shard_blocks, \
                             zero_replica_grads, compute_backward_on_device, wait_streams_before_reduce, \
                             reduce_grads_to_master, broadcast_params_from_master, apply_precondition, apply_clip_and_step
-from _sumac.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
-from _sumac.train_als import least_squares_update_fast, refactor
-from _sumac.train_salsa import configure_kernel_prec, update_factor_salsa
-from _sumac.eval import block_loss_and_pred, eval
+from .training.helper_als_salsa import als_init_factors, als_post_process_factors, als_early_stop
+from .training.als import least_squares_update_fast, refactor
+from .training.salsa import configure_kernel_prec, update_factor_salsa
+from .eval import block_loss_and_pred, eval
 
 def sumac(
     S_index: Tensor,

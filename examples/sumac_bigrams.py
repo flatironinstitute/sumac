@@ -3,13 +3,13 @@ import argparse
 import os
 import numpy as np
 import scipy.io as sio
-from data import *
+from sumac.data import *
 from torch.utils.data import DataLoader
 from sumac import sumac 
-from _sumac.dataset import RowBlockDataset, collate_blocks
-from _sumac.eval import eval 
+from sumac.datasets import RowBlockDataset, collate_blocks
+from sumac.eval import eval
 import sys
-from utils import _ensure_nccl_env
+from sumac.utils import _ensure_nccl_env
 
 if __name__ == '__main__':
     #torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
@@ -19,7 +19,7 @@ if __name__ == '__main__':
     parser.add_argument('--iters', type=int, default=50)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--num_blocks', type=int, default=100, help='number of blocks')
-    parser.add_argument('--filename', type=str, default='/mnt/home/dbollweg/sumac_data/digits_graph_70K.mat')  #OLD: 'digits.txt'
+    parser.add_argument('--filename', type=str, default='/mnt/home/dbollweg/sumac_data/bigrams_250K.mat')  #OLD: 'bigrams.txt'
     parser.add_argument('--momentum', type=float, default=0.9, help='use momentum to update W and H')
     parser.add_argument('--float64', action='store_true', help='use torch.float64 (default use float32)')
     parser.add_argument('--mode', type=str, default='GDlatent_sumac', choices=['ALS','SALSA','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
@@ -28,8 +28,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval_interval', type=int, default=None,
                         help='clean-eval cadence (default: 100 for GD, 10 for SALSA/ALS)')
     parser.add_argument('--eval_only', action='store_true', help='eval only')
-    parser.add_argument('--eval_path', type=str, default='digits_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'digits.txt'
-    parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'digits.txt'
+    parser.add_argument('--eval_path', type=str, default='bigrams_GD/sumac_d=16_mom=0.7_seed=0_iters=1000_ngpus=1_nblocks=None_finit=True_v2')  #OLD: 'bigrams.txt'
+    parser.add_argument('--eval_save',  action='store_true', help='save to txt')  #OLD: 'bigrams.txt'
     parser.add_argument('--compile_cache_path', type=str, default='sumac_compile_cache')
     parser.add_argument('--allow_TF32', action='store_true',
                         help='allow PyTorch and SUMAC custom kernels to use TF32')
@@ -41,15 +41,15 @@ if __name__ == '__main__':
     ngpus = torch.cuda.device_count()
     if args.eval_only == False:
         if args.mode == "GD_sumac":
-            save_dir = "digits_GD_errZ"  
+            save_dir = "bigrams_GD_errZ"  
         elif args.mode == "GDlatent_sumac":
-            save_dir = "digits_GDlatent_errZ"
+            save_dir = "bigrams_GDlatent_errZ"
         elif args.mode == "GDlatent_prec_sumac":
-            save_dir = "digits_GDlatent_prec_errZ"
+            save_dir = "bigrams_GDlatent_prec_errZ"
         elif args.mode == 'SALSA':
-            save_dir = "digits_SALSA"
+            save_dir = "bigrams_SALSA"
         else:
-            save_dir = "digits"
+            save_dir = "bigrams"
         save_path = f"./{save_dir}/sumac_d={args.d}_mom={args.momentum}_seed={args.seed}_iters={args.iters}_ngpus={ngpus}_nblocks={args.num_blocks}_lr={args.lr}_optim={args.optim}_v2" #v2: dated 11/04/2025, testing new changes to matlab
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
@@ -71,12 +71,18 @@ if __name__ == '__main__':
     # load data (3, E)
     if args.filename.endswith('.mat'):
         mat = sio.loadmat(args.filename)
-        S = mat['S']
+        S = mat['bigrams']
 
         S = S.tocoo()
+        row_sums = np.asarray(S.sum(axis=1)).ravel().astype(np.float32)
 
+        realmin = np.finfo(np.float32).tiny
+
+        # Normalize each nonzero entry by the sum of its row
+        S_data = S.data.astype(np.float32) / (row_sums[S.row] + realmin)
+    
         S_index = torch.tensor(np.array([S.row, S.col]), dtype=torch.long)
-        S_value = torch.tensor(S.data, dtype=torch.float64 if args.float64 else torch.float32)
+        S_value = torch.tensor(S_data, dtype=torch.float64 if args.float64 else torch.float32)
         m, n = S.shape
 
     else:
@@ -150,5 +156,5 @@ if __name__ == '__main__':
             fh.write(artifact_bytes)
 
 ##launch scripts
-#GPU: python sumac_digits.py --iters 1000  --num_blocks 100 
-#EVAL: python sumac_digits.py --eval_only
+#GPU: python sumac_bigrams.py --iters 1000  --num_blocks 100 
+#EVAL: python sumac_bigrams.py --eval_only

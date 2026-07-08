@@ -1,7 +1,7 @@
 import torch
 
-from _sumac.cuda_utils import cuda_is_available, nvtx_range, nvtx_range_pop, nvtx_range_push
-from _sumac.dataset import block_span
+from .kernels.cuda_utils import cuda_is_available, nvtx_range, nvtx_range_pop, nvtx_range_push
+from .datasets import block_span
 
 
 relu_bat_tuned = None
@@ -14,7 +14,7 @@ def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
 
     if not (A.is_cuda and B.is_cuda and cuda_is_available()):
         if relu_bat_reduce_kernel_mode != "fallback" or relu_bat_tuned is None:
-            from _sumac.relu_bat_reduce_kernel_helper import (
+            from .kernels.relu_bat_reduce import (
                 relu_bat_reduce_fallback_launcher,
             )
 
@@ -23,7 +23,7 @@ def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
         return relu_bat_tuned
 
     if relu_bat_reduce_kernel_mode != "cuda" or relu_bat_tuned is None:
-        from _sumac.relu_bat_reduce_kernel_helper import relu_bat_reduce_launcher
+        from .kernels.relu_bat_reduce import relu_bat_reduce_launcher
 
         relu_bat_tuned = relu_bat_reduce_launcher()
         relu_bat_reduce_kernel_mode = "cuda"

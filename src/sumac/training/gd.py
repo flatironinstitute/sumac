@@ -9,9 +9,9 @@ import random
 from torch.nn.utils import clip_grad_norm_
 import contextlib
 
-from _sumac.cuda_utils import cuda_device_count, cuda_is_available, synchronize_if_cuda
-from _sumac.dataset import block_span
-from _sumac.eval import block_loss_and_pred, eval
+from ..kernels.cuda_utils import cuda_device_count, cuda_is_available, synchronize_if_cuda
+from ..datasets import block_span
+from ..eval import block_loss_and_pred, eval
 
 # ---------- config (uses num_blocks) ----------
 @dataclass

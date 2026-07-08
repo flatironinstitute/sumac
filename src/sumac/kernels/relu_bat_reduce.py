@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from _sumac.cuda_utils import cuda_is_available
+from .cuda_utils import cuda_is_available
 
 
 class FallbackReluBatReduce:
@@ -22,7 +22,7 @@ def relu_bat_reduce_fallback_launcher() -> FallbackReluBatReduce:
 
 
 def autotune_deps():
-    from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
+    from .tuning import autotune_cuda_kernel, relu_bat_reduce_key
 
     try:
         import optuna
@@ -96,7 +96,7 @@ def relu_bat_reduce_launcher():
         return relu_bat_reduce_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_reduce_key, optuna = autotune_deps()
-    from relu_bat_reduce_jit.api import relu_bat_reduce_fused
+    from .relu_bat_reduce_jit.api import relu_bat_reduce_fused
 
     tune_config = relu_bat_reduce_tune_config()
 

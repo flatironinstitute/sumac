@@ -5,13 +5,13 @@ import optuna
 import torch
 import triton
 
-from _sumac.relu_bat_reduce_kernel_helper import (
+from sumac.kernels.relu_bat_reduce import (
     grid_size as _grid_size,
     relu_bat_reduce_constraints,
     relu_bat_reduce_tune_config,
 )
-from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
-from relu_bat_reduce_jit.custom_op import relu_bat_reduce_fused_op
+from sumac.kernels.tuning import autotune_cuda_kernel, relu_bat_reduce_key
+from sumac.kernels.relu_bat_reduce_jit.custom_op import relu_bat_reduce_fused_op
 
 
 def torch_impl(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

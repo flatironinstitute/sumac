@@ -13,7 +13,7 @@ import pickle
 import time
 import numpy as np
 
-from _sumac.cuda_utils import cuda_is_available
+from .kernels.cuda_utils import cuda_is_available
 
 
 ##helper functions for DDP torchrun

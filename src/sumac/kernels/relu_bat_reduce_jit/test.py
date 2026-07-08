@@ -1,6 +1,6 @@
 import torch
 
-from jit_kernel import *
+from .jit_kernel import *
 
 torch.compile(mode='max-autotune')
 def relu_block(A, B):

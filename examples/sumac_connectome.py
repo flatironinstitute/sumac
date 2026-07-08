@@ -3,13 +3,13 @@ import argparse
 import os
 import numpy as np
 import scipy.io as sio
-from data import *
+from sumac.data import *
 from torch.utils.data import DataLoader
 from sumac import sumac 
-from _sumac.dataset import RowBlockDataset, collate_blocks
-from _sumac.eval import eval 
+from sumac.datasets import RowBlockDataset, collate_blocks
+from sumac.eval import eval
 import sys
-from utils import _ensure_nccl_env
+from sumac.utils import _ensure_nccl_env
 
 if __name__ == '__main__':
     #torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True

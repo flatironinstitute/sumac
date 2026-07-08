@@ -18,8 +18,8 @@
 #include <unordered_map>
 #include <vector>
 
-const std::string kernelPath = "../../relu_bat_reduce_jit/kernel_nnz.cu";
-const std::string kernelPath_mixed = "../../relu_bat_reduce_jit/kernel_nnz_mixed.cu";
+const std::string kernelPath = "../../src/sumac/kernels/relu_bat_reduce_jit/kernel_nnz.cu";
+const std::string kernelPath_mixed = "../../src/sumac/kernels/relu_bat_reduce_jit/kernel_nnz_mixed.cu";
 
 static void fail(const char* id, const std::string& msg) {
     mexErrMsgIdAndTxt(id, "%s", msg.c_str());

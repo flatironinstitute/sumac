@@ -1,7 +1,7 @@
 import torch
 import math
 
-from _sumac.cuda_utils import (
+from ..kernels.cuda_utils import (
     cuda_device_count,
     cuda_is_available,
     empty_cache_if_cuda,

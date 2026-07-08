@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import torch
-from _sumac.compile_utils import compile_cuda_kernel
+from ..compile_utils import compile_cuda_kernel
 from torch.utils.cpp_extension import include_paths
 
 DEBUG = False
