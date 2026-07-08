@@ -4,7 +4,7 @@ import time
 import math
 import numpy as np
 from sumac import sumac
-from data import dense_to_sparse
+from sumac.data import dense_to_sparse
 import scipy as sp
 
 def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, seed=0):
@@ -56,10 +56,11 @@ def torch2scipy_svd(S_index, S_value, n, k=16):
     return torch.FloatTensor(A), torch.FloatTensor(B)
 
 
-def run_low_rank_test(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters=300):
+def test_low_rank(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters=300):
     
     print(f"--- Low-Rank Ground Truth Test (m={m}, n={n}, d_true={d_true}, density={target_density}) ---")
     S_index, S_value, m, n = generate_low_rank_data(m, n, d_true, density=target_density, noise_level=0.0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     actual_density = len(S_value) / (m * n)
     print(f"Actual density: {actual_density:.4f} ({len(S_value)} non-zeros)")
@@ -68,6 +69,10 @@ def run_low_rank_test(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, i
 
     #same factor init using SVD 
     A_init, B_init = torch2scipy_svd(S_index, S_value, n, k=d_fit)
+    S_index = S_index.to(device)
+    S_value = S_value.to(device)
+    A_init = A_init.to(device)
+    B_init = B_init.to(device)
     print(A_init.shape, B_init.shape)
     
     for method in methods:
@@ -88,11 +93,15 @@ def run_low_rank_test(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, i
         with torch.no_grad():
             S_pred = torch.relu(A @ B.T)
             # Reconstruct dense S for checking
-            S_dense = torch.zeros(m, n)
-            S_dense[S_index[0], S_index[1]] = S_value
-            mse = F.mse_loss(S_pred.cpu(), S_dense).item()
+            eval_device = S_pred.device
+            S_index_eval = S_index.to(eval_device)
+            S_value_eval = S_value.to(eval_device)
+            S_dense = torch.zeros(m, n, dtype=S_value_eval.dtype, device=eval_device)
+            S_dense[S_index_eval[0], S_index_eval[1]] = S_value_eval
+            mse = F.mse_loss(S_pred, S_dense).item()
             
         print(f"Method {method} completed in {elapsed:.2f}s. Final MSE: {mse:.6f}")
+        assert mse < 0.08, f"{method} final MSE {mse:.6f} is too large."
 
 if __name__ == "__main__":
-    run_low_rank_test()
+    test_low_rank()

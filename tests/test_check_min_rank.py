@@ -255,7 +255,7 @@ if __name__ == "__main__":
             A = csr[best["R"], :][:, best["C"]].toarray()
             best["k_stable"] = np.linalg.matrix_rank(A)
             print(f"\nSubmatrix A[R, C]  ({A.shape[0]}×{A.shape[1]}):")
-            print(f"all positive = {np.all(A > 0)}, minimum = {A.min()}, rank = {best["k_stable"]}") 
+            print(f"all positive = {np.all(A > 0)}, minimum = {A.min()}, rank = {best['k_stable']}") 
         print(best)
 
     # if best["k"] > 1:
