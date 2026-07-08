@@ -2,13 +2,40 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import optuna
 import torch
 
-from _sumac.tuning import autotune_cuda_kernel, relu_bat_c_key
-from relu_batc_jit.api import relu_bat_c_fused
-from relu_batc_tf32_jit.jit_kernel_tf32_sync import launch_relu_batc_mma_sync_tf32
-from relu_batc_tf32_jit.jit_kernel_tf32_wgmma import launch_relu_bat_c_wgmma_tf32_tma
+from _sumac.cuda_utils import cuda_is_available
+
+
+class FallbackReluBatC:
+    def __call__(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+    ) -> torch.Tensor:
+        return relu_bat_c_fallback(A, B, C)
+
+    def resolve_params(self, *args, **kwargs) -> dict:
+        return {}
+
+
+def relu_bat_c_fallback_launcher() -> FallbackReluBatC:
+    return FallbackReluBatC()
+
+
+def autotune_deps():
+    from _sumac.tuning import autotune_cuda_kernel, relu_bat_c_key
+
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "CUDA relu_bat_c kernels require optional dependency 'optuna'. "
+            "Install the CUDA/autotune extras to use custom CUDA kernels."
+        ) from exc
+
+    return autotune_cuda_kernel, relu_bat_c_key, optuna
 
 
 def grid_size(config: dict) -> int:
@@ -239,6 +266,12 @@ def relu_bat_c_fallback(
 
 @lru_cache(maxsize=None)
 def relu_bat_c_cuda_launcher():
+    if not cuda_is_available():
+        return relu_bat_c_fallback_launcher()
+
+    autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
+    from relu_batc_jit.api import relu_bat_c_fused
+
     tune_config = relu_bat_c_fp32_tune_config()
 
     @autotune_cuda_kernel(
@@ -274,6 +307,14 @@ def relu_bat_c_cuda_launcher():
 
 @lru_cache(maxsize=None)
 def relu_bat_c_tf32_sync_launcher(D: int):
+    if not cuda_is_available():
+        return relu_bat_c_fallback_launcher()
+
+    autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
+    from relu_batc_tf32_jit.jit_kernel_tf32_sync import (
+        launch_relu_batc_mma_sync_tf32,
+    )
+
     tune_config = relu_bat_c_tf32_sync_tune_config(D)
 
     @autotune_cuda_kernel(
@@ -310,6 +351,14 @@ def relu_bat_c_tf32_sync_launcher(D: int):
 
 @lru_cache(maxsize=None)
 def relu_bat_c_tf32_wgmma_launcher(D: int):
+    if not cuda_is_available():
+        return relu_bat_c_fallback_launcher()
+
+    autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
+    from relu_batc_tf32_jit.jit_kernel_tf32_wgmma import (
+        launch_relu_bat_c_wgmma_tf32_tma,
+    )
+
     tune_config = relu_bat_c_tf32_wgmma_tune_config(D)
 
     @autotune_cuda_kernel(
@@ -349,7 +398,10 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
 
 
 def select_relu_bat_c_kernel_mode(allow_tf32: bool, device) -> str:
-    if not allow_tf32 or not torch.cuda.is_available():
+    device = torch.device(device)
+    if device.type != "cuda" or not cuda_is_available():
+        return "fallback"
+    if not allow_tf32:
         return "fp32_cuda"
 
     props = torch.cuda.get_device_properties(device)

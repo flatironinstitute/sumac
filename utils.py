@@ -13,6 +13,8 @@ import pickle
 import time
 import numpy as np
 
+from _sumac.cuda_utils import cuda_is_available
+
 
 ##helper functions for DDP torchrun
 def _pick_nccl_ifname():
@@ -37,9 +39,13 @@ def set_seed(seed):
     #os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    if cuda_is_available():
+        torch.cuda.manual_seed(seed)
 
 def memory_stats():
+    if not cuda_is_available():
+        print("CUDA is not available")
+        return
     print(f'allocated memory {torch.cuda.memory_allocated()/1024**2}')
     print(f'reserved memory {torch.cuda.memory_reserved()/1024**2}')
 
@@ -87,4 +93,3 @@ class Logger(object):
             r = best_result[:, 3]
             print(f'   Final Test: {r.mean():.2f} ± {r.std():.2f}')
             return r
-        

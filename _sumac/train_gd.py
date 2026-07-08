@@ -9,6 +9,7 @@ import random
 from torch.nn.utils import clip_grad_norm_
 import contextlib
 
+from _sumac.cuda_utils import cuda_device_count, cuda_is_available, synchronize_if_cuda
 from _sumac.dataset import block_span
 from _sumac.eval import block_loss_and_pred, eval
 
@@ -20,7 +21,7 @@ class TrainConfig:
     epochs: int = 10
     lr: float = 1e-2
     seed: int = 0
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if cuda_is_available() else "cpu"
     shuffle_blocks: bool = False
     batch_blocks: int = 1      # number of blocks per optimizer step ##TODO: multi-gpu check (use 4 for multi)
     num_workers: int = 0
@@ -65,9 +66,9 @@ def make_optimizer(
 ###Helpers for GD_loop
 def select_devices(cfg, device: torch.device):
     """Return list of devices to use (master first). No DDP."""
-    if torch.cuda.is_available() and device.type == "cuda":
-        if torch.cuda.device_count() > 1:
-            return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    if cuda_is_available() and device.type == "cuda":
+        if cuda_device_count() > 1:
+            return [torch.device(f"cuda:{i}") for i in range(cuda_device_count())]
         else:
             return [torch.device(f"cuda:0")]
     return [device]
@@ -168,7 +169,7 @@ def sync_all(devices):
     if devices[0].type == "cuda":
         for dev in devices:
             if dev.type == "cuda":
-                torch.cuda.synchronize(dev)
+                synchronize_if_cuda(dev)
 
 def wait_streams_before_reduce(devices, streams):
     """

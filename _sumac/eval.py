@@ -1,10 +1,33 @@
 import torch
 
+from _sumac.cuda_utils import cuda_is_available, nvtx_range, nvtx_range_pop, nvtx_range_push
 from _sumac.dataset import block_span
-from _sumac.relu_bat_reduce_kernel_helper import relu_bat_reduce_launcher
 
 
-relu_bat_tuned = relu_bat_reduce_launcher()
+relu_bat_tuned = None
+relu_bat_reduce_kernel_mode = None
+
+
+def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
+    global relu_bat_tuned
+    global relu_bat_reduce_kernel_mode
+
+    if not (A.is_cuda and B.is_cuda and cuda_is_available()):
+        if relu_bat_reduce_kernel_mode != "fallback" or relu_bat_tuned is None:
+            from _sumac.relu_bat_reduce_kernel_helper import (
+                relu_bat_reduce_fallback_launcher,
+            )
+
+            relu_bat_tuned = relu_bat_reduce_fallback_launcher()
+            relu_bat_reduce_kernel_mode = "fallback"
+        return relu_bat_tuned
+
+    if relu_bat_reduce_kernel_mode != "cuda" or relu_bat_tuned is None:
+        from _sumac.relu_bat_reduce_kernel_helper import relu_bat_reduce_launcher
+
+        relu_bat_tuned = relu_bat_reduce_launcher()
+        relu_bat_reduce_kernel_mode = "cuda"
+    return relu_bat_tuned
 
 
 @torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
@@ -39,8 +62,9 @@ def block_loss_errz(
     local_r: torch.Tensor,
     cols_all: torch.Tensor,
     vals_all: torch.Tensor,
+    sum_sr: torch.Tensor,
+    sum_sr2: torch.Tensor,
 ):
-    sum_sr, sum_sr2 = relu_bat_tuned(A_block, B) # type: ignore
     vals_all64 = vals_all.to(torch.float64)
     A_obs = A_block[local_r].to(torch.float64)      
     B_obs = B[cols_all].to(torch.float64)           
@@ -208,12 +232,21 @@ def block_loss_and_pred(
 
 #       torch.cuda.profiler.start()
     if errZ_obj:
-        with torch.cuda.nvtx.range("block_loss_errz"):
-            params = relu_bat_tuned.resolve_params(A_block, B)
-            
-            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(A_block, B, local_r, cols_all, vals_all)
+        with nvtx_range("block_loss_errz"):
+            reduce_kernel = get_relu_bat_reduce(A_block, B)
+            reduce_kernel.resolve_params(A_block, B)
+            sum_sr, sum_sr2 = reduce_kernel(A_block, B)
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(
+                A_block,
+                B,
+                local_r,
+                cols_all,
+                vals_all,
+                sum_sr,
+                sum_sr2,
+            )
     else:
-        with torch.cuda.nvtx.range("block_loss_no_errz"):
+        with nvtx_range("block_loss_no_errz"):
             mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)
 #    torch.cuda.profiler.stop()
     return mse_full, sumSr_block, jacc_num_block, errZ_num_block
@@ -245,7 +278,7 @@ def eval(
             edge_idx = edge_idx.to(device).view(-1)
             block_id = int(block_id)
 
-            torch.cuda.nvtx.range_push("block_loss_and_pred")
+            nvtx_range_push("block_loss_and_pred")
             ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
                 A,
                 B,
@@ -259,7 +292,7 @@ def eval(
                 row_indices=row_indices,
                 errZ_obj=errZ_obj
             )
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop()
 
             ssqe += ssqe_b
             sumSr += sumSr_b

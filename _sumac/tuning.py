@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import json
 import os
@@ -6,9 +8,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-import optuna
 import torch
-import triton
+
+
+def _require_optuna():
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "CUDA kernel autotuning requires the optional dependency 'optuna'. "
+            "Install the CUDA/autotune extras to use custom CUDA kernels."
+        ) from exc
+    return optuna
+
+
+def _require_triton():
+    try:
+        import triton
+    except ImportError as exc:
+        raise RuntimeError(
+            "CUDA kernel benchmarking requires the optional dependency 'triton'. "
+            "Install the CUDA/autotune extras to use custom CUDA kernels."
+        ) from exc
+    return triton
 
 
 class JsonConfigStore:
@@ -55,6 +77,7 @@ def _normalize_for_json(x: Any) -> Any:
 
 
 def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
+    triton = _require_triton()
     return float(
         triton.testing.do_bench(
             fn,
@@ -73,7 +96,7 @@ def _brief_exception(exc: Exception) -> str:
 
 
 def _print_trial_pruned(
-    trial: optuna.Trial,
+    trial: Any,
     reason: str,
     params: Dict[str, Any],
     exc: Optional[Exception] = None,
@@ -113,6 +136,7 @@ def autotune_cuda_kernel(
     default_params = {k: v[0] for k, v in configs.items()}
 
     if sampler is None:
+        optuna = _require_optuna()
         sampler = optuna.samplers.TPESampler(seed=0)
 
     disable_default = os.getenv(disable_env_var, "0") == "1"
@@ -214,7 +238,9 @@ def autotune_cuda_kernel(
             return fn(*args, **kwargs, **decision["params"])
 
         wrapper.resolve_decision = resolve_decision
-        wrapper.resolve_params = lambda *args, **kwargs: resolve_decision(*args, **kwargs)["params"]
+        wrapper.resolve_params = (
+            lambda *args, **kwargs: resolve_decision(*args, **kwargs)["params"]
+        )
         wrapper.clear_memo = memo.clear
         return wrapper
 
@@ -232,9 +258,10 @@ def _run_study(
     n_trials: int,
     warmup: int,
     rep: int,
-    sampler: optuna.samplers.BaseSampler,
+    sampler: Any,
     disk_key: str,
 ) -> TuneResult:
+    optuna = _require_optuna()
     static_kwargs = dict(kwargs)
 
     fallback_runtime_ms = float("inf")

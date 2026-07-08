@@ -1,5 +1,13 @@
 import torch
 import math
+
+from _sumac.cuda_utils import (
+    cuda_device_count,
+    cuda_is_available,
+    empty_cache_if_cuda,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
  
 @torch.compile #if we compile this, we can get kernel fusion of the matmuls and clamp. Standalone clamp is expensive and entirely bandwidth bound
 def block_dense(A, B_blk, pinvA_trans):
@@ -40,34 +48,34 @@ def least_squares_update_fast(
     # 1) block setup (matches MATLAB)
     m = A.shape[0]
     n = B.shape[0]
-    torch.cuda.nvtx.range_push("CPU copy and linalg.solve")
+    nvtx_range_push("CPU copy and linalg.solve")
     # ——————————————
     # 3) keep CPU copies of A, B, and compute pseudoinverse on CPU
     device_cpu = torch.device("cpu")
     A_cpu = A.to(device_cpu, copy=False)
     B_cpu = B.to(device_cpu, copy=False)
     pinvA_trans_cpu = torch.linalg.solve(A_cpu.T @ A_cpu, A_cpu.T).T   # shape (m,r)
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop()
     # ——————————————
     # 4) prepare for multi‐GPU and preload factors to device, add non_blocking
-    torch.cuda.nvtx.range_push("multi-GPU setup and preloading factors to device")
-    if multi_gpu and torch.cuda.device_count() > 1:
-        devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    nvtx_range_push("multi-GPU setup and preloading factors to device")
+    if multi_gpu and cuda_device_count() > 1:
+        devices = [torch.device(f"cuda:{i}") for i in range(cuda_device_count())]
     else:
-        dev = torch.device("cuda:0") if torch.cuda.is_available() else device_cpu
+        dev = torch.device("cuda:0") if cuda_is_available() else device_cpu
         devices = [dev]
     A_devs      = [A_cpu.to(dev, non_blocking=True) for dev in devices]
     pinvA_trans_devs  = [pinvA_trans_cpu.to(dev, non_blocking=True) for dev in devices]
     B_devs      = [B_cpu.to(dev, non_blocking=True) for dev in devices] ##OLD
     dB: torch.Tensor  = torch.zeros_like(B_cpu) ##OLD
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop()
     # ——————————————
     # 5) accumulators
     # on-device metric accumulators (avoid .item() in the loop)
     sumSr_devs = [torch.zeros((), device=d, dtype=S_vals.dtype) for d in devices]
     ssqSr_devs = [torch.zeros((), device=d, dtype=S_vals.dtype) for d in devices]
 
-    torch.cuda.nvtx.range_push("compute_block")
+    nvtx_range_push("compute_block")
     # 6) loop over blocks
     for b in range(num_blocks):
         start = b * cols_per_block
@@ -84,19 +92,19 @@ def least_squares_update_fast(
         sumSr_devs[dev_idx] += sumSr_blk
         ssqSr_devs[dev_idx] += ssqSr_blk
 
-        torch.cuda.nvtx.range_push("torch.sparse.mm")
+        nvtx_range_push("torch.sparse.mm")
        # dB_block = torch.sparse.mm(-Sr.transpose(0,1), pinvA_trans_dev) # (block_size, r)
         dB[start:end] = dB_block.to(dB.device) ##OLD
-        torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_pop()
+        nvtx_range_pop()
+    nvtx_range_pop()
     #compute the second term, correction (S - ABt + Sr)[S>0]
-    torch.cuda.nvtx.range_push("compute correction term")
+    nvtx_range_push("compute correction term")
     pred_vals = torch.sum(
         A_cpu[S_idx[0], :] * B_cpu[S_idx[1], :], 
         dim=1
     )
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("clamp and coalesce")
+    nvtx_range_pop()
+    nvtx_range_push("clamp and coalesce")
     Sr_vals = torch.clamp(pred_vals, min=0.0)
     correction_vals = S_vals - pred_vals + Sr_vals
     dZ_pos = torch.sparse_coo_tensor(
@@ -106,17 +114,17 @@ def least_squares_update_fast(
         device=device_cpu,
         dtype=S_vals.dtype
     ).coalesce()
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push("final update")
+    nvtx_range_pop()
+    nvtx_range_push("final update")
     # final update
     dB += torch.sparse.mm(dZ_pos.transpose(0,1), pinvA_trans_cpu)
     assert isinstance(dB, torch.Tensor)
     nextB = B_cpu + dB
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop()
     # ——————————————
     # 8) metrics
     # reduce device accumulators once, avoid .item()
-    torch.cuda.nvtx.range_push("metrics accumulation")
+    nvtx_range_push("metrics accumulation")
     sumSr = sum(t.detach().to(device_cpu) for t in sumSr_devs)
     ssqSr = sum(t.detach().to(device_cpu) for t in ssqSr_devs)
 
@@ -128,7 +136,7 @@ def least_squares_update_fast(
     ssqS = S_norm**2
     ssqe = ssqS + ssqSr - 2*torch.sum(S_vals * Sr_vals)
     rmse  = math.sqrt(ssqe) / (S_norm + 1e-16)
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop()
     # TODO: Added .item() here, confirm no performance implications given the comment above
     return nextB, rmse, jacc.item()
 
@@ -204,10 +212,10 @@ def least_squares_update(
 
     # ——————————————
     # 4) prepare for multi‐GPU and preload factors to device
-    if multi_gpu and torch.cuda.device_count() > 1:
-        devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    if multi_gpu and cuda_device_count() > 1:
+        devices = [torch.device(f"cuda:{i}") for i in range(cuda_device_count())]
     else:
-        dev = torch.device("cuda:0") if torch.cuda.is_available() else device_cpu
+        dev = torch.device("cuda:0") if cuda_is_available() else device_cpu
         devices = [dev]
     A_devs      = [A_cpu.to(dev) for dev in devices]
     pinvA_trans_devs  = [pinvA_trans_cpu.to(dev) for dev in devices]
@@ -256,7 +264,7 @@ def least_squares_update(
         numJ += sp_elem_min.item() #torch.minimum(Sr.cpu(), Sb.cpu()).values().sum().item()
         denJ += sp_elem_max.item() #torch.maximum(Sr.cpu(), Sb.cpu()).values().sum().item()
         del dense_Sr
-        torch.cuda.empty_cache()
+        empty_cache_if_cuda()
 
         # 4) one‐liner sparse residual: Sr·S1 - Sr 
         S1b = torch.sparse_coo_tensor(

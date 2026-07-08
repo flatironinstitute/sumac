@@ -1,17 +1,13 @@
 import torch
 from torch import Tensor
 from _sumac.dataset import StochasticRowBlockDataset
-from _sumac.relu_bat_c_kernel_helper import (
-    relu_bat_c_cuda_launcher,
-    relu_bat_c_tf32_sync_launcher,
-    relu_bat_c_tf32_wgmma_launcher,
-    select_relu_bat_c_kernel_mode,
-)
+from _sumac.cuda_utils import cuda_is_available
+from _sumac.relu_bat_c_kernel_helper import relu_bat_c_fallback_launcher
 
 
-relu_bat_c_tuned = relu_bat_c_cuda_launcher()
-_relu_bat_c_kernel_mode = "fp32_cuda"
-_relu_bat_c_kernel_d = None
+relu_bat_c_tuned = relu_bat_c_fallback_launcher()
+relu_bat_c_kernel_mode = "fallback"
+relu_bat_c_kernel_d = None
 
 
 def configure_kernel_prec(
@@ -21,22 +17,39 @@ def configure_kernel_prec(
     D: int,
 ) -> None:
     global relu_bat_c_tuned
-    global _relu_bat_c_kernel_mode
-    global _relu_bat_c_kernel_d
+    global relu_bat_c_kernel_mode
+    global relu_bat_c_kernel_d
+
+    device = torch.device(device)
+    if device.type != "cuda" or not cuda_is_available():
+        if relu_bat_c_kernel_mode != "fallback":
+            relu_bat_c_tuned = relu_bat_c_fallback_launcher()
+            relu_bat_c_kernel_mode = "fallback"
+            relu_bat_c_kernel_d = D
+        return
+
+    from _sumac.relu_bat_c_kernel_helper import (
+        relu_bat_c_cuda_launcher,
+        relu_bat_c_tf32_sync_launcher,
+        relu_bat_c_tf32_wgmma_launcher,
+        select_relu_bat_c_kernel_mode,
+    )
 
     mode = select_relu_bat_c_kernel_mode(allow_tf32, device)
-    if mode == _relu_bat_c_kernel_mode and D == _relu_bat_c_kernel_d:
+    if mode == relu_bat_c_kernel_mode and D == relu_bat_c_kernel_d:
         return
 
     if mode == "tf32_wgmma":
         relu_bat_c_tuned = relu_bat_c_tf32_wgmma_launcher(D)
     elif mode == "tf32_mma_sync":
         relu_bat_c_tuned = relu_bat_c_tf32_sync_launcher(D)
+    elif mode == "fallback":
+        relu_bat_c_tuned = relu_bat_c_fallback_launcher()
     else:
         relu_bat_c_tuned = relu_bat_c_cuda_launcher()
 
-    _relu_bat_c_kernel_mode = mode
-    _relu_bat_c_kernel_d = D
+    relu_bat_c_kernel_mode = mode
+    relu_bat_c_kernel_d = D
 
 
 
@@ -139,9 +152,12 @@ def update_factor_salsa(
     m_fixed = Factor_fixed.shape[0]
     _, edge_idx, row_indices = dataset[block_id]
 
-    # TODO: NOTE: Unused
-    params = relu_bat_c_tuned.resolve_params(Factor_fixed[row_indices, :], Factor_update, Factor_fixed[row_indices, :])
-    #need to resolve params outside of the compiled region
+    # Need to resolve CUDA autotune params outside of the compiled region.
+    relu_bat_c_tuned.resolve_params(
+        Factor_fixed[row_indices, :],
+        Factor_update,
+        Factor_fixed[row_indices, :],
+    )
 
     nextF, dF = batch_update_single_gpu(
         S_idx_full=S_idx_full,

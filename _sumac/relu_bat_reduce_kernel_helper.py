@@ -1,10 +1,38 @@
 from __future__ import annotations
 
-import optuna
 import torch
 
-from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
-from relu_bat_reduce_jit.api import relu_bat_reduce_fused
+from _sumac.cuda_utils import cuda_is_available
+
+
+class FallbackReluBatReduce:
+    def __call__(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return relu_bat_reduce_fallback(A, B)
+
+    def resolve_params(self, *args, **kwargs) -> dict:
+        return {}
+
+
+def relu_bat_reduce_fallback_launcher() -> FallbackReluBatReduce:
+    return FallbackReluBatReduce()
+
+
+def autotune_deps():
+    from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
+
+    try:
+        import optuna
+    except ImportError as exc:
+        raise RuntimeError(
+            "CUDA relu_bat_reduce kernels require optional dependency 'optuna'. "
+            "Install the CUDA/autotune extras to use custom CUDA kernels."
+        ) from exc
+
+    return autotune_cuda_kernel, relu_bat_reduce_key, optuna
 
 
 def grid_size(config: dict) -> int:
@@ -64,6 +92,12 @@ def relu_bat_reduce_constraints(
 
 
 def relu_bat_reduce_launcher():
+    if not cuda_is_available():
+        return relu_bat_reduce_fallback_launcher()
+
+    autotune_cuda_kernel, relu_bat_reduce_key, optuna = autotune_deps()
+    from relu_bat_reduce_jit.api import relu_bat_reduce_fused
+
     tune_config = relu_bat_reduce_tune_config()
 
     @autotune_cuda_kernel(
