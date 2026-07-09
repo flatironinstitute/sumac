@@ -45,6 +45,16 @@ connectome/
 
 inductor_cache/
 
-*autotune.json
+*autotune*.json
 
 *.mexa64
+
+*.egg-info
+
+*.ncu-rep
+
+*.nsys-rep
+
+*.sqlite
+
+*.txt
