@@ -1,6 +1,7 @@
 import torch 
 import argparse 
 import os
+import pickle
 import numpy as np
 import scipy.io as sio
 from sumac.data import *
@@ -9,7 +10,6 @@ from sumac import sumac
 from sumac.datasets import RowBlockDataset, collate_blocks
 from sumac.eval import eval
 import sys
-from sumac.utils import _ensure_nccl_env
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -20,7 +20,7 @@ if __name__ == '__main__':
     parser.add_argument('--filename', type=str)
     parser.add_argument('--momentum', type=float, default=0.9, help='use momentum to update W and H')
     parser.add_argument('--float64', action='store_true', help='use torch.float64 (default use float32)')
-    parser.add_argument('--mode', type=str, default='SALSA', choices=['ALS','SALSA','GD_sumac', 'GDlatent_sumac', 'GDlatent_prec_sumac'], help='default (sumac): alternating LS')
+    parser.add_argument('--mode', type=str, default='SALSA', choices=['SALSA', 'GD'], help='default (sumac): SALSA')
     parser.add_argument('--learning_rate', type=float, default=1e-2)
     parser.add_argument('--optim', type=str, default='adam', choices=['adam','sgd', 'adamw', 'muon'], help='Optimizer to use for GD')
     parser.add_argument('--eval_interval', type=int, default=None, help='Evaluation interval (default: 100 for GD, 10 for SALSA)')
@@ -29,26 +29,21 @@ if __name__ == '__main__':
     parser.add_argument('--eval_path', type=str)
     parser.add_argument('--eval_save',  action='store_true', help='Save evaluation results to .txt file.')
     parser.add_argument('--allow_tf32', action='store_true', help='allow PyTorch and SUMAC custom kernels to use TF32.')
+    parser.add_argument('--device', type=str, default="cuda" if torch.cuda.is_available() else "cpu", help='training/evaluation device')
     args = parser.parse_args()
     torch.set_float32_matmul_precision('high' if args.allow_tf32 else 'highest')
     
     # log experiment configuration
-    args_dict = vars(args)
-    ngpus = torch.cuda.device_count()
     old_stdout = sys.stdout
     log_file = None
     if not args.eval_only:
-        if args.mode == "GD_sumac":
-            save_dir = "bigrams_GD_errZ"  
-        elif args.mode == "GDlatent_sumac":
-            save_dir = "bigrams_GDlatent_errZ"
-        elif args.mode == "GDlatent_prec_sumac":
-            save_dir = "bigrams_GDlatent_prec_errZ"
+        if args.mode == "GD":
+            save_dir = "bigrams_GD"
         elif args.mode == 'SALSA':
             save_dir = "bigrams_SALSA"
         else:
             save_dir = "bigrams"
-        save_path = f"./{save_dir}/sumac_rank={args.rank}_mom={args.momentum}_seed={args.seed}_iters={args.iters}_ngpus={ngpus}_nblocks={args.num_blocks}_learning_rate={args.learning_rate}_optim={args.optim}"
+        save_path = f"./{save_dir}/sumac_rank={args.rank}_mom={args.momentum}_seed={args.seed}_iters={args.iters}_nblocks={args.num_blocks}_learning_rate={args.learning_rate}_optim={args.optim}"
         if not os.path.exists(save_path):
             os.makedirs(save_path, exist_ok=True)
         # logging
@@ -88,38 +83,28 @@ if __name__ == '__main__':
 
     print(f'm=n={m}, E={len(S_value)}')
    
-    dtype = torch.float64 if args.float64 else torch.float32
     if not args.eval_only:
-        method = args.mode if args.mode in ['ALS', 'SALSA'] else 'GD'
-        GD_latent = args.mode in ['GDlatent_sumac', 'GDlatent_prec_sumac']
-        precond = args.mode == 'GDlatent_prec_sumac'
-        if method == 'GD':
-            _ensure_nccl_env() #for cluster job run
-            print("NCCL_SOCKET_IFNAME=", os.environ.get("NCCL_SOCKET_IFNAME"),
-                " MASTER_ADDR=", os.environ.get("MASTER_ADDR"),
-                " MASTER_PORT=", os.environ.get("MASTER_PORT"))
-
-        opts = {'eval_interval': args.eval_interval} if args.eval_interval is not None else None
         A, B, costs = sumac(
-            S_index,
-            S_value,
-            m=m,
-            n=n,
-            d=args.rank,
-            max_iterate=args.iters,
-            factor_init=True,
+            S_index=S_index,
+            S_value=S_value,
+            shape=(m, n),
+            rank=args.rank,
+            max_iterations=args.iters,
             num_blocks=args.num_blocks,
-            sgd_momentum=args.momentum,
-            method=method,
-            lr=args.learning_rate,
-            save_path=save_path,
-            GD_latent=GD_latent,
-            optim=args.optim,
-            precondition=precond,
-            opts=opts,
+            momentum=args.momentum,
+            method=args.mode,
+            learning_rate=args.learning_rate,
+            optimizer=args.optim,
+            eval_interval=args.eval_interval,
             seed=args.seed,
-            allow_TF32=args.allow_tf32
+            allow_tf32=args.allow_tf32,
+            device=args.device,
         )
+        torch.save([A, B], f"{save_path}/AB.pt")
+        with open(f"{save_path}/cost.pkl", "wb") as f:
+            pickle.dump(costs, f)
+        with open(f"{save_path}/opts.pkl", "wb") as f:
+            pickle.dump(vars(args), f)
 
         eval_device = A.device
         A_eval = A.detach()
@@ -152,7 +137,7 @@ if __name__ == '__main__':
             log_file.close()
 
     else:
-        eval_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        eval_device = torch.device(args.device)
         A, B = torch.load(f"{args.eval_path}/AB.pt", map_location="cpu")
         A_eval = A.detach().to(eval_device)
         B_eval = B.detach().to(eval_device)

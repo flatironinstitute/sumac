@@ -10,6 +10,67 @@ relu_bat_c_kernel_mode = "fallback"
 relu_bat_c_kernel_d = None
 
 
+def refactor(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
+    """
+    Refactor A and B so A @ B.T is unchanged while both factors share singular values.
+    """
+    Qa, Ra = torch.linalg.qr(A, mode="reduced")
+    Qb, Rb = torch.linalg.qr(B, mode="reduced")
+
+    U, S, Vh = torch.linalg.svd(Ra @ Rb.T, full_matrices=False)
+    sqrtS = torch.diag(torch.sqrt(S))
+
+    Ar = Qa @ U @ sqrtS
+    Br = Qb @ Vh.T @ sqrtS
+
+    return Ar, Br
+
+
+def init_salsa_factors(
+    S_index: Tensor,
+    S_value: Tensor,
+    m: int,
+    n: int,
+    d: int,
+    gen: torch.Generator,
+) -> tuple[Tensor, Tensor]:
+    """
+    Initialize with A > 0 and B < 0, then rescale.
+    """
+    print("salsa init...")
+    device = S_value.device
+    dtype = S_value.dtype
+
+    S = torch.sparse_coo_tensor(
+        S_index.to(device=device, dtype=torch.long),
+        S_value,
+        size=(m, n),
+        device=device,
+        dtype=dtype,
+    ).coalesce()
+    R_A = torch.rand((n, d), device=device, dtype=dtype, generator=gen)
+    R_B = torch.rand((m, d), device=device, dtype=dtype, generator=gen)
+    A = torch.sqrt(torch.sparse.mm(S, R_A))
+    B = -torch.sqrt(torch.sparse.mm(S.T, R_B))
+
+    Lij = torch.sum(A[S_index[0], :] * B[S_index[1], :], dim=1)
+
+    ssqS = torch.sum(S_value ** 2)
+    ssqL = torch.sum(Lij ** 2)
+    SdotL = torch.sum(S_value * Lij)
+
+    a = ssqL
+    b = -2.0 * SdotL
+    c = -3.0 * ssqS
+
+    alpha = (-b + torch.sqrt(b**2 - 4 * a * c)) / (2 * a)
+    scale = torch.clamp(torch.sqrt(alpha), 0.0, 1.0)
+    A = scale * A
+    B = scale * B
+
+    return refactor(A, B)
+
+
 def configure_kernel_prec(
     *,
     allow_tf32: bool,

@@ -1,42 +1,12 @@
 import torch 
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import optim
-
-#from torch_sparse import transpose, spmm, spspmm
-#from torch_sparse.tensor import * 
-import argparse 
-import pathlib
-import os
 import random
-import pickle
-import time
 import numpy as np
 
 from .kernels.cuda_utils import cuda_is_available
 
 
-##helper functions for DDP torchrun
-def _pick_nccl_ifname():
-    # keep user override if already set
-    if os.environ.get("NCCL_SOCKET_IFNAME"):
-        return os.environ["NCCL_SOCKET_IFNAME"]
-    # try to pick a real ethernet iface
-    for cand in ("eth0", "eno1", "ens3f0", "ens5f0", "enp134s0"):
-        if os.path.exists(f"/sys/class/net/{cand}"):
-            return cand
-    # fallback: exclude virtual/loopback/IB so NCCL auto-picks a real NIC
-    return "^lo,docker0,virbr0,veth*,ib*"
-
-def _ensure_nccl_env():
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    # If you do NOT use InfiniBand on this cluster, leave this enabled:
-    os.environ.setdefault("NCCL_IB_DISABLE", "1")
-    os.environ["NCCL_SOCKET_IFNAME"] = _pick_nccl_ifname()
-
 def set_seed(seed):
     random.seed(seed)
-    #os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if cuda_is_available():

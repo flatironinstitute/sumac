@@ -79,13 +79,16 @@ def test_low_rank(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters
         print(f"\n>> Running SUMAC with method: {method}")
         t_start = time.time()
         A, B, costs = sumac(
-            S_index, S_value, m=m, n=n, d=d_fit, 
-            max_iterate=iters, 
-            method=method, 
-            lr=1e-1 if method == "GD" else 0.1, # adjust lr for GD
+            S_index=S_index,
+            S_value=S_value,
+            shape=(m, n),
+            rank=d_fit,
+            max_iterations=iters,
+            method=method,
+            learning_rate=1e-1 if method == "GD" else 0.1, # adjust lr for GD
             num_blocks=2,
-            multi_gpu=torch.cuda.device_count() > 1,
-            A_init=A_init, B_init=B_init
+            A_init=A_init,
+            B_init=B_init,
         )
         elapsed = time.time() - t_start
         

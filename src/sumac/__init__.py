@@ -1,3 +1,3 @@
-from .sumac import sumac
+from .sumac import OptimizerName, SumacMethod, sumac
 
-__all__ = ["sumac"]
+__all__ = ["sumac", "SumacMethod", "OptimizerName"]
