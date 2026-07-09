@@ -11,7 +11,7 @@ from sumac.kernels.relu_bat_reduce import (
     relu_bat_reduce_tune_config,
 )
 from sumac.kernels.tuning import autotune_cuda_kernel, relu_bat_reduce_key
-from sumac.kernels.relu_bat_reduce_jit.custom_op import relu_bat_reduce_fused_op
+from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 
 
 def torch_impl(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -103,7 +103,7 @@ def relu_bat_reduce_fp32_launcher(
         BK: int,
         num_ms: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return relu_bat_reduce_fused_op(B, A, BM, BK, num_ms)
+        return relu_bat_reduce_fused(B, A, BM, BK, num_ms)
 
     return relu_bat_reduce_fp32_cuda
 
@@ -140,7 +140,7 @@ def bench_one(
         (A, B),
         fp32_params,
     )
-    out_fp32 = relu_bat_reduce_fused_op(
+    out_fp32 = relu_bat_reduce_fused(
         B,
         A,
         fp32_params["BM"],
@@ -160,7 +160,7 @@ def bench_one(
         return torch_impl(A, B)
 
     def fp32_run():
-        return relu_bat_reduce_fused_op(
+        return relu_bat_reduce_fused(
             B,
             A,
             fp32_params["BM"],
