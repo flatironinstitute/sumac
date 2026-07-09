@@ -43,7 +43,7 @@ def resolve_sumac_device(
     )
 
 
-def sumac(
+def sumac_factorize(
     *,
     S_index: Tensor,
     S_value: Tensor,
@@ -69,7 +69,7 @@ def sumac(
     allow_tf32: bool = False,
 ):
     """
-    PyTorch version of sumac algorithm driver function.
+    Factorize a sparse nonnegative matrix with SUMAC.
 
     Args:
       S_index: sparse index of shape (2, nnz)

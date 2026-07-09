@@ -6,28 +6,82 @@ We offer two major routines:
 - Stochastic Alternating Least Squares Algorithm (sumac-SALSA): update factors alternately using random subsets of the other factor and its associated subset of edges.
 - Gradient descent (sumac-GD): update factors $A, B$ simultaneously via minibatch gradient descent
 
-### Setup and Overview
-Create a Python virtual environment (for Python > 3.10) and activate it
-```
+### Installation
+
+Create and activate a Python virtual environment. SUMAC currently requires Python 3.10 or newer.
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
 ```
-Then install the dependencies
+
+For a CPU-only install, install the CPU PyTorch wheel first, then install SUMAC:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e .
 ```
-pip install -r requirements.txt
+
+For a CUDA install, install a PyTorch wheel matching your CUDA runtime, then install SUMAC with the CUDA extra. For example, for CUDA 12.8:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -e ".[cuda]"
 ```
+
+For development, install the developer extra:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+or, for CUDA development:
+
+```bash
+python -m pip install -e ".[cuda,dev]"
+```
+
+The developer extra includes `pytest` for tests and `build` for creating source and wheel distributions:
+
+```bash
+python -m build
+```
+
 The package source is under ```src/sumac```, with examples in ```examples```.
+
+### Python API
+
+The main entry point is `sumac.sumac_factorize`. Inputs are passed by keyword. The sparse matrix is represented in COO form by `S_index` with shape `(2, nnz)` and `S_value` with shape `(nnz,)`.
+
+```python
+from sumac import sumac_factorize
+
+A, B, history = sumac_factorize(
+    S_index=S_index,
+    S_value=S_value,
+    shape=(m, n),
+    rank=16,
+    method="SALSA",
+    max_iterations=100,
+    num_blocks=100,
+    device="cuda",
+)
+```
+
+The return values are the learned factors `A` and `B`, with shapes `(m, rank)` and `(n, rank)`, plus a metric history collected during training. If `device` is omitted, SUMAC infers it from `S_index` and `S_value`; if `device` is provided, the sparse input tensors are moved there before training.
+
+Common options are `method="SALSA"` or `method="GD"`, `rank`, `max_iterations`, `num_blocks`, `dtype`, `seed`, `momentum`, `learning_rate`, `optimizer`, `eval_interval`, `verbose`, and `allow_tf32`.
 
 ### Application: Fly Connectome Data
 The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. The data is available at ```/mnt/home/lsaul/Datasets/flywire/connectome.txt```
 
 To run sumac-SALSA
-```
-python sumac_connectome.py --mode SALSA
+```bash
+python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode SALSA
 ```
 To run sumac-GD
-```
-python sumac_connectome.py --mode GD
+```bash
+python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode GD
 ```
 
 ### Exploration: Lower bound of the rank (embedding dimension)

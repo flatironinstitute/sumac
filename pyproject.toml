@@ -19,6 +19,10 @@ cuda = [
     "optuna>=4.8,<5",
     "triton",
 ]
+dev = [
+    "build>=1.2,<2",
+    "pytest>=8,<9",
+]
 
 [tool.setuptools]
 include-package-data = true

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import time
 import math
 import numpy as np
-from sumac import sumac
+from sumac import sumac_factorize
 from sumac.data import dense_to_sparse
 import scipy as sp
 
@@ -78,7 +78,7 @@ def test_low_rank(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters
     for method in methods:
         print(f"\n>> Running SUMAC with method: {method}")
         t_start = time.time()
-        A, B, costs = sumac(
+        A, B, costs = sumac_factorize(
             S_index=S_index,
             S_value=S_value,
             shape=(m, n),

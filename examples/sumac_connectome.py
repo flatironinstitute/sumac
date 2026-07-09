@@ -6,7 +6,7 @@ import numpy as np
 import scipy.io as sio
 from sumac.data import *
 from torch.utils.data import DataLoader
-from sumac import sumac 
+from sumac import sumac_factorize
 from sumac.datasets import RowBlockDataset, collate_blocks
 from sumac.eval import eval
 import sys
@@ -82,7 +82,7 @@ if __name__ == '__main__':
         S_index -= 1
 
     if not args.eval_only:
-        A, B, costs = sumac(
+        A, B, costs = sumac_factorize(
             S_index=S_index,
             S_value=S_value,
             shape=(m, n),
