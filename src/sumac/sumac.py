@@ -130,7 +130,7 @@ def sumac(
     if opts['display']:
         nnz = len(S_value)
         print(f"\n  Input to SUMAC is {m}×{n} sparse matrix with {nnz} nonzeros.")
-        print(f"  Attempting to complete with rank {d}.")
+        print(f"  Attempting matrix completion with rank {d}.")
         print(f"  Available GPUs: {cuda_device_count()}.")
         print("  Options:")
         for k, v in opts.items():
@@ -198,7 +198,7 @@ def sumac(
         torch.save([A_ori,B_ori], f"{save_path}/AB.pt")
         pickle.dump(costs, open(f"{save_path}/cost.pkl", "wb"))
         pickle.dump(opts, open(f"{save_path}/opts.pkl", "wb"))
-    print(f'finish for {max_iterate} iterations!')
+    print(f'SUMAC finished after {max_iterate} iterations.')
     return A_ori, B_ori, costs
 
 
