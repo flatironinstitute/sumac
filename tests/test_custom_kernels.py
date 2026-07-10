@@ -65,8 +65,8 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("TF32 MMA sync kernel requires SM80 or newer")
 
-    from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_sync import (
-        launch_relu_batc_mma_sync_tf32,
+    from sumac.kernels.relu_batc_tf32_jit.api import (
+        relu_bat_c_tf32_mma_sync,
     )
 
     torch.manual_seed(D)
@@ -76,7 +76,7 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
 
-    result = launch_relu_batc_mma_sync_tf32(
+    result = relu_bat_c_tf32_mma_sync(
         A,
         B,
         C,
@@ -155,8 +155,8 @@ def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("TF32 WGMMA kernel requires SM90")
 
-    from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_wgmma import (
-        launch_relu_bat_c_wgmma_tf32_tma,
+    from sumac.kernels.relu_batc_tf32_jit.api import (
+        relu_bat_c_tf32_wgmma,
     )
 
     torch.manual_seed(D)
@@ -166,7 +166,7 @@ def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
 
-    result = launch_relu_bat_c_wgmma_tf32_tma(A, B, C, **params)
+    result = relu_bat_c_tf32_wgmma(A, B, C, **params)
     reference = relu_bat_c_tf32_reference(A, B, C)
 
     torch.cuda.synchronize()

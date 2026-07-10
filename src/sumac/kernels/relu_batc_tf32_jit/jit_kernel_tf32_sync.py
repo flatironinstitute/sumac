@@ -205,7 +205,7 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
     )
 
 
-def _launch_relu_batc_mma_sync_tf32_impl(
+def relu_bat_c_tf32_mma_sync_impl(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -317,77 +317,3 @@ def _launch_relu_batc_mma_sync_tf32_impl(
     )
 
     return Y[:, :D]
-
-
-@torch.library.custom_op(
-    "sumac::relu_bat_c_tf32_mma_sync",
-    mutates_args=(),
-    device_types="cuda",
-)
-def relu_bat_c_tf32_mma_sync_op(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BN: int,
-    M_TILES: int,
-    num_stages: int,
-) -> torch.Tensor:
-    return _launch_relu_batc_mma_sync_tf32_impl(
-        A,
-        B,
-        C,
-        BM=BM,
-        BN=BN,
-        M_TILES=M_TILES,
-        num_stages=num_stages,
-    )
-
-
-@relu_bat_c_tf32_mma_sync_op.register_fake
-def _(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BN: int,
-    M_TILES: int,
-    num_stages: int,
-) -> torch.Tensor:
-    if A.dim() != 2 or B.dim() != 2 or C.dim() != 2:
-        raise RuntimeError("expected rank-2 tensors")
-    M = B.shape[0]
-    D = A.shape[1]
-    if D < 1:
-        raise RuntimeError("D must be >= 1")
-    if BN % 8 != 0:
-        raise RuntimeError("BN must be divisible by MMA_N=8")
-    if num_stages < 1:
-        raise RuntimeError("num_stages must be >= 1")
-
-    warp_m_rows = M_TILES * 16
-    if BM % warp_m_rows != 0:
-        raise RuntimeError("BM must be divisible by M_TILES * 16")
-    D_pad = _round_up(D, 8)
-    return A.new_empty_strided((M, D), (D_pad, 1))
-
-
-def launch_relu_batc_mma_sync_tf32(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    *,
-    BM: int,
-    BN: int,
-    M_TILES: int,
-    num_stages: int = 2,
-) -> torch.Tensor:
-    return relu_bat_c_tf32_mma_sync_op(
-        A,
-        B,
-        C,
-        BM,
-        BN,
-        M_TILES,
-        num_stages,
-    )

@@ -14,7 +14,7 @@ DEFAULT_DYNAMIC_SMEM_LIMIT_BYTES = 48 * 1024
 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
 
 _KERNEL_MARKER = "// KERNEL_START"
-_KERNEL_PATH_WGMMA_TF32_TMA = Path(__file__).with_name(
+_KERNEL_PATH_WGMMA_TF32 = Path(__file__).with_name(
     "kernel_wgmma_tf32_tma.cu"
 )
 
@@ -194,7 +194,7 @@ def _compile_or_print_full_error(
 
 
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_wgmma_tf32_tma(
+def get_relu_bat_c_kernel_wgmma_tf32(
     BM: int,
     BN: int,
     D_k_f: int,
@@ -212,7 +212,7 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
     kernel_name = _kernel_name_wgmma_tf32()
     pack_kernel_name = _pack_kernel_name_wgmma_tf32()
     header_code, kernel_source, kernel_source_start_line = _split_kernel_file(
-        _KERNEL_PATH_WGMMA_TF32_TMA
+        _KERNEL_PATH_WGMMA_TF32
     )
 
     header_code = (
@@ -230,11 +230,11 @@ def get_relu_bat_c_kernel_wgmma_tf32_tma(
             D_y_f=D_y_f,
         )
         + "\n"
-        + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
+        + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32}"\n'
         + header_code
         + "\n"
         + f'#line {kernel_source_start_line} '
-          f'"{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
+          f'"{_KERNEL_PATH_WGMMA_TF32}"\n'
     )
 
     if DEBUG:
@@ -276,7 +276,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
     kernel_name = _kernel_name_wgmma_tf32()
     pack_kernel_name = _pack_kernel_name_wgmma_tf32()
     header_code, kernel_source, kernel_source_start_line = _split_kernel_file(
-        _KERNEL_PATH_WGMMA_TF32_TMA
+        _KERNEL_PATH_WGMMA_TF32
     )
 
     header_code = (
@@ -294,11 +294,11 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
             D_y_f=D_y_f,
         )
         + "\n"
-        + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
+        + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32}"\n'
         + header_code
         + "\n"
         + f'#line {kernel_source_start_line} '
-          f'"{_KERNEL_PATH_WGMMA_TF32_TMA}"\n'
+          f'"{_KERNEL_PATH_WGMMA_TF32}"\n'
     )
 
     if DEBUG:
@@ -321,7 +321,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
     )
 
 
-def _launch_relu_bat_c_wgmma_tf32_tma_impl(
+def relu_bat_c_tf32_wgmma_impl(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -427,7 +427,7 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
             ],
         )
 
-    kernel = get_relu_bat_c_kernel_wgmma_tf32_tma(
+    kernel = get_relu_bat_c_kernel_wgmma_tf32(
         BM,
         BN,
         D_k_pad,
@@ -466,104 +466,3 @@ def _launch_relu_bat_c_wgmma_tf32_tma_impl(
     )
 
     return Y[:, :D]
-
-
-@torch.library.custom_op(
-    "sumac::relu_bat_c_tf32_wgmma_tma",
-    mutates_args=(),
-    device_types="cuda",
-)
-def relu_bat_c_tf32_wgmma_tma_op(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BN: int,
-    WGMMA_S_N: int,
-    WGMMA_Y_N: int,
-    num_stages: int,
-    wgmma_mode: str,
-) -> torch.Tensor:
-    return _launch_relu_bat_c_wgmma_tf32_tma_impl(
-        A,
-        B,
-        C,
-        BM=BM,
-        BN=BN,
-        WGMMA_S_N=WGMMA_S_N,
-        WGMMA_Y_N=WGMMA_Y_N,
-        num_stages=num_stages,
-        wgmma_mode=wgmma_mode,
-    )
-
-
-@relu_bat_c_tf32_wgmma_tma_op.register_fake
-def _(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    BM: int,
-    BN: int,
-    WGMMA_S_N: int,
-    WGMMA_Y_N: int,
-    num_stages: int,
-    wgmma_mode: str,
-) -> torch.Tensor:
-    if A.dim() != 2 or B.dim() != 2 or C.dim() != 2:
-        raise RuntimeError("expected rank-2 tensors")
-    M = B.shape[0]
-    D = A.shape[1]
-    if D < 1:
-        raise RuntimeError("D must be >= 1")
-    if WGMMA_S_N not in (16, 32, 64, 128):
-        raise RuntimeError("WGMMA_S_N must be one of 16, 32, 64, or 128")
-    if WGMMA_Y_N not in (16, 32, 64, 128):
-        raise RuntimeError("WGMMA_Y_N must be one of 16, 32, 64, or 128")
-    if BN % WGMMA_S_N != 0:
-        raise RuntimeError("BN must be divisible by WGMMA_S_N")
-    if num_stages not in (1, 2, 3):
-        raise RuntimeError("num_stages must be 1, 2, or 3")
-    if wgmma_mode not in ("RS", "SS"):
-        raise RuntimeError("wgmma_mode must be 'RS' or 'SS'")
-    if BM % 64 != 0:
-        raise RuntimeError("BM must be divisible by 64")
-
-    compute_warpgroups_per_block = BM // 64
-    if compute_warpgroups_per_block < 1:
-        raise RuntimeError("BM must cover at least one warpgroup")
-    if (compute_warpgroups_per_block + 1) * 128 > 1024:
-        raise RuntimeError("A CTA cannot contain more than 1024 threads")
-    D_y_pad = _round_up(D, WGMMA_Y_N)
-    return A.new_empty_strided((M, D), (D_y_pad, 1))
-
-
-def launch_relu_bat_c_wgmma_tf32_tma(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    *,
-    BM: int,
-    BN: int,
-    WGMMA_N: int = 16,
-    WGMMA_S_N: int | None = None,
-    WGMMA_Y_N: int | None = None,
-    num_stages: int = 2,
-    wgmma_mode: str = "RS",
-) -> torch.Tensor:
-    if WGMMA_S_N is None:
-        WGMMA_S_N = WGMMA_N
-    if WGMMA_Y_N is None:
-        WGMMA_Y_N = WGMMA_N
-    wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
-
-    return relu_bat_c_tf32_wgmma_tma_op(
-        A,
-        B,
-        C,
-        BM,
-        BN,
-        WGMMA_S_N,
-        WGMMA_Y_N,
-        num_stages,
-        wgmma_mode,
-    )

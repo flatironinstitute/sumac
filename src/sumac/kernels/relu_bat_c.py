@@ -311,8 +311,8 @@ def relu_bat_c_tf32_sync_launcher(D: int):
         return relu_bat_c_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
-    from .relu_batc_tf32_jit.jit_kernel_tf32_sync import (
-        launch_relu_batc_mma_sync_tf32,
+    from .relu_batc_tf32_jit.api import (
+        relu_bat_c_tf32_mma_sync,
     )
 
     tune_config = relu_bat_c_tf32_sync_tune_config(D)
@@ -336,7 +336,7 @@ def relu_bat_c_tf32_sync_launcher(D: int):
         M_TILES: int,
         num_stages: int,
     ) -> torch.Tensor:
-        return launch_relu_batc_mma_sync_tf32(
+        return relu_bat_c_tf32_mma_sync(
             A,
             B,
             C,
@@ -355,8 +355,8 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
         return relu_bat_c_fallback_launcher()
 
     autotune_cuda_kernel, relu_bat_c_key, optuna = autotune_deps()
-    from .relu_batc_tf32_jit.jit_kernel_tf32_wgmma import (
-        launch_relu_bat_c_wgmma_tf32_tma,
+    from .relu_batc_tf32_jit.api import (
+        relu_bat_c_tf32_wgmma,
     )
 
     tune_config = relu_bat_c_tf32_wgmma_tune_config(D)
@@ -382,7 +382,7 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
         num_stages: int,
         wgmma_mode: str,
     ) -> torch.Tensor:
-        return launch_relu_bat_c_wgmma_tf32_tma(
+        return relu_bat_c_tf32_wgmma(
             A,
             B,
             C,

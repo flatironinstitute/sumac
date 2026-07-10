@@ -17,8 +17,10 @@ from sumac.kernels.relu_bat_c import (
 )
 from sumac.kernels.tuning import autotune_cuda_kernel, relu_bat_c_key
 from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused_op
-from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_sync import launch_relu_batc_mma_sync_tf32
-from sumac.kernels.relu_batc_tf32_jit.jit_kernel_tf32_wgmma import launch_relu_bat_c_wgmma_tf32_tma
+from sumac.kernels.relu_batc_tf32_jit.api import (
+    relu_bat_c_tf32_mma_sync,
+    relu_bat_c_tf32_wgmma,
+)
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def torch_impl(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
@@ -151,7 +153,7 @@ def relu_bat_c_tf32_sync_launcher(
         M_TILES: int,
         num_stages: int,
     ) -> torch.Tensor:
-        return launch_relu_batc_mma_sync_tf32(
+        return relu_bat_c_tf32_mma_sync(
             A,
             B,
             C,
@@ -195,7 +197,7 @@ def relu_bat_c_tf32_wgmma_launcher(
         num_stages: int,
         wgmma_mode: str,
     ) -> torch.Tensor:
-        return launch_relu_bat_c_wgmma_tf32_tma(
+        return relu_bat_c_tf32_wgmma(
             A,
             B,
             C,
@@ -266,7 +268,7 @@ def bench_one(
         C,
     )
     tf32_mma_sync_params = tf32_mma_sync_decision["params"]
-    out_tf32_mma_sync = launch_relu_batc_mma_sync_tf32(
+    out_tf32_mma_sync = relu_bat_c_tf32_mma_sync(
         A,
         B,
         C,
@@ -280,7 +282,7 @@ def bench_one(
     if relu_bat_c_wgmma_tuned is not None:
         wgmma_decision = relu_bat_c_wgmma_tuned.resolve_decision(A, B, C)
         wgmma_params = wgmma_decision["params"]
-        out_wgmma = launch_relu_bat_c_wgmma_tf32_tma(A, B, C, **wgmma_params)
+        out_wgmma = relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params)
         err_wgmma = (out_wgmma - ref).abs().max().item()
 
 
@@ -321,10 +323,10 @@ def bench_one(
         )
 
     def tf32_mma_sync_run():
-        return launch_relu_batc_mma_sync_tf32(A, B, C, **tf32_mma_sync_params)
+        return relu_bat_c_tf32_mma_sync(A, B, C, **tf32_mma_sync_params)
 
     def wgmma_run():
-        return launch_relu_bat_c_wgmma_tf32_tma(A, B, C, **wgmma_params)
+        return relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params)
 
     torch.cuda.synchronize()
 
