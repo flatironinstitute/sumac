@@ -12,8 +12,8 @@
 #include <unordered_map>
 #include <vector>
 
-const std::string kernelPath = "../../relu_batc_jit/kernel.cu";
-const std::string kernelPath_mixed = "../../relu_batc_jit/kernel_mixed.cu";
+const std::string kernelPath = "../../src/sumac/kernels/relu_batc_jit/kernel.cu";
+const std::string kernelPath_mixed = "../../src/sumac/kernels/relu_batc_jit/kernel_mixed.cu";
 
 static void fail(const char* id, const std::string& msg) {
     mexErrMsgIdAndTxt(id, "%s", msg.c_str());

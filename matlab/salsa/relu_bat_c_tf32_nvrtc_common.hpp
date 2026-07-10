@@ -26,9 +26,9 @@ namespace relu_bat_c_tf32_nvrtc {
 static constexpr int kPackThreads = 256;
 static constexpr int kDefaultDynamicSmemLimitBytes = 48 * 1024;
 static constexpr const char* kMmaSyncKernelPath =
-    "../../relu_batc_tf32_jit/kernel_mma_sync_tf32.cu";
+    "../../src/sumac/kernels/relu_batc_tf32_jit/kernel_mma_sync_tf32.cu";
 static constexpr const char* kWgmmaKernelPath =
-    "../../relu_batc_tf32_jit/kernel_wgmma_tf32_tma.cu";
+    "../../src/sumac/kernels/relu_batc_tf32_jit/kernel_wgmma_tf32_tma.cu";
 
 enum class Tf32Mode {
     MmaSync,

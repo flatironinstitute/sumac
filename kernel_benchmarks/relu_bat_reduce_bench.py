@@ -5,13 +5,18 @@ import optuna
 import torch
 import triton
 
-from _sumac.relu_bat_reduce_kernel_helper import (
+from sumac.kernels.relu_bat_reduce import (
     grid_size as _grid_size,
     relu_bat_reduce_constraints,
     relu_bat_reduce_tune_config,
 )
-from _sumac.tuning import autotune_cuda_kernel, relu_bat_reduce_key
-from relu_bat_reduce_jit.custom_op import relu_bat_reduce_fused_op
+from sumac.kernels.tuning import (
+    AUTOTUNE_MODES,
+    autotune_cuda_kernel,
+    kernel_autotune_options,
+    relu_bat_reduce_key,
+)
+from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 
 
 def torch_impl(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -50,7 +55,7 @@ def _require_valid_params(
         return
     raise RuntimeError(
         f"{name} resolved invalid autotune params {params}. "
-        "Remove the corresponding autotune cache or set KERNEL_AUTOTUNE_FORCE=1."
+        "Remove the corresponding autotune cache or rerun with autotune='force'."
     )
 
 
@@ -80,8 +85,8 @@ def print_perf_summary(result: dict) -> None:
 @lru_cache(maxsize=None)
 def relu_bat_reduce_fp32_launcher(
     n_trials: int,
-    warmup: int,
-    rep: int,
+    warmup_ms: int,
+    rep_ms: int,
 ):
     tune_config = relu_bat_reduce_tune_config()
     n_trials = max(n_trials, _grid_size(tune_config))
@@ -92,8 +97,8 @@ def relu_bat_reduce_fp32_launcher(
         constraint_fn=relu_bat_reduce_constraints,
         cache_path="relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
         n_trials=n_trials,
-        warmup=warmup,
-        rep=rep,
+        warmup=warmup_ms,
+        rep=rep_ms,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
     )
     def relu_bat_reduce_fp32_cuda(
@@ -103,7 +108,7 @@ def relu_bat_reduce_fp32_launcher(
         BK: int,
         num_ms: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return relu_bat_reduce_fused_op(B, A, BM, BK, num_ms)
+        return relu_bat_reduce_fused(B, A, BM, BK, num_ms)
 
     return relu_bat_reduce_fp32_cuda
 
@@ -115,11 +120,11 @@ def bench_one(
     D: int,
     dtype=torch.float32,
     device="cuda",
-    wm_iters=0,
-    iters=1,
+    warmup_ms=0,
+    rep_ms=1,
     tune_trials=200,
-    tune_warmup_iters=1,
-    tune_iters=5,
+    tune_warmup_ms=1,
+    tune_rep_ms=5,
 ):
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
@@ -128,8 +133,8 @@ def bench_one(
 
     fp32_tuned = relu_bat_reduce_fp32_launcher(
         tune_trials,
-        tune_warmup_iters,
-        tune_iters,
+        tune_warmup_ms,
+        tune_rep_ms,
     )
 
     fp32_decision = fp32_tuned.resolve_decision(A, B)
@@ -140,7 +145,7 @@ def bench_one(
         (A, B),
         fp32_params,
     )
-    out_fp32 = relu_bat_reduce_fused_op(
+    out_fp32 = relu_bat_reduce_fused(
         B,
         A,
         fp32_params["BM"],
@@ -160,7 +165,7 @@ def bench_one(
         return torch_impl(A, B)
 
     def fp32_run():
-        return relu_bat_reduce_fused_op(
+        return relu_bat_reduce_fused(
             B,
             A,
             fp32_params["BM"],
@@ -170,8 +175,8 @@ def bench_one(
 
     torch.cuda.synchronize()
 
-    t_torch = triton.testing.do_bench(torch_run, warmup=wm_iters, rep=iters)
-    t_fp32 = triton.testing.do_bench(fp32_run, warmup=wm_iters, rep=iters)
+    t_torch = triton.testing.do_bench(torch_run, warmup=warmup_ms, rep=rep_ms)
+    t_fp32 = triton.testing.do_bench(fp32_run, warmup=warmup_ms, rep=rep_ms)
 
     return {
         "M": M,
@@ -193,50 +198,54 @@ if __name__ == "__main__":
         description="sum(ReLU(B A.T)) reduce kernel benchmark"
     )
     parser.add_argument(
-        "--warmup-iters",
+        "--warmup-ms",
         type=int,
         default=5,
-        help="Number of benchmark warmup iterations",
+        help="Benchmark warmup duration in milliseconds",
     )
     parser.add_argument(
-        "--iters",
+        "--rep-ms",
         type=int,
         default=20,
-        help="Number of benchmark iterations",
+        help="Benchmark measurement duration in milliseconds",
     )
     parser.add_argument(
-        "--tune-trials",
-        type=int,
-        default=200,
-        help="Number of autotuning trials",
+        "--autotune",
+        type=str,
+        default="cache",
+        choices=tuple(mode for mode in AUTOTUNE_MODES if mode != "fallback"),
+        help="CUDA kernel autotuning mode for the kernel benchmark",
     )
     parser.add_argument(
-        "--tune-warmup-iters",
-        type=int,
-        default=1,
-        help="Number of autotuning warmup iterations",
+        "--autotune-cache-dir",
+        "--autotune_cache_dir",
+        type=str,
+        default=None,
+        help="Directory for SUMAC kernel autotune cache files",
     )
     parser.add_argument(
-        "--tune-iters",
-        type=int,
-        default=5,
-        help="Number of autotuning benchmark iterations",
+        "--autotune-verbose",
+        "--autotune_verbose",
+        action="store_true",
+        help="Print CUDA kernel autotuning decisions and pruned trials",
     )
     args = parser.parse_args()
 
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
-    for D in (16,32,64,128,256):
-        result = bench_one(
-            M=288768,
-            N=1408,
-            D=D,
-            dtype=torch.float32,
-            wm_iters=args.warmup_iters,
-            iters=args.iters,
-            tune_trials=args.tune_trials,
-            tune_warmup_iters=args.tune_warmup_iters,
-            tune_iters=args.tune_iters,
-        )
-        print_perf_summary(result)
+    with kernel_autotune_options(
+        mode=args.autotune,
+        cache_dir=args.autotune_cache_dir,
+        verbose=args.autotune_verbose,
+    ):
+        for D in (16,32,64,128,256):
+            result = bench_one(
+                M=288768,
+                N=1408,
+                D=D,
+                dtype=torch.float32,
+                warmup_ms=args.warmup_ms,
+                rep_ms=args.rep_ms,
+            )
+            print_perf_summary(result)

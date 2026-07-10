@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sumac"
+version = "0.1.0"
+description = "Subzero matrix completion for sparse data analysis"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy>=2.0,<3",
+    "scipy>=1.13,<2",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "optuna>=4.8,<5",
+    "triton",
+]
+dev = [
+    "build>=1.2,<2",
+    "pytest>=8,<9",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = [
+    "sumac*",
+]
+
+[tool.setuptools.package-data]
+"sumac.kernels.relu_batc_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
+"sumac.kernels.relu_bat_reduce_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
+"sumac.kernels.relu_batc_tf32_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]

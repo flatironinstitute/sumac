@@ -2,41 +2,86 @@
 
 Python implementation of subzero matrix completion, a rectified linear factorization of a sparse matrix $S \in \mathbb R^{m \times n}$ as $S = \text{ReLU}(A B^{\top})$ such that $A, B \in \mathbb R^{m \times d}, d \ll \min(m,n)$.
 
-We offer three major routines (all of which support CPU/Single GPU/Multi-GPU):
-- Gradient descent (sumac-GD): update factors $A, B$ simultaneously via minibatch gradient descent (loss aligned with sumac-ALS)
-- Alternating Least Squares (sumac-ALS): update factors $A,B$ alternatively by solving least squares, together with an auxiliary variable $Z$ where $\min_{Z, A, B} || Z - A B^{\top} ||_F^2, S = \text{ReLU}(Z)$
-- Stochastic Alternating Least Squares Algorithm (sumac-SALSA): similar to ALS to update factors alternatively, but only use a random subset of the other factor (and its associated subset of edges). Preferred to ALS for faster convergence in large $S$.
+We offer two major routines:
+- Stochastic Alternating Least Squares Algorithm (sumac-SALSA): update factors alternately using random subsets of the other factor and its associated subset of edges.
+- Gradient descent (sumac-GD): update factors $A, B$ simultaneously via minibatch gradient descent
 
-### Setup and Overview
-Create a Python virtual environment (for Python > 3.10) and activate it
-```
+### Installation
+
+Create and activate a Python virtual environment. SUMAC currently requires Python 3.10 or newer.
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
 ```
-Then install the dependencies
+
+For a CPU-only install, install the CPU PyTorch wheel first, then install SUMAC:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e .
 ```
-pip install -r requirements.txt
+
+For a CUDA install, install a PyTorch wheel matching your CUDA runtime, then install SUMAC with the CUDA extra. For example, for CUDA 12.8:
+
+```bash
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -e ".[cuda]"
 ```
-The driver code is in ```sumac.py```, which routines and helper functions in ```_sumac```. 
+
+For development, install the developer extra:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+or, for CUDA development:
+
+```bash
+python -m pip install -e ".[cuda,dev]"
+```
+
+The developer extra includes `pytest` for tests and `build` for creating source and wheel distributions:
+
+```bash
+python -m build
+```
+
+The package source is under ```src/sumac```, with examples in ```examples```.
+
+### Python API
+
+The main entry point is `sumac.sumac_factorize`. Inputs are passed by keyword. The sparse matrix is represented in COO form by `S_index` with shape `(2, nnz)` and `S_value` with shape `(nnz,)`.
+
+```python
+from sumac import sumac_factorize
+
+A, B, history = sumac_factorize(
+    S_index=S_index,
+    S_value=S_value,
+    shape=(m, n),
+    rank=16,
+    method="SALSA",
+    max_iterations=100,
+    num_blocks=100,
+    device="cuda",
+)
+```
+
+The return values are the learned factors `A` and `B`, with shapes `(m, rank)` and `(n, rank)`, plus a metric history collected during training. If `device` is omitted, SUMAC infers it from `S_index` and `S_value`; if `device` is provided, the sparse input tensors are moved there before training.
+
+Common options are `method="SALSA"` or `method="GD"`, `rank`, `max_iterations`, `num_blocks`, `dtype`, `seed`, `momentum`, `learning_rate`, `optimizer`, `eval_interval`, `verbose`, and `allow_tf32`. CUDA kernel autotuning can be controlled with `autotune="cache"`, `"force"`, `"disable"`, or `"fallback"`; cached tuning results are stored under `$XDG_CACHE_HOME/sumac` by default, or `~/.cache/sumac` if `XDG_CACHE_HOME` is unset. Use `autotune_cache_dir` to override this location and `autotune_verbose=True` to print tuning decisions.
 
 ### Application: Fly Connectome Data
 The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. The data is available at ```/mnt/home/lsaul/Datasets/flywire/connectome.txt```
 
-To run sumac-ALS
-```
-python sumac_connectome.py --mode ALS
-```
 To run sumac-SALSA
+```bash
+python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode SALSA
 ```
-python sumac_connectome.py --mode SALSA
-```
-To run sumac-GD with loss aligned as ALS/SALSA
-```
-python sumac_connectome.py --mode GDlatent_sumac
-```
-To run sumac-GD with loss aligned as ALS and preconditioning
-```
-python sumac_connectome.py --mode GDlatent_prec_sumac
+To run sumac-GD
+```bash
+python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode GD
 ```
 
 ### Exploration: Lower bound of the rank (embedding dimension)
