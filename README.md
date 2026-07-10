@@ -70,7 +70,7 @@ A, B, history = sumac_factorize(
 
 The return values are the learned factors `A` and `B`, with shapes `(m, rank)` and `(n, rank)`, plus a metric history collected during training. If `device` is omitted, SUMAC infers it from `S_index` and `S_value`; if `device` is provided, the sparse input tensors are moved there before training.
 
-Common options are `method="SALSA"` or `method="GD"`, `rank`, `max_iterations`, `num_blocks`, `dtype`, `seed`, `momentum`, `learning_rate`, `optimizer`, `eval_interval`, `verbose`, and `allow_tf32`.
+Common options are `method="SALSA"` or `method="GD"`, `rank`, `max_iterations`, `num_blocks`, `dtype`, `seed`, `momentum`, `learning_rate`, `optimizer`, `eval_interval`, `verbose`, and `allow_tf32`. CUDA kernel autotuning can be controlled with `autotune="cache"`, `"force"`, `"disable"`, or `"fallback"`; cached tuning results are stored under `$XDG_CACHE_HOME/sumac` by default, or `~/.cache/sumac` if `XDG_CACHE_HOME` is unset. Use `autotune_cache_dir` to override this location and `autotune_verbose=True` to print tuning decisions.
 
 ### Application: Fly Connectome Data
 The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. The data is available at ```/mnt/home/lsaul/Datasets/flywire/connectome.txt```

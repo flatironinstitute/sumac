@@ -3,11 +3,13 @@ from torch import Tensor
 from ..datasets import StochasticRowBlockDataset
 from ..kernels.cuda_utils import cuda_is_available
 from ..kernels.relu_bat_c import relu_bat_c_fallback_launcher
+from ..kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
 
 
 relu_bat_c_tuned = relu_bat_c_fallback_launcher()
 relu_bat_c_kernel_mode = "fallback"
 relu_bat_c_kernel_d = None
+relu_bat_c_kernel_autotune_options: KernelAutotuneOptions | None = None
 
 
 def refactor(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
@@ -80,13 +82,16 @@ def configure_kernel_prec(
     global relu_bat_c_tuned
     global relu_bat_c_kernel_mode
     global relu_bat_c_kernel_d
+    global relu_bat_c_kernel_autotune_options
 
+    autotune_options = active_kernel_autotune_options()
     device = torch.device(device)
     if device.type != "cuda" or not cuda_is_available():
         if relu_bat_c_kernel_mode != "fallback":
             relu_bat_c_tuned = relu_bat_c_fallback_launcher()
             relu_bat_c_kernel_mode = "fallback"
             relu_bat_c_kernel_d = D
+            relu_bat_c_kernel_autotune_options = autotune_options
         return
 
     from ..kernels.relu_bat_c import (
@@ -97,20 +102,25 @@ def configure_kernel_prec(
     )
 
     mode = select_relu_bat_c_kernel_mode(allow_tf32, device)
-    if mode == relu_bat_c_kernel_mode and D == relu_bat_c_kernel_d:
+    if (
+        mode == relu_bat_c_kernel_mode and
+        D == relu_bat_c_kernel_d and
+        autotune_options == relu_bat_c_kernel_autotune_options
+    ):
         return
 
     if mode == "tf32_wgmma":
-        relu_bat_c_tuned = relu_bat_c_tf32_wgmma_launcher(D)
+        relu_bat_c_tuned = relu_bat_c_tf32_wgmma_launcher(D, autotune_options)
     elif mode == "tf32_mma_sync":
-        relu_bat_c_tuned = relu_bat_c_tf32_sync_launcher(D)
+        relu_bat_c_tuned = relu_bat_c_tf32_sync_launcher(D, autotune_options)
     elif mode == "fallback":
         relu_bat_c_tuned = relu_bat_c_fallback_launcher()
     else:
-        relu_bat_c_tuned = relu_bat_c_cuda_launcher()
+        relu_bat_c_tuned = relu_bat_c_cuda_launcher(autotune_options)
 
     relu_bat_c_kernel_mode = mode
     relu_bat_c_kernel_d = D
+    relu_bat_c_kernel_autotune_options = autotune_options
 
 
 

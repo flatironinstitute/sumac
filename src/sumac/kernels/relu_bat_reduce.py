@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from .cuda_utils import cuda_is_available
+from .tuning import KernelAutotuneOptions
 
 
 class FallbackReluBatReduce:
@@ -91,7 +94,10 @@ def relu_bat_reduce_constraints(
     return smem_bytes <= props.shared_memory_per_block
 
 
-def relu_bat_reduce_launcher():
+@lru_cache(maxsize=None)
+def relu_bat_reduce_launcher(
+    autotune_options: KernelAutotuneOptions | None = None,
+):
     if not cuda_is_available():
         return relu_bat_reduce_fallback_launcher()
 
@@ -110,6 +116,7 @@ def relu_bat_reduce_launcher():
         warmup=1,
         rep=5,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
+        autotune_options=autotune_options,
     )
     def relu_bat_reduce(
         A: torch.Tensor,

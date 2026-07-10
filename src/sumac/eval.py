@@ -1,17 +1,21 @@
 import torch
 
 from .kernels.cuda_utils import cuda_is_available, nvtx_range, nvtx_range_pop, nvtx_range_push
+from .kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
 from .datasets import block_span
 
 
 relu_bat_tuned = None
 relu_bat_reduce_kernel_mode = None
+relu_bat_reduce_kernel_autotune_options: KernelAutotuneOptions | None = None
 
 
 def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
     global relu_bat_tuned
     global relu_bat_reduce_kernel_mode
+    global relu_bat_reduce_kernel_autotune_options
 
+    autotune_options = active_kernel_autotune_options()
     if not (A.is_cuda and B.is_cuda and cuda_is_available()):
         if relu_bat_reduce_kernel_mode != "fallback" or relu_bat_tuned is None:
             from .kernels.relu_bat_reduce import (
@@ -20,13 +24,19 @@ def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
 
             relu_bat_tuned = relu_bat_reduce_fallback_launcher()
             relu_bat_reduce_kernel_mode = "fallback"
+            relu_bat_reduce_kernel_autotune_options = autotune_options
         return relu_bat_tuned
 
-    if relu_bat_reduce_kernel_mode != "cuda" or relu_bat_tuned is None:
+    if (
+        relu_bat_reduce_kernel_mode != "cuda" or
+        relu_bat_tuned is None or
+        autotune_options != relu_bat_reduce_kernel_autotune_options
+    ):
         from .kernels.relu_bat_reduce import relu_bat_reduce_launcher
 
-        relu_bat_tuned = relu_bat_reduce_launcher()
+        relu_bat_tuned = relu_bat_reduce_launcher(autotune_options)
         relu_bat_reduce_kernel_mode = "cuda"
+        relu_bat_reduce_kernel_autotune_options = autotune_options
     return relu_bat_tuned
 
 

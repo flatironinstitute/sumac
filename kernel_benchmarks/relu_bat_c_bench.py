@@ -15,7 +15,12 @@ from sumac.kernels.relu_bat_c import (
     relu_bat_c_tf32_wgmma_constraints,
     relu_bat_c_tf32_wgmma_tune_config,
 )
-from sumac.kernels.tuning import autotune_cuda_kernel, relu_bat_c_key
+from sumac.kernels.tuning import (
+    AUTOTUNE_MODES,
+    autotune_cuda_kernel,
+    kernel_autotune_options,
+    relu_bat_c_key,
+)
 from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused_op
 from sumac.kernels.relu_batc_tf32_jit.api import (
     relu_bat_c_tf32_mma_sync,
@@ -96,8 +101,8 @@ def print_perf_summary(result: dict) -> None:
 @lru_cache(maxsize=None)
 def relu_bat_c_fp32_cuda_launcher(
     n_trials: int,
-    warmup: int,
-    rep: int,
+    warmup_ms: int,
+    rep_ms: int,
 ):
     tune_config = relu_bat_c_fp32_tune_config()
     n_trials = max(n_trials, _grid_size(tune_config))
@@ -108,8 +113,8 @@ def relu_bat_c_fp32_cuda_launcher(
         constraint_fn=relu_bat_c_fp32_constraints,
         cache_path="relu_bat_c_jit_autotune.json",
         n_trials=n_trials,
-        warmup=warmup,
-        rep=rep,
+        warmup=warmup_ms,
+        rep=rep_ms,
         sampler=optuna.samplers.GridSampler(search_space=tune_config)
     )
     def relu_bat_c_fp32_cuda(
@@ -129,8 +134,8 @@ def relu_bat_c_fp32_cuda_launcher(
 def relu_bat_c_tf32_sync_launcher(
     D: int,
     n_trials: int,
-    warmup: int,
-    rep: int,
+    warmup_ms: int,
+    rep_ms: int,
 ):
     tune_config = relu_bat_c_tf32_sync_tune_config(D)
 
@@ -140,8 +145,8 @@ def relu_bat_c_tf32_sync_launcher(
         constraint_fn=relu_bat_c_tf32_sync_constraints,
         cache_path="relu_bat_c_tf32_mma_autotune.json",
         n_trials=n_trials,
-        warmup=warmup,
-        rep=rep,
+        warmup=warmup_ms,
+        rep=rep_ms,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
     )
     def relu_bat_c_tf32_sync_cuda(
@@ -170,8 +175,8 @@ def relu_bat_c_tf32_sync_launcher(
 def relu_bat_c_tf32_wgmma_launcher(
     D: int,
     n_trials: int,
-    warmup: int,
-    rep: int,
+    warmup_ms: int,
+    rep_ms: int,
 ):
     tune_config = relu_bat_c_tf32_wgmma_tune_config(D)
     n_trials = max(n_trials, _grid_size(tune_config))
@@ -182,8 +187,8 @@ def relu_bat_c_tf32_wgmma_launcher(
         constraint_fn=relu_bat_c_tf32_wgmma_constraints,
         cache_path="relu_bat_c_tf32_wgmma_mode_autotune.json",
         n_trials=n_trials,
-        warmup=warmup,
-        rep=rep,
+        warmup=warmup_ms,
+        rep=rep_ms,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
     )
     def relu_bat_c_tf32_wgmma_cuda(
@@ -219,11 +224,11 @@ def bench_one(
     D: int,
     dtype=torch.float32,
     device="cuda",
-    wm_iters=0,
-    iters=1,
+    warmup_ms=0,
+    rep_ms=1,
     tune_trials=200,
-    tune_warmup_iters=1,
-    tune_iters=5,
+    tune_warmup_ms=1,
+    tune_rep_ms=5,
 ):
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
@@ -232,22 +237,22 @@ def bench_one(
     ref = torch_impl(A, B, C)
     relu_bat_c_fp32_tuned = relu_bat_c_fp32_cuda_launcher(
         tune_trials,
-        tune_warmup_iters,
-        tune_iters,
+        tune_warmup_ms,
+        tune_rep_ms,
     )
     relu_bat_c_tf32_mma_sync_tuned = relu_bat_c_tf32_sync_launcher(
         D,
         tune_trials,
-        tune_warmup_iters,
-        tune_iters,
+        tune_warmup_ms,
+        tune_rep_ms,
     )
     relu_bat_c_wgmma_tuned = None
     if relu_bat_c_tf32_wgmma_available(A):
         relu_bat_c_wgmma_tuned = relu_bat_c_tf32_wgmma_launcher(
             D,
             tune_trials,
-            tune_warmup_iters,
-            tune_iters,
+            tune_warmup_ms,
+            tune_rep_ms,
         )
 
     fp32_cuda_decision = relu_bat_c_fp32_tuned.resolve_decision(A, B, C)
@@ -330,20 +335,24 @@ def bench_one(
 
     torch.cuda.synchronize()
 
-    t_torch   = triton.testing.do_bench(torch_run, warmup=wm_iters, rep=iters)
+    t_torch   = triton.testing.do_bench(torch_run, warmup=warmup_ms, rep=rep_ms)
     t_fp32_cuda = triton.testing.do_bench(
         fp32_cuda_run,
-        warmup=wm_iters,
-        rep=iters,
+        warmup=warmup_ms,
+        rep=rep_ms,
     )
     t_tf32_mma_sync = triton.testing.do_bench(
         tf32_mma_sync_run,
-        warmup=wm_iters,
-        rep=iters,
+        warmup=warmup_ms,
+        rep=rep_ms,
     )
     t_wgmma = None
     if wgmma_params is not None:
-        t_wgmma = triton.testing.do_bench(wgmma_run, warmup=wm_iters, rep=iters)
+        t_wgmma = triton.testing.do_bench(
+            wgmma_run,
+            warmup=warmup_ms,
+            rep=rep_ms,
+        )
 
     return {
         "M": M, "N": N, "D": D, "dtype": str(dtype).replace("torch.", ""),
@@ -382,60 +391,85 @@ def bench_one(
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="ReLU(B A.T)C Kernel benchmark")
-    parser.add_argument("--warmup-iters", type=int, default=5,
-                        help="Number of warmup iterations")
-    parser.add_argument("--iters", type=int, default=20,
-                        help="Number of benchmark iterations")
+    parser.add_argument("--warmup-ms", type=int, default=5,
+                        help="Benchmark warmup duration in milliseconds")
+    parser.add_argument("--rep-ms", type=int, default=20,
+                        help="Benchmark measurement duration in milliseconds")
+    parser.add_argument(
+        "--autotune",
+        type=str,
+        default="cache",
+        choices=tuple(mode for mode in AUTOTUNE_MODES if mode != "fallback"),
+        help="CUDA kernel autotuning mode for the kernel benchmark",
+    )
+    parser.add_argument(
+        "--autotune-cache-dir",
+        "--autotune_cache_dir",
+        type=str,
+        default=None,
+        help="Directory for SUMAC kernel autotune cache files",
+    )
+    parser.add_argument(
+        "--autotune-verbose",
+        "--autotune_verbose",
+        action="store_true",
+        help="Print CUDA kernel autotuning decisions and pruned trials",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
     torch.set_float32_matmul_precision('high')
     assert torch.cuda.is_available()
 
-    r = bench_one(
-        M=250000,
-        N=2500,
-        D=16,
-        dtype=torch.float32,
-        wm_iters=args.warmup_iters,
-        iters=args.iters,
-    )
-    print_perf_summary(r)
-    r = bench_one(
-        M=250000,
-        N=2500,
-        D=32,
-        dtype=torch.float32,
-        wm_iters=args.warmup_iters,
-        iters=args.iters,
-    )
-    print_perf_summary(r)
-    r = bench_one(
-        M=250000,
-        N=2500,
-        D=64,
-        dtype=torch.float32,
-        wm_iters=args.warmup_iters,
-        iters=args.iters,
-    )
-    print_perf_summary(r)
-    r = bench_one(
-        M=250000,
-        N=2500,
-        D=128,
-        dtype=torch.float32,
-        wm_iters=args.warmup_iters,
-        iters=args.iters,
-    )
-    print_perf_summary(r)
-    r = bench_one(
-        M=250000, 
-        N=2500, 
-        D=256, 
-        dtype=torch.float32, 
-        wm_iters=args.warmup_iters, 
-        iters=args.iters,
-    )
-    print_perf_summary(r)
+    with kernel_autotune_options(
+        mode=args.autotune,
+        cache_dir=args.autotune_cache_dir,
+        verbose=args.autotune_verbose,
+    ):
+        r = bench_one(
+            M=250000,
+            N=2500,
+            D=16,
+            dtype=torch.float32,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+        )
+        print_perf_summary(r)
+        r = bench_one(
+            M=250000,
+            N=2500,
+            D=32,
+            dtype=torch.float32,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+        )
+        print_perf_summary(r)
+        r = bench_one(
+            M=250000,
+            N=2500,
+            D=64,
+            dtype=torch.float32,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+        )
+        print_perf_summary(r)
+        r = bench_one(
+            M=250000,
+            N=2500,
+            D=128,
+            dtype=torch.float32,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+        )
+        print_perf_summary(r)
+        r = bench_one(
+            M=250000,
+            N=2500,
+            D=256,
+            dtype=torch.float32,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+        )
+        print_perf_summary(r)
     
     

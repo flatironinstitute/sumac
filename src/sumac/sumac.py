@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import math
 import time
 import random
+from pathlib import Path
 from .data import prune_zero_rows_cols
 from typing import Literal
 
@@ -16,6 +17,12 @@ from .kernels.cuda_utils import (
 from .datasets import collate_blocks, StochasticRowBlockDataset
 from .training.gd import TrainConfig, make_optimizer, apply_clip_and_step
 from .training.salsa import configure_kernel_prec, init_salsa_factors, update_factor_salsa
+from .kernels.tuning import (
+    AutotuneMode,
+    default_kernel_autotune_cache_dir,
+    kernel_autotune_options,
+    normalize_autotune_mode,
+)
 from .eval import block_loss_and_pred, eval
 
 SumacMethod = Literal["SALSA", "GD"]
@@ -67,6 +74,9 @@ def sumac_factorize(
     A_init: Tensor | None = None,
     B_init: Tensor | None = None,
     allow_tf32: bool = False,
+    autotune: AutotuneMode = "cache",
+    autotune_cache_dir: str | Path | None = None,
+    autotune_verbose: bool = False,
 ):
     """
     Factorize a sparse nonnegative matrix with SUMAC.
@@ -83,12 +93,16 @@ def sumac_factorize(
       optimizer args: adam_, muon_
       A_init, B_init: allow user-specified factor initialization
       allow_tf32: If true, allow TF32 matmuls and SALSA TF32 relu_bat_c kernels
+      autotune: "cache", "force", "disable", or "fallback"
+      autotune_cache_dir: directory for kernel autotune JSON files
+      autotune_verbose: print kernel autotune decisions
     """
 
     if method not in SUMAC_METHODS:
         raise ValueError(f"method must be one of {SUMAC_METHODS}, got {method!r}")
     if optimizer not in OPTIMIZER_NAMES:
         raise ValueError(f"optimizer must be one of {OPTIMIZER_NAMES}, got {optimizer!r}")
+    autotune = normalize_autotune_mode(autotune)
     m, n = shape
 
     training_device = resolve_sumac_device(S_index, S_value, device)
@@ -115,6 +129,13 @@ def sumac_factorize(
         'optimizer': optimizer,
         'allow_tf32': allow_tf32,
         'device': str(training_device),
+        'autotune': autotune,
+        'autotune_cache_dir': str(
+            autotune_cache_dir
+            if autotune_cache_dir is not None
+            else default_kernel_autotune_cache_dir()
+        ),
+        'autotune_verbose': autotune_verbose,
     }
 
     torch.set_float32_matmul_precision('high' if allow_tf32 else 'highest')
@@ -154,37 +175,42 @@ def sumac_factorize(
 
     # call the core SUMAC loop 
     nvtx_range_push("core SUMAC loop")
-    if method == 'GD':
-        cfg = TrainConfig(
-            rank,
-            num_blocks=num_blocks,
-            epochs=max_iterations,
-            lr=learning_rate,
-            optimizer=optimizer,
-            momentum=momentum,
-            adam_betas=adam_betas,
-            adam_eps=adam_eps,
-            muon_momentum=muon_momentum,
-            eval_interval=eval_interval,
-            device=training_device,
-        )
-        A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, gen, A_init, B_init)
-    elif method == 'SALSA':
-        A, B, costs = salsa_loop(
-            S_index,
-            S_value,
-            m_eff,
-            n_eff,
-            rank,
-            options,
-            learning_rate,
-            gen,
-            training_device,
-            A_init,
-            B_init,
-        )
-    else:
-        raise NotImplementedError("method must be chosen from GD or SALSA")
+    with kernel_autotune_options(
+        mode=autotune,
+        cache_dir=autotune_cache_dir,
+        verbose=autotune_verbose,
+    ):
+        if method == 'GD':
+            cfg = TrainConfig(
+                rank,
+                num_blocks=num_blocks,
+                epochs=max_iterations,
+                lr=learning_rate,
+                optimizer=optimizer,
+                momentum=momentum,
+                adam_betas=adam_betas,
+                adam_eps=adam_eps,
+                muon_momentum=muon_momentum,
+                eval_interval=eval_interval,
+                device=training_device,
+            )
+            A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, gen, A_init, B_init)
+        elif method == 'SALSA':
+            A, B, costs = salsa_loop(
+                S_index,
+                S_value,
+                m_eff,
+                n_eff,
+                rank,
+                options,
+                learning_rate,
+                gen,
+                training_device,
+                A_init,
+                B_init,
+            )
+        else:
+            raise NotImplementedError("method must be chosen from GD or SALSA")
     nvtx_range_pop()
     # NEW: restore zero rows and columns
     if row_mask is not None:

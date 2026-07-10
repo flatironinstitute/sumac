@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import os
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Literal
 
 import torch
 
@@ -34,7 +37,7 @@ def _require_triton():
 
 
 class JsonConfigStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str | Path):
         self.path = Path(path)
         self._lock = threading.Lock()
         self._cache = self._load()
@@ -48,6 +51,7 @@ class JsonConfigStore:
             return {}
 
     def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(self._cache, indent=2, sort_keys=True))
         tmp.replace(self.path)
@@ -100,7 +104,10 @@ def _print_trial_pruned(
     reason: str,
     params: Dict[str, Any],
     exc: Optional[Exception] = None,
+    verbose: bool = False,
 ) -> None:
+    if not verbose:
+        return
     message = f"[Trial {trial.number}] pruned: {reason}; params={params}"
     if exc is not None:
         message += f"; error={_brief_exception(exc)}"
@@ -109,9 +116,79 @@ def _print_trial_pruned(
 
 @dataclass(frozen=True)
 class TuneResult:
-    mode: str 
+    mode: str
     params: Dict[str, Any]
     runtime_ms: float
+
+
+AutotuneMode = Literal["cache", "force", "disable", "fallback"]
+AUTOTUNE_MODES: tuple[AutotuneMode, ...] = (
+    "cache",
+    "force",
+    "disable",
+    "fallback",
+)
+
+
+@dataclass(frozen=True)
+class KernelAutotuneOptions:
+    mode: AutotuneMode = "cache"
+    cache_dir: Path | None = None
+    cache_dir_key: str | None = None
+    verbose: bool = False
+    session_id: int = 0
+
+
+AUTOTUNE_SESSION_IDS = itertools.count(1)
+
+ACTIVE_AUTOTUNE_OPTIONS: ContextVar[KernelAutotuneOptions] = ContextVar(
+    "ACTIVE_AUTOTUNE_OPTIONS",
+    default=KernelAutotuneOptions(),
+)
+
+
+def normalize_autotune_mode(mode: str) -> AutotuneMode:
+    if mode not in AUTOTUNE_MODES:
+        raise ValueError(f"autotune must be one of {AUTOTUNE_MODES}, got {mode!r}")
+    return mode
+
+
+def default_kernel_autotune_cache_dir() -> Path:
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return Path(xdg_cache_home) / "sumac"
+    return Path.home() / ".cache" / "sumac"
+
+
+def active_kernel_autotune_options() -> KernelAutotuneOptions:
+    return ACTIVE_AUTOTUNE_OPTIONS.get()
+
+
+@contextmanager
+def kernel_autotune_options(
+    *,
+    mode: str = "cache",
+    cache_dir: str | Path | None = None,
+    verbose: bool = False,
+):
+    normalized_mode = normalize_autotune_mode(mode)
+    resolved_cache_dir = (
+        default_kernel_autotune_cache_dir()
+        if cache_dir is None
+        else Path(cache_dir)
+    )
+    options = KernelAutotuneOptions(
+        mode=normalized_mode,
+        cache_dir=resolved_cache_dir,
+        cache_dir_key=str(resolved_cache_dir),
+        verbose=verbose,
+        session_id=next(AUTOTUNE_SESSION_IDS) if normalized_mode == "force" else 0,
+    )
+    token = ACTIVE_AUTOTUNE_OPTIONS.set(options)
+    try:
+        yield options
+    finally:
+        ACTIVE_AUTOTUNE_OPTIONS.reset(token)
 
 
 def autotune_cuda_kernel(
@@ -125,67 +202,95 @@ def autotune_cuda_kernel(
     warmup=25,
     rep=100,
     sampler=None,
-    force_env_var="KERNEL_AUTOTUNE_FORCE",
-    disable_env_var="KERNEL_AUTOTUNE_DISABLE",
-    verbose_env_var="KERNEL_AUTOTUNE_VERBOSE",
-    force_fallback_env_var="KERNEL_AUTOTUNE_FORCE_FALLBACK",
-    disable_fallback_env_var="KERNEL_AUTOTUNE_DISABLE_FALLBACK",
+    autotune_options: KernelAutotuneOptions | None = None,
 ):
-    store = JsonConfigStore(cache_path)
     memo: Dict[Any, Dict[str, Any]] = {}
     default_params = {k: v[0] for k, v in configs.items()}
+    cache_path_obj = Path(cache_path)
+    cache_path_key = str(cache_path_obj)
+    cache_path_is_absolute = cache_path_obj.is_absolute()
+    fixed_options = autotune_options
+    fixed_cache_file = None
+    fixed_store = None
+    if fixed_options is not None and fixed_options.mode not in ("disable", "fallback"):
+        fixed_cache_file = (
+            cache_path_obj
+            if cache_path_is_absolute
+            else (fixed_options.cache_dir or default_kernel_autotune_cache_dir()) / cache_path_obj
+        )
+        fixed_store = JsonConfigStore(fixed_cache_file)
 
     if sampler is None:
         optuna = _require_optuna()
         sampler = optuna.samplers.TPESampler(seed=0)
 
-    disable_default = os.getenv(disable_env_var, "0") == "1"
-    force_default = os.getenv(force_env_var, "0") == "1"
-    verbose_default = os.getenv(verbose_env_var, "0") == "1"
-    force_fallback_default = os.getenv(force_fallback_env_var, "0") == "1"
-    disable_fallback_default = os.getenv(disable_fallback_env_var, "0") == "1"
-
     def decorator(fn):
         def resolve_decision(*args, **kwargs) -> Dict[str, Any]:
-            mem_key = key_fn(*args, **kwargs)
+            options = fixed_options or active_kernel_autotune_options()
 
-            if force_fallback_default:
+            if options.mode == "fallback":
                 if fallback_fn is None:
                     raise ValueError(
-                        f"{force_fallback_env_var}=1 but no fallback_fn was provided"
+                        f"autotune='fallback' was requested for {fn.__name__}, "
+                        "but no fallback_fn was provided"
                     )
                 decision = {
                     "mode": "fallback",
                     "params": dict(default_params),
                     "runtime_ms": float("inf"),
                 }
-                memo[mem_key] = decision
                 return decision
 
-            if disable_default:
+            mem_key = key_fn(*args, **kwargs)
+            if fixed_options is not None:
+                memo_key = mem_key
+            else:
+                cache_dir_key = options.cache_dir_key
+                if cache_dir_key is None:
+                    cache_dir_key = str(
+                        options.cache_dir or default_kernel_autotune_cache_dir()
+                    )
+                memo_key = (
+                    cache_path_key if cache_path_is_absolute else cache_dir_key,
+                    cache_path_key,
+                    options.mode,
+                    options.session_id,
+                    mem_key,
+                )
+
+            decision = memo.get(memo_key)
+            if decision is not None:
+                return decision
+
+            if options.mode == "disable":
                 decision = {
                     "mode": "cuda",
                     "params": dict(default_params),
                     "runtime_ms": float("inf"),
                 }
-                memo[mem_key] = decision
+                memo[memo_key] = decision
                 return decision
 
-            decision = None if force_default else memo.get(mem_key)
-            if decision is not None:
-                return decision
+            if fixed_options is not None:
+                store = fixed_store
+            else:
+                cache_file = (
+                    cache_path_obj
+                    if cache_path_is_absolute
+                    else (options.cache_dir or default_kernel_autotune_cache_dir()) / cache_path_obj
+                )
+                store = JsonConfigStore(cache_file)
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
-            payload = None if force_default else store.get(disk_key)
+            payload = None if options.mode == "force" else store.get(disk_key)
             if payload is not None:
-               
-                memo[mem_key] = payload
+                memo[memo_key] = payload
                 return payload
 
             result = _run_study(
                 fn=fn,
-                fallback_fn=None if disable_fallback_default else fallback_fn,
+                fallback_fn=fallback_fn,
                 constraint_fn=constraint_fn,
                 args=args,
                 kwargs=kwargs,
@@ -195,6 +300,7 @@ def autotune_cuda_kernel(
                 rep=rep,
                 sampler=sampler,
                 disk_key=disk_key,
+                verbose=options.verbose,
             )
 
             decision = {
@@ -202,7 +308,7 @@ def autotune_cuda_kernel(
                 "params": result.params,
                 "runtime_ms": result.runtime_ms,
             }
-            memo[mem_key] = decision
+            memo[memo_key] = decision
 
             store.put(
                 disk_key,
@@ -214,7 +320,7 @@ def autotune_cuda_kernel(
                 },
             )
 
-            if verbose_default:
+            if options.verbose:
                 print(
                     f"[autotune:{fn.__name__}] tuned key={mem_key} "
                     f"mode={result.mode} params={result.params} "
@@ -260,6 +366,7 @@ def _run_study(
     rep: int,
     sampler: Any,
     disk_key: str,
+    verbose: bool,
 ) -> TuneResult:
     optuna = _require_optuna()
     static_kwargs = dict(kwargs)
@@ -277,7 +384,8 @@ def _run_study(
                 rep=rep,
             )
         except Exception as e:
-            print(f"[fallback] Error: {e}")
+            if verbose:
+                print(f"[fallback] Error: {e}")
             fallback_runtime_ms = float("inf")
 
     def objective(trial: optuna.Trial) -> float:
@@ -296,11 +404,17 @@ def _run_study(
                     "constraint_fn error",
                     params,
                     e,
+                    verbose=verbose,
                 )
                 raise optuna.TrialPruned() from e
 
             if not constraint_ok:
-                _print_trial_pruned(trial, "constraint rejected config", params)
+                _print_trial_pruned(
+                    trial,
+                    "constraint rejected config",
+                    params,
+                    verbose=verbose,
+                )
                 raise optuna.TrialPruned()
 
         def run():
@@ -314,6 +428,7 @@ def _run_study(
                 "jit compile or kernel launch failure",
                 params,
                 e,
+                verbose=verbose,
             )
             raise optuna.TrialPruned() from e
 
@@ -325,6 +440,7 @@ def _run_study(
                 "runtime failure after warmup launch",
                 params,
                 e,
+                verbose=verbose,
             )
             raise optuna.TrialPruned() from e
 
@@ -337,18 +453,26 @@ def _run_study(
                 "runtime or benchmark failure",
                 params,
                 e,
+                verbose=verbose,
             )
             raise optuna.TrialPruned() from e
 
         return runtime_ms
 
     study_name = f"{fn.__module__}.{fn.__qualname__}:{disk_key}"
-    study = optuna.create_study(
-        study_name=study_name,
-        direction="minimize",
-        sampler=sampler,
-    )
-    study.optimize(objective, n_trials=n_trials)
+    previous_optuna_verbosity = optuna.logging.get_verbosity()
+    if not verbose:
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    try:
+        study = optuna.create_study(
+            study_name=study_name,
+            direction="minimize",
+            sampler=sampler,
+        )
+        study.optimize(objective, n_trials=n_trials)
+    finally:
+        if not verbose:
+            optuna.logging.set_verbosity(previous_optuna_verbosity)
 
     best = study.best_trial
     best_cuda_runtime_ms = float(best.user_attrs["runtime_ms"])
@@ -405,10 +529,3 @@ def relu_bat_reduce_key(
         int(M),
         int(D),
     )
-
-# Environment flags:
-#   KERNEL_AUTOTUNE_DISABLE=1           -> bypass autotuning, use first config in each list
-#   KERNEL_AUTOTUNE_FORCE=1             -> ignore cache and retune
-#   KERNEL_AUTOTUNE_VERBOSE=1           -> print tuning/cache diagnostics
-#   KERNEL_AUTOTUNE_FORCE_FALLBACK=1    -> always use fallback_fn
-#   KERNEL_AUTOTUNE_DISABLE_FALLBACK=1  -> do not benchmark or select fallback_fn

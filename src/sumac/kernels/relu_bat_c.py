@@ -5,6 +5,7 @@ from functools import lru_cache
 import torch
 
 from .cuda_utils import cuda_is_available
+from .tuning import KernelAutotuneOptions
 
 
 class FallbackReluBatC:
@@ -265,7 +266,9 @@ def relu_bat_c_fallback(
 
 
 @lru_cache(maxsize=None)
-def relu_bat_c_cuda_launcher():
+def relu_bat_c_cuda_launcher(
+    autotune_options: KernelAutotuneOptions | None = None,
+):
     if not cuda_is_available():
         return relu_bat_c_fallback_launcher()
 
@@ -284,6 +287,7 @@ def relu_bat_c_cuda_launcher():
         warmup=1,
         rep=5,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
+        autotune_options=autotune_options,
     )
     def relu_batc(
         A: torch.Tensor,
@@ -306,7 +310,10 @@ def relu_bat_c_cuda_launcher():
 
 
 @lru_cache(maxsize=None)
-def relu_bat_c_tf32_sync_launcher(D: int):
+def relu_bat_c_tf32_sync_launcher(
+    D: int,
+    autotune_options: KernelAutotuneOptions | None = None,
+):
     if not cuda_is_available():
         return relu_bat_c_fallback_launcher()
 
@@ -319,6 +326,7 @@ def relu_bat_c_tf32_sync_launcher(D: int):
 
     @autotune_cuda_kernel(
         configs=tune_config,
+        fallback_fn=relu_bat_c_fallback,
         key_fn=relu_bat_c_key,
         constraint_fn=relu_bat_c_tf32_sync_constraints,
         cache_path="relu_bat_c_tf32_mma_autotune.json",
@@ -326,6 +334,7 @@ def relu_bat_c_tf32_sync_launcher(D: int):
         warmup=1,
         rep=5,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
+        autotune_options=autotune_options,
     )
     def relu_bat_c_tf32_sync_cuda(
         A: torch.Tensor,
@@ -350,7 +359,10 @@ def relu_bat_c_tf32_sync_launcher(D: int):
 
 
 @lru_cache(maxsize=None)
-def relu_bat_c_tf32_wgmma_launcher(D: int):
+def relu_bat_c_tf32_wgmma_launcher(
+    D: int,
+    autotune_options: KernelAutotuneOptions | None = None,
+):
     if not cuda_is_available():
         return relu_bat_c_fallback_launcher()
 
@@ -363,6 +375,7 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
 
     @autotune_cuda_kernel(
         configs=tune_config,
+        fallback_fn=relu_bat_c_fallback,
         key_fn=relu_bat_c_key,
         constraint_fn=relu_bat_c_tf32_wgmma_constraints,
         cache_path="relu_bat_c_tf32_wgmma_mode_autotune.json",
@@ -370,6 +383,7 @@ def relu_bat_c_tf32_wgmma_launcher(D: int):
         warmup=1,
         rep=5,
         sampler=optuna.samplers.GridSampler(search_space=tune_config),
+        autotune_options=autotune_options,
     )
     def relu_bat_c_tf32_wgmma_cuda(
         A: torch.Tensor,

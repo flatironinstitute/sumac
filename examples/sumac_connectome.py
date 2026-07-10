@@ -29,6 +29,9 @@ if __name__ == '__main__':
     parser.add_argument('--eval_path', type=str)
     parser.add_argument('--eval_save',  action='store_true', help='Save evaluation results to .txt file.')
     parser.add_argument('--allow_tf32', action='store_true', help='allow PyTorch and SUMAC custom kernels to use TF32.')
+    parser.add_argument('--autotune', type=str, default='cache', choices=['cache', 'force', 'disable', 'fallback'], help='CUDA kernel autotuning mode.')
+    parser.add_argument('--autotune_cache_dir', type=str, default=None, help='Directory for SUMAC kernel autotune cache files.')
+    parser.add_argument('--autotune_verbose', action='store_true', help='Print CUDA kernel autotuning decisions.')
     parser.add_argument('--device', type=str, default="cuda" if torch.cuda.is_available() else "cpu", help='training/evaluation device')
     args = parser.parse_args()
     torch.set_float32_matmul_precision('high' if args.allow_tf32 else 'highest')
@@ -97,6 +100,9 @@ if __name__ == '__main__':
             seed=args.seed,
             allow_tf32=args.allow_tf32,
             device=args.device,
+            autotune=args.autotune,
+            autotune_cache_dir=args.autotune_cache_dir,
+            autotune_verbose=args.autotune_verbose,
         )
         torch.save([A, B], f"{save_path}/AB.pt")
         with open(f"{save_path}/cost.pkl", "wb") as f:
