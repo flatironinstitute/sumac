@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from sumac import sumac_factorize
 from sumac.datasets import RowBlockDataset, collate_blocks
 from sumac.eval import eval
+from sumac.config.options import make_config_from_args, SumacConfig
 import sys
 
 if __name__ == '__main__':

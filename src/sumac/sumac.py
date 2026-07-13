@@ -140,6 +140,7 @@ def sumac_factorize(
 
     torch.set_float32_matmul_precision('high' if allow_tf32 else 'highest')
 
+    # requires m, which requires shape, which can't be set in config alone
     if num_blocks is None:
         max_bytes = cache_mb * 1e6
         bytes_per_dtype = 8 if dtype == torch.float64 else 4
