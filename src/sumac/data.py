@@ -39,11 +39,12 @@ def sparse_to_dense(idx: torch.Tensor, val: torch.Tensor, m: int, n: int):
     s = torch.sparse_coo_tensor(idx, val, size=(m,n))
     return s.to_dense()
 
-def prune_zero_rows_cols(S_index, shape):
+def prune_zero_rows_cols(S_index, shape, verbose=True):
     r, c = S_index
     m, n = shape
     if r.unique().numel() == m and c.unique().numel() == n:
-        print(f"no all-zero row or col")
+        if verbose:
+            print("no all-zero row or col")
         return S_index, None, None # nothing to drop
     dev = S_index.device
     row_mask = torch.zeros(m, dtype=torch.bool, device=dev)
@@ -55,5 +56,6 @@ def prune_zero_rows_cols(S_index, shape):
     col_new = torch.full((n,), -1, dtype=torch.long, device=dev)
     col_new[col_mask] = torch.arange(col_mask.sum().item(), device=dev)
     new_idx = torch.stack([row_new[r], col_new[c]])
-    print(f"{int(row_mask.sum())} rows, {int(col_mask.sum())} cols")
+    if verbose:
+        print(f"{int(row_mask.sum())} rows, {int(col_mask.sum())} cols")
     return new_idx, row_mask, col_mask

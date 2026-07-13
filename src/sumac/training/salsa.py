@@ -39,7 +39,6 @@ def init_salsa_factors(
     """
     Initialize with A > 0 and B < 0, then rescale.
     """
-    print("salsa init...")
     device = S_value.device
     dtype = S_value.dtype
 
@@ -78,6 +77,7 @@ def configure_kernel_prec(
     allow_tf32: bool,
     device,
     D: int,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     global relu_bat_c_tuned
     global relu_bat_c_kernel_mode
@@ -86,7 +86,11 @@ def configure_kernel_prec(
 
     autotune_options = active_kernel_autotune_options()
     device = torch.device(device)
-    if device.type != "cuda" or not cuda_is_available():
+    if (
+        dtype != torch.float32
+        or device.type != "cuda"
+        or not cuda_is_available()
+    ):
         if relu_bat_c_kernel_mode != "fallback":
             relu_bat_c_tuned = relu_bat_c_fallback_launcher()
             relu_bat_c_kernel_mode = "fallback"
