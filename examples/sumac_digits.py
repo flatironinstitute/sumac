@@ -1,9 +1,7 @@
 from contextlib import redirect_stdout
 import torch 
 
-from sumac.data import *
 from sumac.config.options import make_config_from_args
-
 from ._example_shared import eval_only, make_paths, load_factorize_save
 
 if __name__ == '__main__':
