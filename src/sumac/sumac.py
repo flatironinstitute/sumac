@@ -6,7 +6,6 @@ import time
 import random
 from pathlib import Path
 from .data import prune_zero_rows_cols
-from typing import Literal
 
 from .kernels.cuda_utils import (
     cuda_device_count,
@@ -25,11 +24,6 @@ from .kernels.tuning import (
 )
 from .eval import block_loss_and_pred, eval
 from sumac.config.options import SumacConfig, SumacMethod, OptimizerName
-
-# SumacMethod = Literal["SALSA", "GD"]
-# OptimizerName = Literal["adam", "adamw", "sgd", "muon"]
-# SUMAC_METHODS: tuple[SumacMethod, ...] = ("SALSA", "GD")
-# OPTIMIZER_NAMES: tuple[OptimizerName, ...] = ("adam", "adamw", "sgd", "muon")
 
 
 def resolve_sumac_device(
@@ -117,7 +111,7 @@ def sumac_factorize(
         raise ValueError("sumac: the input matrix should be nonnegative.")
 
     if eval_interval is None:
-        eval_interval = 100 if method == "GD" else 10
+        eval_interval = 100 if method == SumacMethod.GD else 10
 
     options = {
         'max_iterations': max_iterations,
@@ -183,7 +177,7 @@ def sumac_factorize(
         cache_dir=autotune_cache_dir,
         verbose=autotune_verbose,
     ):
-        if method == 'GD':
+        if method == SumacMethod.GD:
             cfg = TrainConfig(
                 rank,
                 num_blocks=num_blocks,
@@ -198,7 +192,7 @@ def sumac_factorize(
                 device=training_device,
             )
             A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, cfg, gen, A_init, B_init)
-        elif method == 'SALSA':
+        elif method == SumacMethod.SALSA:
             A, B, costs = salsa_loop(
                 S_index,
                 S_value,
