@@ -5,8 +5,9 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from ..kernels.cuda_utils import cuda_is_available
+from sumac.config.options import OptimizerName
 
-OptimizerName = Literal["adam", "adamw", "sgd", "muon"]
+# OptimizerName = Literal["adam", "adamw", "sgd", "muon"]
 
 
 @dataclass
@@ -20,7 +21,7 @@ class TrainConfig:
     shuffle_blocks: bool = False
     batch_blocks: int = 1
     eval_interval: int = 100
-    optimizer: OptimizerName = "adam"
+    optimizer: OptimizerName = OptimizerName.ADAM
     momentum: float = 0.7
     adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_eps: float = 1e-8
@@ -37,14 +38,13 @@ def make_optimizer(
     adam_eps: float = 1e-8,
     muon_momentum: float = 0.95
 ):
-    name = name.lower()
-    if name == "adam":
+    if name == OptimizerName.ADAM:
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
-    if name == "adamw":
+    if name == OptimizerName.ADAMW:
         return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
-    if name == "sgd":
+    if name == OptimizerName.SGD:
         return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
-    if name == "muon":
+    if name == OptimizerName.MUON:
         return torch.optim.Muon(
             params,
             lr=lr,

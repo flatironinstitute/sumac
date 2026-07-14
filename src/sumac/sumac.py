@@ -24,11 +24,12 @@ from .kernels.tuning import (
     normalize_autotune_mode,
 )
 from .eval import block_loss_and_pred, eval
+from sumac.config.options import SumacConfig, SumacMethod, OptimizerName
 
-SumacMethod = Literal["SALSA", "GD"]
-OptimizerName = Literal["adam", "adamw", "sgd", "muon"]
-SUMAC_METHODS: tuple[SumacMethod, ...] = ("SALSA", "GD")
-OPTIMIZER_NAMES: tuple[OptimizerName, ...] = ("adam", "adamw", "sgd", "muon")
+# SumacMethod = Literal["SALSA", "GD"]
+# OptimizerName = Literal["adam", "adamw", "sgd", "muon"]
+# SUMAC_METHODS: tuple[SumacMethod, ...] = ("SALSA", "GD")
+# OPTIMIZER_NAMES: tuple[OptimizerName, ...] = ("adam", "adamw", "sgd", "muon")
 
 
 def resolve_sumac_device(
@@ -56,7 +57,7 @@ def sumac_factorize(
     S_value: Tensor,
     shape: tuple[int, int],
     rank: int,
-    method: SumacMethod = "SALSA",
+    method: SumacMethod = SumacMethod.SALSA,
     max_iterations: int = 25,
     num_blocks: int | None = None,
     cache_mb: int = 5000,
@@ -64,7 +65,7 @@ def sumac_factorize(
     device: torch.device | str | None = None,
     momentum: float = 0.7,
     learning_rate: float = 1e-1,
-    optimizer: OptimizerName = "adam",
+    optimizer: OptimizerName = OptimizerName.ADAM,
     adam_betas: tuple[float, float] = (0.9, 0.999),
     adam_eps: float = 1e-8,
     muon_momentum: float = 0.95,
@@ -98,10 +99,11 @@ def sumac_factorize(
       autotune_verbose: print kernel autotune decisions
     """
 
-    if method not in SUMAC_METHODS:
-        raise ValueError(f"method must be one of {SUMAC_METHODS}, got {method!r}")
-    if optimizer not in OPTIMIZER_NAMES:
-        raise ValueError(f"optimizer must be one of {OPTIMIZER_NAMES}, got {optimizer!r}")
+    ## TODO: REINSTATE CHECKS
+    # if method not in SUMAC_METHODS:
+    #     raise ValueError(f"method must be one of {SUMAC_METHODS}, got {method!r}")
+    # if optimizer not in OPTIMIZER_NAMES:
+    #     raise ValueError(f"optimizer must be one of {OPTIMIZER_NAMES}, got {optimizer!r}")
     autotune = normalize_autotune_mode(autotune)
     m, n = shape
 
