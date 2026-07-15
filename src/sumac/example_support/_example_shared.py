@@ -100,20 +100,7 @@ def load_factorize_save(config: SumacConfig, etype: example_type, save_path: str
         S_index=S_index,
         S_value=S_value,
         shape=(m, n),
-        rank=config.rank,
-        max_iterations=config.max_iterations,
-        num_blocks=config.num_blocks,
-        momentum=config.momentum,
-        method=config.method,
-        learning_rate=config.learning_rate,
-        optimizer=config.optimizer,
-        eval_interval=config.eval_interval,
-        seed=config.seed if config.seed is not None else 0,
-        allow_tf32=config.allow_tf32,
-        device=config.device,
-        autotune=config.autotune.value,
-        autotune_cache_dir=config.autotune_cache_dir,
-        autotune_verbose=config.autotune_verbose,
+        config=config
     )
     torch.save([A, B], f"{save_path}/AB.pt")
     with open(f"{save_path}/cost.pkl", "wb") as f:
