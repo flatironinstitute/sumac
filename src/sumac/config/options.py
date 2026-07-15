@@ -1,8 +1,10 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
+import math
 import os
 from pathlib import Path
+import random
 import torch
 
 class SumacMethod(Enum):
@@ -38,6 +40,7 @@ class SumacConfig:
     rank: int = 16
     max_iterations: int = 25
     num_blocks: int | None = None
+    cols_per_block: int | None = None
     seed: int | None = None
     cache_mb: int = 5000
     dtype: torch.dtype = torch.float32
@@ -45,17 +48,18 @@ class SumacConfig:
     device: torch.device | None = None
     momentum: float = 0.7
     learning_rate: float = 1e-1
-    optimizer: OptimizerName = OptimizerName.ADAM
+    verbose: bool = True
+    eval_interval: int | None = None
     # optimizer-specific
+    optimizer: OptimizerName = OptimizerName.ADAM
     adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_eps: float = 1e-8
     muon_momentum: float = 0.95
-    eval_interval: int | None = None
-    verbose: bool = True
+    # autotuning
     autotune: AutotuneMode = AutotuneMode.CACHE
     autotune_cache_dir: str | Path | None = None
     autotune_verbose: bool = False
-    # consumed by examples
+    # consumed by examples only
     input_filename: str | None = None
     log_filename: str | None = None
     eval_only: bool = False
@@ -69,6 +73,42 @@ class SumacConfig:
         if self.autotune_cache_dir is None:
             self.autotune_cache_dir = default_kernel_autotune_cache_dir()
         self.autotune_cache_dir = str(self.autotune_cache_dir)
+        if self.seed is not None:
+            if self.verbose:
+                print(f"seed = {self.seed}")
+            random.seed(self.seed)
+
+        ## TODO: Reincorporate check for validity of SumacMethod, Optimizer, TuningValue etc
+
+
+    def set_cols_per_block(self, m: int, n: int):
+        if self.num_blocks is None:
+            max_bytes = self.cache_mb * 1e6
+            bytes_per_dtype = 8 if self.dtype == torch.float64 else 4
+            self.cols_per_block = max(1, int(max_bytes // (m * bytes_per_dtype)))
+            self.num_blocks = math.ceil(n / self.cols_per_block)
+        else:
+            self.cols_per_block = int(n // self.num_blocks)
+
+
+    def print_prefactor_report(self, S_value: torch.Tensor, m: int, n: int, devcount: int):
+        if not self.verbose: return
+        nnz = len(S_value)
+        print(f"\n  Input to SUMAC is a {m}x{n} sparse matrix with {nnz} nonzeros.")
+        print(f"  Attempting matrix completion with rank {self.rank}.")
+        print(f"  Available GPUs: {devcount}.")
+        print(f"  Options:")
+        opts = [f'    {m.name}: {getattr(self, m.name)}' for m in fields(self)]
+        print("\n".join(opts))
+        print()
+
+    
+    def get_generator(self):
+        gen = torch.Generator(device = self.device)
+        if self.seed is not None:
+            gen.manual_seed(self.seed)
+            torch.manual_seed(self.seed)
+        return gen
 
 
 def make_config_from_args() -> SumacConfig:

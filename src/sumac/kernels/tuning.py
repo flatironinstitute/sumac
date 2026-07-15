@@ -13,6 +13,8 @@ from typing import Any, Callable, Dict, Optional, Literal
 
 import torch
 
+from sumac.config.options import AutotuneMode
+
 
 def _require_optuna():
     try:
@@ -121,18 +123,9 @@ class TuneResult:
     runtime_ms: float
 
 
-AutotuneMode = Literal["cache", "force", "disable", "fallback"]
-AUTOTUNE_MODES: tuple[AutotuneMode, ...] = (
-    "cache",
-    "force",
-    "disable",
-    "fallback",
-)
-
-
 @dataclass(frozen=True)
 class KernelAutotuneOptions:
-    mode: AutotuneMode = "cache"
+    mode: AutotuneMode = AutotuneMode.CACHE
     cache_dir: Path | None = None
     cache_dir_key: str | None = None
     verbose: bool = False
@@ -145,12 +138,6 @@ ACTIVE_AUTOTUNE_OPTIONS: ContextVar[KernelAutotuneOptions] = ContextVar(
     "ACTIVE_AUTOTUNE_OPTIONS",
     default=KernelAutotuneOptions(),
 )
-
-
-def normalize_autotune_mode(mode: str) -> AutotuneMode:
-    if mode not in AUTOTUNE_MODES:
-        raise ValueError(f"autotune must be one of {AUTOTUNE_MODES}, got {mode!r}")
-    return mode
 
 
 def default_kernel_autotune_cache_dir() -> Path:
@@ -171,18 +158,18 @@ def kernel_autotune_options(
     cache_dir: str | Path | None = None,
     verbose: bool = False,
 ):
-    normalized_mode = normalize_autotune_mode(mode)
+    # normalized_mode = normalize_autotune_mode(mode)
     resolved_cache_dir = (
         default_kernel_autotune_cache_dir()
         if cache_dir is None
         else Path(cache_dir)
     )
     options = KernelAutotuneOptions(
-        mode=normalized_mode,
+        mode=AutotuneMode(mode),
         cache_dir=resolved_cache_dir,
         cache_dir_key=str(resolved_cache_dir),
         verbose=verbose,
-        session_id=next(AUTOTUNE_SESSION_IDS) if normalized_mode == "force" else 0,
+        session_id=next(AUTOTUNE_SESSION_IDS) if mode == "force" else 0,
     )
     token = ACTIVE_AUTOTUNE_OPTIONS.set(options)
     try:
