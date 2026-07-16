@@ -260,13 +260,13 @@ def update_factor_salsa(
 
 
 # TODO: Ask whether learning rate is still intended to be a scalar
+# TODO: Can we break this into fewer than 140 lines maybe
 def salsa_loop(
     S_index: Tensor,
     S_value: Tensor,
     m: int,
     n: int,
     cfg: SumacConfig,
-    # device: torch.device,
     A_init: Tensor | None = None,
     B_init: Tensor | None = None
 ):
@@ -276,22 +276,18 @@ def salsa_loop(
     assert cfg.num_blocks is not None
     assert cfg.device is not None
 
-    gen = cfg.get_generator()
+    (gen, gen_rows, gen_cols) = cfg.get_generator()
+    assert gen_rows is not None
+    assert gen_cols is not None
 
     configure_kernel_prec(
         allow_tf32=cfg.allow_tf32,
         device=cfg.device,
         D=cfg.rank,
     )
+
     S_index = S_index.to(cfg.device)
     S_value = S_value.to(cfg.device)
-    
-    gen_rows = torch.Generator(device=cfg.device)
-    gen_cols = torch.Generator(device=cfg.device)
-    if cfg.seed is not None:
-        gen_rows.manual_seed(cfg.seed + 1)
-        gen_cols.manual_seed(cfg.seed + 2)
-
     if A_init is None or B_init is None:
         nvtx_range_push("init_salsa_factors")
         A, B = init_salsa_factors(S_index, S_value, m, n, cfg.rank, gen=gen)

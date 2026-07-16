@@ -8,19 +8,23 @@ import random
 import torch
 
 class SumacMethod(Enum):
+    """Which strategy to use: SALSA (stochastic alternating least
+    squares) or GD (gradient descent with choice of optimizer).
+    """
     SALSA = 'salsa'
     GD = 'gd'
 
 
 class OptimizerName(Enum):
+    """Choice of supported optimizer for GD mode."""
     ADAM = 'adam'
     ADAMW = 'adamw'
     SGD = 'sgd'
     MUON = 'muon'
 
 
-# TODO: need to check if we need to support cuda, cpu, etc.
 class AutotuneMode(Enum):
+    """Controls autotuner cache usage."""
     CACHE = 'cache'
     FORCE = 'force'
     DISABLE = 'disable'
@@ -36,6 +40,99 @@ def default_kernel_autotune_cache_dir() -> Path:
 
 @dataclass(kw_only=True)
 class SumacConfig:
+    """Unified configuration object for Sumac.
+
+    All parameters have reasonable defaults. Supported fields
+    include shared configuration parameters and those that are
+    only relevant for specific modes of operation--irrelevant
+    parameters will be ignored by the rest of the code.
+
+    Attributes:
+        method (SumacMethod): Which of the available Sumac
+            factorization methods will be ueds. (Default: SALSA)
+        rank (int): Target rank for the low-rank representation.
+            (Default: 16)
+        max_iterations (int): Maximum iterations before termination.
+            (Default: 25)
+        num_blocks (int | None): Number of blocks to use for blocking
+            update algorithms. Defaults to None, in which case it will
+            be computed from the available cache memory (cache_mb) and
+            the size of the input matrix.
+        cols_per_block (int | None): Columns to include per matrix
+            block for blocked matrix algorithms. Defaults to None,
+            in which case it will be computed based on the requested
+            block count and input matrix size.
+        seed (int | None): Random seed for reproducible results.
+            By default set to None, to avoid restricting result space.
+        cache_mb (int): Available megabytes of memory for caching, in MB.
+            (Default: 5000)
+        dtype (torch.dtype): Torch datatype for computation: makes
+            the choice between single- and double-precision (or,
+            if allowed, TF32 representation). (Default: float32)
+        allow_tf32 (bool): Whether to use TF32 instead of IEEE
+            single-precision representation during training. (Default:
+            False) If True, and the dtype parameter is set to float32
+            (single-precision), TF32 will be used if supported by the
+            system.
+        device (torch.device | None): Which device (CPU, GPU) to use for
+            training. (Default: None) If unset, will be inferred from
+            the location of the input sparse matrix.
+        momentum (float | None): Momentum used in training. For GD methods,
+            will be used by the chosen optimizer; for SALSA, used
+            directly in updates. (Default: 0.7, unless GD is used
+            with muon optimizer, in which case the default is 0.95.)
+        learning_rate (float): Learning rate for training. For GD
+            methods, used by the chosen optimizer; for SALSA, used
+            in updates directly.
+        verbose (bool): Whether to print lots of status messages.
+            (Default: True)
+        eval_interval (int | None): How many iterations to run
+            between reporting loss values. If set to None
+            (the default), will be set to 10 for SALSA or 100
+            for GD modes.
+        optimizer (OptimizerName): Determines the type of
+            optimizer used for GD methods; ignored for SALSA.
+            Available optimizers are defined by the OptimizerName
+            enum. (Default: adam)
+        adam_betas (tuple[float, float]): Used for configuring
+            adam or adamw optimizer in GD mode. Ignored for
+            SALSA or GD with other optimizers. (Default:
+            (0.9, 0.999))
+        adam_eps (float): Epsilon parameter for configuring
+            adam or adamw optimizer in GD mode. Ignored for
+            SALSA or GD with other optimizers. (Default: 1e-8)
+        shuffle_blocks (bool): Whether to shuffle blocks
+            through the data loader. Only relevant in GD
+            mode; SALSA mode always shuffles blocks at every
+            iteration. (Default: False)
+        batch_blocks (int): Number of blocks per batch in
+            GD mode. Ignored in SALSA mode. (Default: 1)
+        autotune (AutotuneMode): How the autotuner will
+            be used. Available options defined by the
+            AutotuneMode enum. (Default: cache)
+        autotune_cache_dir (str): Directory to use for
+            the autotuner data cache. If None (the default),
+            sumac will inspect the XDG_CACHE_HOME environment
+            variable. If that is set, we will use a "sumac"
+            directory under its value; otherwise, the default
+            is ".cache/sumac" within the home directory.
+        autotune_verbose (bool): Whether the autotuner should
+            print verbose output. (Default: False)
+        input_filename (str): Used by example code to identify
+            a data file to load. Ignored in normal use.
+        log_filename (str): Output filename for log data
+            from examples. Ignored in normal use.
+        eval_only (bool): Used in examples only. If True,
+            the example will skip training and only provide
+            an evaluation of provided matrix factors.
+        eval_path (str | None): Used in examples only, as the
+            directory to write the matrix factors into. In
+            eval-only mode, this directory should contain
+            the matrix factors to evaluate.
+        eval_save (bool): Used in examples only. If True,
+            the factors discovered through training will be
+            saved in eval_path; otherwise they are discarded.
+    """
     method: SumacMethod = SumacMethod.SALSA
     rank: int = 16
     max_iterations: int = 25
@@ -46,7 +143,7 @@ class SumacConfig:
     dtype: torch.dtype = torch.float32
     allow_tf32: bool = False
     device: torch.device | None = None
-    momentum: float = 0.7
+    momentum: float = -1.
     learning_rate: float = 1e-1
     verbose: bool = True
     eval_interval: int | None = None
@@ -54,7 +151,8 @@ class SumacConfig:
     optimizer: OptimizerName = OptimizerName.ADAM
     adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_eps: float = 1e-8
-    muon_momentum: float = 0.95
+    shuffle_blocks: bool = False
+    batch_blocks: int = 1
     # autotuning
     autotune: AutotuneMode = AutotuneMode.CACHE
     autotune_cache_dir: str | Path | None = None
@@ -73,15 +171,18 @@ class SumacConfig:
         if self.autotune_cache_dir is None:
             self.autotune_cache_dir = default_kernel_autotune_cache_dir()
         self.autotune_cache_dir = str(self.autotune_cache_dir)
+        if self.momentum < 0:
+            self.momentum = 0.7
+            if (self.optimizer == OptimizerName.MUON
+                and self.method == SumacMethod.GD):
+                self.momentum = 0.95
         if self.seed is not None:
             if self.verbose:
                 print(f"seed = {self.seed}")
             random.seed(self.seed)
 
-        ## TODO: Reincorporate check for validity of SumacMethod, Optimizer, TuningValue etc
 
-
-    def set_cols_per_block(self, m: int, n: int):
+    def set_block_sizes(self, m: int, n: int):
         if self.num_blocks is None:
             max_bytes = self.cache_mb * 1e6
             bytes_per_dtype = 8 if self.dtype == torch.float64 else 4
@@ -105,10 +206,17 @@ class SumacConfig:
     
     def get_generator(self):
         gen = torch.Generator(device = self.device)
+        gen_rows = None
+        gen_cols = None
+        if self.method == SumacMethod.SALSA:
+            gen_rows = torch.Generator(device = self.device)
+            gen_cols = torch.Generator(device = self.device)
         if self.seed is not None:
             gen.manual_seed(self.seed)
             torch.manual_seed(self.seed)
-        return gen
+            if gen_rows is not None: gen_rows.manual_seed(self.seed + 1)
+            if gen_cols is not None: gen_cols.manual_seed(self.seed + 2)
+        return (gen, gen_rows, gen_cols)
 
 
 def make_config_from_args() -> SumacConfig:

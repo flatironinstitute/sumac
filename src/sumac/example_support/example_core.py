@@ -11,6 +11,8 @@ def run_example(etype: example_type):
        
     torch.set_float32_matmul_precision('high' if config.allow_tf32 else 'highest')
 
+    ## TODO: Consider forcing verbose to on, forcing seed for example
+
     if config.eval_only:
         eval_only(config, etype)
         exit()
