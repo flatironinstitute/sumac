@@ -59,7 +59,7 @@ def torch2scipy_svd(S_index, S_value, n, k=16):
     return torch.FloatTensor(A), torch.FloatTensor(B)
 
 
-@mark.parametrize("method", [(SumacMethod.GD, SumacMethod.SALSA)])
+@mark.parametrize("method", [(SumacMethod.GD), (SumacMethod.SALSA)])
 def test_low_rank(method: SumacMethod):
     m = 1000
     n = 1000
