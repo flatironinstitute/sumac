@@ -5,7 +5,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch import Tensor
 
-from sumac.config.options import OptimizerName, SumacConfig
+from sumac.config import OptimizerName, SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import block_loss_and_pred, eval
 from sumac.kernels.cuda_utils import nvtx_range_pop, nvtx_range_push

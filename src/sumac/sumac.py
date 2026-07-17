@@ -3,7 +3,7 @@ from torch import Tensor
 
 from .kernels.tuning import kernel_autotune_options
 
-from sumac.config.options import SumacConfig, SumacMethod
+from sumac.config import SumacConfig, SumacMethod
 from sumac.data import prune_zero_rows_cols, restore_zero_rows_cols
 from sumac.kernels.cuda_utils import (
     cuda_device_count,

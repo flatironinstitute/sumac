@@ -1,4 +1,4 @@
-from .sumac import SumacMethod, sumac_factorize
-from .config.options import AutotuneMode, OptimizerName
+from .sumac import sumac_factorize
+from .config import AutotuneMode, OptimizerName, SumacConfig, SumacMethod
 
-__all__ = ["sumac_factorize", "SumacMethod", "OptimizerName", "AutotuneMode"]
+__all__ = ["sumac_factorize", "SumacConfig", "SumacMethod", "OptimizerName", "AutotuneMode"]

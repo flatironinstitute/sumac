@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 
-from sumac.config.options import AutotuneMode
+from sumac.config import AutotuneMode
 
 
 def _require_optuna():

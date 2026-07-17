@@ -8,7 +8,7 @@ from sumac import sumac_factorize
 from sumac.data import dense_to_sparse
 import scipy as sp
 
-from sumac.config.options import SumacMethod, SumacConfig
+from sumac.config import SumacMethod, SumacConfig
 
 def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, seed=0):
     """

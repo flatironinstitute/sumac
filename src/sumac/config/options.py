@@ -315,5 +315,3 @@ def make_config_from_args() -> SumacConfig:
         eval_path = args.eval_path,
         eval_save = args.eval_save
     )
-
-

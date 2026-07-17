@@ -1,7 +1,7 @@
 from contextlib import redirect_stdout
 import torch
 
-from sumac.config.options import make_config_from_args
+from sumac.config import make_config_from_args
 from sumac.example_support._example_shared import example_type, eval_only, make_paths, load_factorize_save
 
 def run_example(etype: example_type):

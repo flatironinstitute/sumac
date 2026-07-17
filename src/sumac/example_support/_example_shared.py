@@ -9,7 +9,7 @@ from typing import Literal
 from sumac import sumac_factorize
 from sumac.datasets import RowBlockDataset, collate_blocks
 from sumac.eval import eval
-from sumac.config.options import SumacConfig
+from sumac.config import SumacConfig
 
 
 example_type = Literal['digits'] | Literal['bigrams'] | Literal['connectome']

@@ -3,7 +3,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
-from sumac.config.options import SumacConfig
+from sumac.config import SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import eval
 from sumac.kernels.cuda_utils import cuda_is_available, nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
