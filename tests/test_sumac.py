@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import time
@@ -22,10 +23,14 @@ def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, 
     # Compute product
     S_latent = A_true @ B_true.T
     
-    # Estimate bias to achieve target density
-    # For Gaussian-like sum, we can use the percentile
-    bias = torch.quantile(S_latent.flatten(), 1.0 - density)
-    S_dense = S_latent - bias
+    # Set a bias based on the target density
+    # i.e. find a value in the tensor for which m*n*density elements
+    # will be greater, so we can subtract that, thus setting the others
+    # to zero after the relu
+    S_flat = S_latent.flatten()
+    bias_idx = math.ceil(len(S_flat) * density)
+    bias_val = torch.sort(S_flat, descending=True)[0][bias_idx]
+    S_dense = S_latent - bias_val
     
     # Add noise
     if noise_level > 0:
@@ -59,13 +64,13 @@ def torch2scipy_svd(S_index, S_value, n, k=16):
     return torch.FloatTensor(A), torch.FloatTensor(B)
 
 
-@mark.parametrize("method", [(SumacMethod.GD), (SumacMethod.SALSA)])
-def test_low_rank(method: SumacMethod):
-    m = 1000
-    n = 1000
+@mark.parametrize("method, num_blocks", [(SumacMethod.GD, 2), (SumacMethod.SALSA, 25)])
+def test_low_rank(method: SumacMethod, num_blocks: int):
+    m = 10000
+    n = 10000
     d_true = 16
     d_fit = 16
-    target_density = 0.1
+    target_density = 0.01
     iters = 300
 
     # TODO: decide whether to actually keep the manually-call-the-test interface
@@ -89,7 +94,8 @@ def test_low_rank(method: SumacMethod):
         max_iterations = iters,
         method = method,
         learning_rate = 0.1,
-        num_blocks = 2
+        num_blocks = num_blocks,
+        seed = 0
     )
     print(f"\n>> Running SUMAC with method: {method}")
     t_start = time.time()
@@ -119,5 +125,5 @@ def test_low_rank(method: SumacMethod):
     assert mse < 0.08, f"{method} final MSE {mse:.6f} is too large."
 
 if __name__ == "__main__":
-    test_low_rank(SumacMethod.GD)
-    test_low_rank(SumacMethod.SALSA)
+    test_low_rank(SumacMethod.GD, 2)
+    test_low_rank(SumacMethod.SALSA, 25)
