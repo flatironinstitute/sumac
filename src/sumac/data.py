@@ -81,12 +81,12 @@ def restore_zero_rows_cols(
 ):
     if row_mask is not None:
         A_ori = torch.zeros((m, rank), dtype=A.dtype, device=A.device)
-        A_ori[row_mask] = A 
+        A_ori[row_mask] = A
     else:
         A_ori = A
     if col_mask is not None:
         B_ori = torch.zeros((n, rank), dtype=B.dtype, device=B.device)
-        B_ori[col_mask] = B 
+        B_ori[col_mask] = B
     else:
         B_ori = B
     

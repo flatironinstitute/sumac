@@ -81,13 +81,8 @@ def test_low_rank(method: SumacMethod, num_blocks: int):
     actual_density = len(S_value) / (m * n)
     print(f"Actual density: {actual_density:.4f} ({len(S_value)} non-zeros)")
     
-    #same factor init using SVD 
-    A_init, B_init = torch2scipy_svd(S_index, S_value, n, k=d_fit)
     S_index = S_index.to(device)
     S_value = S_value.to(device)
-    A_init = A_init.to(device)
-    B_init = B_init.to(device)
-    print(A_init.shape, B_init.shape)
     
     config = SumacConfig(
         rank = d_fit,
@@ -103,8 +98,6 @@ def test_low_rank(method: SumacMethod, num_blocks: int):
         S_index=S_index,
         S_value=S_value,
         shape=(m, n),
-        A_init=A_init,
-        B_init=B_init,
         config=config
     )
     elapsed = time.time() - t_start
