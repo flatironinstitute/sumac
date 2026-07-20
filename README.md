@@ -79,7 +79,7 @@ Optional `A_init` and `B_init` keyword arguments can supply initial factor tenso
 `SumacConfig` is keyword-only and provides defaults for every field. See its docstring for the complete list of configuration options and their behavior.
 
 ### Application: Fly Connectome Data
-The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. The data is available at ```/mnt/home/lsaul/Datasets/flywire/connectome.txt```
+The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. 
 
 To run sumac-SALSA
 ```bash
