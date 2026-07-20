@@ -7,11 +7,12 @@ import os
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
+from torch import Tensor
 
 from sumac.config import AutotuneMode
 
@@ -119,21 +120,6 @@ def _print_trial_pruned(
     print(message)
 
 
-@dataclass(frozen=True)
-class TuneResult:
-    mode: str
-    params: Dict[str, Any]
-    runtime_ms: float
-
-
-@dataclass(frozen=True)
-class KernelAutotuneOptions:
-    mode: AutotuneMode = AutotuneMode.CACHE
-    cache_dir: Path | None = None
-    cache_dir_key: str | None = None
-    verbose: bool = False
-    session_id: int = 0
-
 
 AUTOTUNE_SESSION_IDS = itertools.count(1)
 
@@ -157,7 +143,7 @@ def active_kernel_autotune_options() -> KernelAutotuneOptions:
 @contextmanager
 def kernel_autotune_options(
     *,
-    mode: str = "cache",
+    mode: AutotuneMode = AutotuneMode.CACHE,
     cache_dir: str | Path | None = None,
     verbose: bool = False,
 ):
@@ -172,7 +158,7 @@ def kernel_autotune_options(
         cache_dir=resolved_cache_dir,
         cache_dir_key=str(resolved_cache_dir),
         verbose=verbose,
-        session_id=next(AUTOTUNE_SESSION_IDS) if mode == "force" else 0,
+        session_id=next(AUTOTUNE_SESSION_IDS) if mode == AutotuneMode.FORCE else 0,
     )
     token = ACTIVE_AUTOTUNE_OPTIONS.set(options)
     try:
@@ -181,9 +167,14 @@ def kernel_autotune_options(
         ACTIVE_AUTOTUNE_OPTIONS.reset(token)
 
 
+# TODO: Discuss: I think this is getting pretty ambitious for a decorator.
+# Maybe we'd be better off making it an actual class with a __call__() fn that
+# wraps the underlying fn?
+# This would also allow better type-matching between the supported kernels
+# and the supported parameters.
 def autotune_cuda_kernel(
     *,
-    configs,
+    configs: T_TuneConfig,
     key_fn,
     fallback_fn: Optional[Callable[..., Any]] = None,
     constraint_fn: Optional[Callable[..., bool]] = None,
@@ -202,7 +193,7 @@ def autotune_cuda_kernel(
     fixed_options = autotune_options
     fixed_cache_file = None
     fixed_store = None
-    if fixed_options is not None and fixed_options.mode not in ("disable", "fallback"):
+    if fixed_options is not None and fixed_options.mode not in (AutotuneMode.DISABLE, AutotuneMode.FALLBACK):
         fixed_cache_file = (
             cache_path_obj
             if cache_path_is_absolute
@@ -218,18 +209,8 @@ def autotune_cuda_kernel(
         def resolve_decision(*args, **kwargs) -> Dict[str, Any]:
             options = fixed_options or active_kernel_autotune_options()
 
-            if options.mode == "fallback":
-                if fallback_fn is None:
-                    raise ValueError(
-                        f"autotune='fallback' was requested for {fn.__name__}, "
-                        "but no fallback_fn was provided"
-                    )
-                decision = {
-                    "mode": "fallback",
-                    "params": dict(default_params),
-                    "runtime_ms": float("inf"),
-                }
-                return decision
+            if options.mode == AutotuneMode.FALLBACK:
+                return _handle_fallback(configs, fn, fallback_fn)
 
             mem_key = key_fn(*args, **kwargs)
             if fixed_options is not None:
@@ -240,6 +221,7 @@ def autotune_cuda_kernel(
                     cache_dir_key = str(
                         options.cache_dir or default_kernel_autotune_cache_dir()
                     )
+                # TODO ???
                 memo_key = (
                     cache_path_key if cache_path_is_absolute else cache_dir_key,
                     cache_path_key,
@@ -252,7 +234,8 @@ def autotune_cuda_kernel(
             if decision is not None:
                 return decision
 
-            if options.mode == "disable":
+            if options.mode == AutotuneMode.DISABLE:
+                # TODO MAKE TUNERESULT
                 decision = {
                     "mode": "cuda",
                     "params": dict(default_params),
@@ -274,7 +257,7 @@ def autotune_cuda_kernel(
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
-            payload = None if options.mode == "force" else store.get(disk_key)
+            payload = None if options.mode == AutotuneMode.FORCE else store.get(disk_key)
             if payload is not None:
                 memo[memo_key] = payload
                 return payload
@@ -294,6 +277,7 @@ def autotune_cuda_kernel(
                 verbose=options.verbose,
             )
 
+            # TODO MAKE TUNERESULT
             decision = {
                 "mode": result.mode,
                 "params": result.params,
@@ -301,6 +285,7 @@ def autotune_cuda_kernel(
             }
             memo[memo_key] = decision
 
+            # TODO MAKE TUNERESULT
             store.put(
                 disk_key,
                 {
@@ -334,6 +319,7 @@ def autotune_cuda_kernel(
 
             return fn(*args, **kwargs, **decision["params"])
 
+        # Can we get closer to an actual class at this point...?
         wrapper.resolve_decision = resolve_decision  # type: ignore[attr-defined]
         wrapper.resolve_params = (  # type: ignore[attr-defined]
             lambda *args, **kwargs: resolve_decision(*args, **kwargs)["params"]
@@ -342,6 +328,20 @@ def autotune_cuda_kernel(
         return wrapper
 
     return decorator
+
+
+def _handle_fallback(default_config: T_TuneConfig, fn: Any, fallback_fn: Optional[Callable[..., Any]] = None):
+    if fallback_fn is None:
+        raise ValueError(
+            f"autotune='fallback' was requested for {fn.__name__}, "
+            "but no fallback_fn was provided"
+        )
+    decision = TuneResult(
+        mode = "fallback",
+        params = asdict(default_config),
+        runtime_ms = float("inf")
+    )
+    return decision
 
 
 def _run_study(
@@ -483,11 +483,7 @@ def _run_study(
     )
 
 
-def relu_bat_c_key(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-) -> tuple:
+def relu_bat_c_key(A: Tensor, B: Tensor, C: Tensor) -> tuple:
     props = torch.cuda.get_device_properties(A.device)
 
     N, D = A.shape
@@ -503,10 +499,7 @@ def relu_bat_c_key(
     )
 
 
-def relu_bat_reduce_key(
-    A: torch.Tensor,
-    B: torch.Tensor,
-) -> tuple:
+def relu_bat_reduce_key(A: Tensor, B: Tensor) -> tuple:
     props = torch.cuda.get_device_properties(A.device)
 
     N, D = A.shape

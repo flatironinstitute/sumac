@@ -68,7 +68,6 @@ def sumac_factorize(
                 B_init = B_init[col_mask]
 
         config.print_prefactor_report(S_value, m, n, cuda_device_count())
-
         nvtx_range_push("core SUMAC loop")
         with kernel_autotune_options(
             mode=config.autotune.value,
