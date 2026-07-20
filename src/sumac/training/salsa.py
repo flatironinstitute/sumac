@@ -1,15 +1,27 @@
+import time
 import torch
 from torch import Tensor
-from ..datasets import StochasticRowBlockDataset
-from ..kernels.cuda_utils import cuda_is_available
-from ..kernels.relu_bat_c import relu_bat_c_fallback_launcher
-from ..kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
+from torch.utils.data import DataLoader
+
+from sumac.config import SumacConfig
+from sumac.datasets import collate_blocks, StochasticRowBlockDataset
+from sumac.eval import eval
+from sumac.kernels.cuda_utils import nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
+from sumac.kernels.relu_bat_c import relu_bat_c_fallback_launcher
+from sumac.kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
 
 
 relu_bat_c_tuned = relu_bat_c_fallback_launcher()
 relu_bat_c_kernel_mode = "fallback"
 relu_bat_c_kernel_d = None
 relu_bat_c_kernel_autotune_options: KernelAutotuneOptions | None = None
+
+
+# TODO:
+# - review
+# - tighten
+# - check inter-line todos
+# - remove performance instrumentation
 
 
 def refactor(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
@@ -39,6 +51,7 @@ def init_salsa_factors(
     """
     Initialize with A > 0 and B < 0, then rescale.
     """
+    print("salsa init...")
     device = S_value.device
     dtype = S_value.dtype
 
@@ -85,19 +98,6 @@ def configure_kernel_prec(
     global relu_bat_c_kernel_autotune_options
 
     autotune_options = active_kernel_autotune_options()
-    device = torch.device(device)
-    if (
-        dtype != torch.float32
-        or device.type != "cuda"
-        or not cuda_is_available()
-    ):
-        if relu_bat_c_kernel_mode != "fallback":
-            relu_bat_c_tuned = relu_bat_c_fallback_launcher()
-            relu_bat_c_kernel_mode = "fallback"
-            relu_bat_c_kernel_d = D
-            relu_bat_c_kernel_autotune_options = autotune_options
-        return
-
     from ..kernels.relu_bat_c import (
         relu_bat_c_cuda_launcher,
         relu_bat_c_tf32_sync_launcher,
@@ -105,7 +105,7 @@ def configure_kernel_prec(
         select_relu_bat_c_kernel_mode,
     )
 
-    mode = select_relu_bat_c_kernel_mode(allow_tf32, device)
+    mode = select_relu_bat_c_kernel_mode(allow_tf32, device, dtype)
     if (
         mode == relu_bat_c_kernel_mode and
         D == relu_bat_c_kernel_d and
@@ -127,7 +127,6 @@ def configure_kernel_prec(
     relu_bat_c_kernel_autotune_options = autotune_options
 
 
-
 def lsq_update_single_gpu(
     Ar_dev: torch.Tensor,
     B_blk_dev: torch.Tensor,
@@ -141,7 +140,8 @@ def lsq_update_single_gpu(
     lrate: Tensor | float,
 ) -> tuple[Tensor, Tensor]:
 
-    stepM_blk = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev)
+    # TODO: FOLLOW UP, ensre this signature is correct in all branches, remove type-ignore
+    stepM_blk = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev) # type: ignore
 
     Lij_blk = torch.sum(Ar_dev[edge_i, :] * B_blk_dev[edge_j, :], dim=1)
     Mij_blk = torch.relu(Lij_blk)
@@ -249,3 +249,136 @@ def update_factor_salsa(
     )
     
     return nextF, dF
+
+
+# TODO: Ask whether learning rate is still intended to be a scalar
+# TODO: Can we break this into fewer than 140 lines maybe
+def salsa_loop(
+    S_index: Tensor,
+    S_value: Tensor,
+    m: int,
+    n: int,
+    cfg: SumacConfig,
+    A_init: Tensor | None = None,
+    B_init: Tensor | None = None
+):
+    """
+    Minimal PyTorch version of the SALSA loop, reusing helpers from sumac.py.
+    """
+    assert cfg.num_blocks is not None
+    assert cfg.device is not None
+
+    (gen, gen_rows, gen_cols) = cfg.get_generator()
+    assert gen_rows is not None
+    assert gen_cols is not None
+
+    configure_kernel_prec(
+        allow_tf32=cfg.allow_tf32,
+        device=cfg.device,
+        D=cfg.rank,
+        dtype=cfg.dtype,
+    )
+
+    S_index = S_index.to(cfg.device)
+    S_value = S_value.to(cfg.device)
+    if A_init is None or B_init is None:
+        nvtx_range_push("init_salsa_factors")
+        A, B = init_salsa_factors(S_index, S_value, m, n, cfg.rank, gen=gen)
+        nvtx_range_pop()
+    else:
+        A, B = A_init.to(cfg.device), B_init.to(cfg.device)
+
+    dA = torch.zeros_like(A)
+    dB = torch.zeros_like(B)
+
+
+    # Datasets for row and column blocks
+
+    nvtx_range_push("StochasitcRowBlockDataset rows")
+    ds_rows = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen=gen_rows)
+    S_index_T = S_index[[1, 0], :] 
+    nvtx_range_pop()
+
+    nvtx_range_push("StochasticRowBlockDataset cols")
+    ds_cols = StochasticRowBlockDataset(S_index_T, S_value, n, cfg.num_blocks, gen=gen_cols)
+    nvtx_range_pop()
+    ##init evaluation
+
+    nvtx_range_push("eval_loader init")
+    eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+    rmse, jacc, errZ = eval(A.to(cfg.device), B.to(cfg.device), S_index, S_value, m, n, cfg.num_blocks, 
+                            eval_loader, device=cfg.device, errZ_obj=True)
+    print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
+    nvtx_range_pop()
+    rmse_hist = []
+    jacc_hist = []
+    time_hist = []
+    lrate = torch.tensor(cfg.learning_rate, device=A.device, dtype=A.dtype)
+    t_start_loop = time.time()    
+    
+    momentum = torch.tensor(cfg.momentum, device=A.device, dtype=A.dtype)
+    t_start = time.time()
+    for iter_idx in range(1, cfg.max_iterations + 1):
+        nvtx_range_push("Iteration " + str(iter_idx))
+
+        # Truly stochastic sampling: reshuffle partitions every epoch
+        nvtx_range_push("reshuffle")
+        ds_rows.reshuffle()
+        ds_cols.reshuffle()
+        block_order = list(range(cfg.num_blocks))
+        nvtx_range_pop()
+        #random.shuffle(block_order) -- only used for deterministic minibatch
+        
+        for mb_idx, block_id in enumerate(block_order):
+            stepnum: int = mb_idx + 1 + (iter_idx - 1) * cfg.num_blocks
+            unbias = 1 - (momentum ** stepnum)
+            nvtx_range_push("update_factor_salsa B")
+
+            # --- Update B ---
+            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias, lrate)
+            nvtx_range_pop()
+
+            nvtx_range_push("update_factor_salsa A")
+            # --- Update A ---
+            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias, lrate)
+            nvtx_range_pop()
+
+        # Metrics and Reporting
+        if cfg.eval_interval is not None and iter_idx % cfg.eval_interval == 0:
+            eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
+            rmse, jacc, errZ = eval(
+                A.to(cfg.device),
+                B.to(cfg.device),
+                S_index,
+                S_value,
+                m,
+                n,
+                cfg.num_blocks,
+                eval_loader,
+                device=cfg.device,
+                errZ_obj=True,
+            )
+
+            if cfg.device.type == "cuda":
+                synchronize_if_cuda(cfg.device)
+            elapsed = time.time() - t_start
+            rmse_hist.append(rmse)
+            jacc_hist.append(jacc)
+            time_hist.append(elapsed)
+            
+            if cfg.verbose:
+                print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
+            t_start = time.time()
+        nvtx_range_pop()
+    # WRAP UP
+    costs = {
+        'rmse': rmse_hist,
+        'jacc': jacc_hist,
+        'time': time_hist
+    }
+
+    if cfg.verbose:
+        total = time.time() - t_start_loop
+        print(f"\nTotal elapsed time: {total:.2f} sec")
+
+    return A, B, costs

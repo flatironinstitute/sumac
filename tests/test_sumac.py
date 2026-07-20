@@ -1,11 +1,14 @@
+import math
 import torch
 import torch.nn.functional as F
 import time
-import math
+from pytest import mark
 import numpy as np
 from sumac import sumac_factorize
 from sumac.data import dense_to_sparse
 import scipy as sp
+
+from sumac.config import SumacMethod, SumacConfig
 
 def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, seed=0):
     """
@@ -20,10 +23,14 @@ def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, 
     # Compute product
     S_latent = A_true @ B_true.T
     
-    # Estimate bias to achieve target density
-    # For Gaussian-like sum, we can use the percentile
-    bias = torch.quantile(S_latent.flatten(), 1.0 - density)
-    S_dense = S_latent - bias
+    # Set a bias based on the target density
+    # i.e. find a value in the tensor for which m*n*density elements
+    # will be greater, so we can subtract that, thus setting the others
+    # to zero after the relu
+    S_flat = S_latent.flatten()
+    bias_idx = math.ceil(len(S_flat) * density)
+    bias_val = torch.sort(S_flat, descending=True)[0][bias_idx]
+    S_dense = S_latent - bias_val
     
     # Add noise
     if noise_level > 0:
@@ -36,6 +43,7 @@ def generate_low_rank_data(m=1000, n=1000, d=16, noise_level=0.01, density=0.1, 
     # Convert to sparse
     S_index, S_value = dense_to_sparse(S_dense)
     return S_index, S_value, m, n
+
 
 def torch2scipy_svd(S_index, S_value, n, k=16):
     rows = S_index[0].numpy()
@@ -56,8 +64,16 @@ def torch2scipy_svd(S_index, S_value, n, k=16):
     return torch.FloatTensor(A), torch.FloatTensor(B)
 
 
-def test_low_rank(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters=300):
-    
+@mark.parametrize("method, num_blocks", [(SumacMethod.GD, 2), (SumacMethod.SALSA, 25)])
+def test_low_rank(method: SumacMethod, num_blocks: int):
+    m = 10000
+    n = 10000
+    d_true = 16
+    d_fit = 16
+    target_density = 0.01
+    iters = 300
+
+    # TODO: decide whether to actually keep the manually-call-the-test interface
     print(f"--- Low-Rank Ground Truth Test (m={m}, n={n}, d_true={d_true}, density={target_density}) ---")
     S_index, S_value, m, n = generate_low_rank_data(m, n, d_true, density=target_density, noise_level=0.0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,46 +81,42 @@ def test_low_rank(m=1000, n=1000, d_true=16, d_fit=16, target_density=0.1, iters
     actual_density = len(S_value) / (m * n)
     print(f"Actual density: {actual_density:.4f} ({len(S_value)} non-zeros)")
     
-    methods = ["GD", "SALSA"] #TODO: sync and test the other routines 
-
-    #same factor init using SVD 
-    A_init, B_init = torch2scipy_svd(S_index, S_value, n, k=d_fit)
     S_index = S_index.to(device)
     S_value = S_value.to(device)
-    A_init = A_init.to(device)
-    B_init = B_init.to(device)
-    print(A_init.shape, B_init.shape)
     
-    for method in methods:
-        print(f"\n>> Running SUMAC with method: {method}")
-        t_start = time.time()
-        A, B, costs = sumac_factorize(
-            S_index=S_index,
-            S_value=S_value,
-            shape=(m, n),
-            rank=d_fit,
-            max_iterations=iters,
-            method=method,
-            learning_rate=1e-1 if method == "GD" else 0.1, # adjust lr for GD
-            num_blocks=2,
-            A_init=A_init,
-            B_init=B_init,
-        )
-        elapsed = time.time() - t_start
-        
-        # Calculate final error
-        with torch.no_grad():
-            S_pred = torch.relu(A @ B.T)
-            # Reconstruct dense S for checking
-            eval_device = S_pred.device
-            S_index_eval = S_index.to(eval_device)
-            S_value_eval = S_value.to(eval_device)
-            S_dense = torch.zeros(m, n, dtype=S_value_eval.dtype, device=eval_device)
-            S_dense[S_index_eval[0], S_index_eval[1]] = S_value_eval
-            mse = F.mse_loss(S_pred, S_dense).item()
-            
-        print(f"Method {method} completed in {elapsed:.2f}s. Final MSE: {mse:.6f}")
-        assert mse < 0.08, f"{method} final MSE {mse:.6f} is too large."
+    config = SumacConfig(
+        rank = d_fit,
+        max_iterations = iters,
+        method = method,
+        learning_rate = 0.1,
+        num_blocks = num_blocks,
+        seed = 0
+    )
+    print(f"\n>> Running SUMAC with method: {method}")
+    t_start = time.time()
+    A, B, costs = sumac_factorize(
+        S_index=S_index,
+        S_value=S_value,
+        shape=(m, n),
+        config=config
+    )
+    elapsed = time.time() - t_start
+    
+    # Calculate final error
+    with torch.no_grad():
+        S_pred = torch.relu(A @ B.T)
+        # Reconstruct dense S for checking
+        eval_device = S_pred.device
+        S_index_eval = S_index.to(eval_device)
+        S_value_eval = S_value.to(eval_device)
+        S_dense = torch.zeros(m, n, dtype=S_value_eval.dtype, device=eval_device)
+        S_dense[S_index_eval[0], S_index_eval[1]] = S_value_eval
+        mse = F.mse_loss(S_pred, S_dense).item()
+    
+    print(f"Method {method} completed in {elapsed:.2f}s. Final MSE: {mse:.6f}")
+    # TODO: This is not a very strong assertion
+    assert mse < 0.08, f"{method} final MSE {mse:.6f} is too large."
 
 if __name__ == "__main__":
-    test_low_rank()
+    test_low_rank(SumacMethod.GD, 2)
+    test_low_rank(SumacMethod.SALSA, 25)

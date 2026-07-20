@@ -10,8 +10,6 @@ pytestmark = pytest.mark.skipif(
 
 FP32_MAX_ABS_ERROR = 5e-3
 TF32_MAX_ABS_ERROR = 2.0
-BACKWARD_RTOL = 1e-4
-BACKWARD_ATOL = 5e-3
 
 
 def relu_bat_c_tf32_reference(
@@ -40,8 +38,8 @@ def assert_max_abs_close(
 
 @pytest.mark.parametrize("D", [16, 32, 64, 128])
 def test_relu_batc_kernel(D: int):
-    N = 250
-    M = 25000
+    N = 2500
+    M = 250000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
@@ -72,8 +70,8 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
     )
 
     torch.manual_seed(D)
-    N = 250
-    M = 25000
+    N = 2500
+    M = 250000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
@@ -162,8 +160,8 @@ def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
     )
 
     torch.manual_seed(D)
-    N = 250
-    M = 25000
+    N = 2500
+    M = 250000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
@@ -177,8 +175,8 @@ def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
 
 @pytest.mark.parametrize("D", [13, 16, 17, 32, 64, 128, 256])
 def test_relu_bat_reduce_kernel(D: int):
-    N = 250
-    M = 25000
+    N = 2500
+    M = 250000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
 
@@ -200,8 +198,8 @@ def test_relu_bat_reduce_kernel(D: int):
 @pytest.mark.parametrize("include_sum_sr", [False, True])
 def test_relu_bat_reduce_kernel_backward(D: int, include_sum_sr: bool):
     torch.manual_seed(D + int(include_sum_sr))
-    M = 25000
-    N = 250
+    M = 257
+    N = 263
     A = torch.randn(M, D, device="cuda", dtype=torch.float32, requires_grad=True)
     B = torch.randn(N, D, device="cuda", dtype=torch.float32, requires_grad=True)
     A_ref = A.detach().clone().requires_grad_(True)
@@ -224,15 +222,5 @@ def test_relu_bat_reduce_kernel_backward(D: int, include_sum_sr: bool):
     reference_loss.backward()
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        A.grad,
-        A_ref.grad,
-        rtol=BACKWARD_RTOL,
-        atol=BACKWARD_ATOL,
-    )
-    torch.testing.assert_close(
-        B.grad,
-        B_ref.grad,
-        rtol=BACKWARD_RTOL,
-        atol=BACKWARD_ATOL,
-    )
+    assert_max_abs_close(A.grad, A_ref.grad, FP32_MAX_ABS_ERROR)
+    assert_max_abs_close(B.grad, B_ref.grad, FP32_MAX_ABS_ERROR)

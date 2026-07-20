@@ -411,9 +411,13 @@ def relu_bat_c_tf32_wgmma_launcher(
     return relu_bat_c_tf32_wgmma_cuda
 
 
-def select_relu_bat_c_kernel_mode(allow_tf32: bool, device) -> str:
+def select_relu_bat_c_kernel_mode(
+    allow_tf32: bool,
+    device,
+    dtype: torch.dtype = torch.float32,
+) -> str:
     device = torch.device(device)
-    if device.type != "cuda" or not cuda_is_available():
+    if dtype != torch.float32 or device.type != "cuda" or not cuda_is_available():
         return "fallback"
     if not allow_tf32:
         return "fp32_cuda"

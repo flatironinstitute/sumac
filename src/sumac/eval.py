@@ -1,6 +1,6 @@
 import torch
 
-from .kernels.cuda_utils import cuda_is_available, nvtx_range, nvtx_range_pop, nvtx_range_push
+from .kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
 from .kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
 from .datasets import block_span
 
@@ -15,35 +15,54 @@ def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
     global relu_bat_reduce_kernel_mode
     global relu_bat_reduce_kernel_autotune_options
 
-    autotune_options = active_kernel_autotune_options()
-    if not (
-        A.dtype == torch.float32
-        and B.dtype == torch.float32
-        and A.is_cuda
-        and B.is_cuda
-        and cuda_is_available()
-    ):
-        if relu_bat_reduce_kernel_mode != "fallback" or relu_bat_tuned is None:
-            from .kernels.relu_bat_reduce import (
-                relu_bat_reduce_fallback_launcher,
-            )
+    from .kernels.relu_bat_reduce import (
+        relu_bat_reduce_fallback_launcher,
+        relu_bat_reduce_launcher,
+        select_relu_bat_reduce_kernel_mode,
+    )
 
-            relu_bat_tuned = relu_bat_reduce_fallback_launcher()
-            relu_bat_reduce_kernel_mode = "fallback"
-            relu_bat_reduce_kernel_autotune_options = autotune_options
+    autotune_options = active_kernel_autotune_options()
+    mode = select_relu_bat_reduce_kernel_mode(A, B)
+    if (
+        mode == relu_bat_reduce_kernel_mode
+        and relu_bat_tuned is not None
+        and autotune_options == relu_bat_reduce_kernel_autotune_options
+    ):
         return relu_bat_tuned
 
-    if (
-        relu_bat_reduce_kernel_mode != "cuda" or
-        relu_bat_tuned is None or
-        autotune_options != relu_bat_reduce_kernel_autotune_options
-    ):
-        from .kernels.relu_bat_reduce import relu_bat_reduce_launcher
-
+    if mode == "fallback":
+        relu_bat_tuned = relu_bat_reduce_fallback_launcher()
+    else:
         relu_bat_tuned = relu_bat_reduce_launcher(autotune_options)
-        relu_bat_reduce_kernel_mode = "cuda"
-        relu_bat_reduce_kernel_autotune_options = autotune_options
+
+    relu_bat_reduce_kernel_mode = mode
+    relu_bat_reduce_kernel_autotune_options = autotune_options
     return relu_bat_tuned
+
+
+@torch.compile(mode="max-autotune-no-cudagraphs", dynamic=True)
+def block_loss_no_errz(
+    A_block: torch.Tensor,   
+    B: torch.Tensor,         
+    local_r: torch.Tensor,   
+    cols_all: torch.Tensor, 
+    vals_all: torch.Tensor,
+):
+    Sr = torch.relu(A_block @ B.T)
+
+    sum_sr = Sr.sum()
+    sum_sr2 = (Sr * Sr).sum()
+
+    sr_obs = Sr[local_r, cols_all]
+    dot_obs = (vals_all * sr_obs).sum()
+    jacc_num = torch.minimum(vals_all, sr_obs).sum()
+    ssq_vals = (vals_all * vals_all).sum()
+
+    #||Sr - S||^2 where S is sparse and zero elsewhere
+    mse_full = sum_sr2 - 2.0 * dot_obs + ssq_vals
+
+    errZ_num = mse_full
+    return mse_full, sum_sr, jacc_num, errZ_num
 
 
 @torch.compile(dynamic=True)
@@ -70,13 +89,7 @@ def block_loss_errz(
 
     jacc_num = torch.minimum(vals_all64, Mij).sum()
     
-    output_dtype = A_block.dtype
-    return (
-        mse_full.to(output_dtype),
-        sum_sr.squeeze().to(output_dtype),
-        jacc_num.to(output_dtype),
-        errZ_num.to(output_dtype),
-    )
+    return mse_full.to(torch.float32), sum_sr.squeeze().to(torch.float32), jacc_num.to(torch.float32), errZ_num.to(torch.float32)
 
 
 def compute_local_rows(
@@ -98,9 +111,6 @@ def compute_local_rows(
         local_map[row_indices] = torch.arange(b, device=rows_all.device)
         local_r = local_map[rows_all]
 
-        if (local_r < 0).any().item():
-            raise ValueError("rows_all contains rows that are not present in row_indices")
-
         return local_r, b
 
     if start is None:
@@ -108,7 +118,6 @@ def compute_local_rows(
 
     local_r = rows_all - start
     return local_r, None
-
 
 
 def block_loss_and_pred(
@@ -122,6 +131,7 @@ def block_loss_and_pred(
     S_value: torch.Tensor,           # (nnz,)
     edge_idx: torch.Tensor,          # indices into S_index/S_value for this block
     row_indices: torch.Tensor | None = None, # NEW: explicit row indices for this block
+    errZ_obj: bool = False,          # whether use objective to min ||Z - L|| instead of ||S - Sr||
 ):
     """
     - Builds full block prediction Sr_I = ReLU(A_I @ B^T) (shape b x n).
@@ -159,23 +169,25 @@ def block_loss_and_pred(
         row_indices=row_indices,
         start=start,
     )
-    if ((local_r < 0) | (local_r >= b)).any().item():
-        raise ValueError("edge_idx contains rows outside the selected row block")
 
 #       torch.cuda.profiler.start()
-    with nvtx_range("block_loss_errz"):
-        reduce_kernel = get_relu_bat_reduce(A_block, B)
-        reduce_kernel.resolve_params(A_block, B)
-        sum_sr, sum_sr2 = reduce_kernel(A_block, B)
-        mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(
-            A_block,
-            B,
-            local_r,
-            cols_all,
-            vals_all,
-            sum_sr,
-            sum_sr2,
-        )
+    if errZ_obj:
+        with nvtx_range("block_loss_errz"):
+            reduce_kernel = get_relu_bat_reduce(A_block, B)
+            reduce_kernel.resolve_params(A_block, B)
+            sum_sr, sum_sr2 = reduce_kernel(A_block, B)
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(
+                A_block,
+                B,
+                local_r,
+                cols_all,
+                vals_all,
+                sum_sr,
+                sum_sr2,
+            )
+    else:
+        with nvtx_range("block_loss_no_errz"):
+            mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_no_errz(A_block, B, local_r, cols_all, vals_all)
 #    torch.cuda.profiler.stop()
     return mse_full, sumSr_block, jacc_num_block, errZ_num_block
 
@@ -191,6 +203,7 @@ def eval(
     num_blocks: int,
     full_block_loader,   # yields (block_id, edge_idx) once per block_id # TODO
     device: torch.device | None = None,
+    errZ_obj: bool = False,  # whether use objective to min ||Z - L|| instead of ||S - Sr||
 ):
     if device is None:
         device = A.device
@@ -217,6 +230,7 @@ def eval(
                 S_value,
                 edge_idx, 
                 row_indices=row_indices,
+                errZ_obj=errZ_obj
             )
             nvtx_range_pop()
 
