@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 import math
+import warnings
 import torch
 from torch import Tensor
 
@@ -34,10 +35,21 @@ def _validate_finite_number(name: str, value: object) -> None:
 def _matmul_precision(allow_tf32: bool):
     previous_precision = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
-    try:
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous_precision)
+    with warnings.catch_warnings():
+        if not allow_tf32:
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    "TensorFloat32 tensor cores for float32 matrix multiplication "
+                    "available but not enabled.*"
+                ),
+                category=UserWarning,
+                module=r"torch\._inductor\.compile_fx",
+            )
+        try:
+            yield
+        finally:
+            torch.set_float32_matmul_precision(previous_precision)
 
 
 def _validate_sumac_inputs(
@@ -229,7 +241,10 @@ def sumac_factorize(
         S_index = S_index.to(config.device)
         S_value = S_value.to(device=config.device, dtype=config.dtype)
 
-        S_index, row_mask, col_mask, m_eff, n_eff = prune_zero_rows_cols(S_index, shape=(m,n))
+        S_index, row_mask, col_mask, m_eff, n_eff = prune_zero_rows_cols(
+            S_index,
+            shape=(m, n),
+        )
         config.set_block_sizes(m_eff, n_eff)
         assert config.num_blocks is not None
         assert config.eval_interval is not None
@@ -267,5 +282,6 @@ def sumac_factorize(
 
         A_ori, B_ori = restore_zero_rows_cols(A, B, m, n, config.rank, row_mask, col_mask)
 
-        print(f'SUMAC finished after {config.max_iterations} iterations.')
+        if config.verbose:
+            print(f'SUMAC finished after {config.max_iterations} iterations.')
         return A_ori, B_ori, costs

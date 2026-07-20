@@ -150,11 +150,13 @@ def GD_loop(
         S_norm = float(torch.norm(S_value).item())
         rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
         log = f"[epoch {epoch}/{cfg.max_iterations}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
-        print(log)
+        if cfg.verbose:
+            print(log)
         history.append(log)
         nvtx_range_pop()
     total = time.time() - t0
-    print(f"\nTotal elapsed time: {total:.2f} sec")
+    if cfg.verbose:
+        print(f"\nTotal elapsed time: {total:.2f} sec")
 
     rmse, jacc, errZ = eval(
         A,
@@ -164,6 +166,7 @@ def GD_loop(
         full_block_loader=loader,
         device=A.device,
     )
-    print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
+    if cfg.verbose:
+        print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
 
     return A.detach(), B.detach(), history

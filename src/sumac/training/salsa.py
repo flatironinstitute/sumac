@@ -51,7 +51,6 @@ def init_salsa_factors(
     """
     Initialize with A > 0 and B < 0, then rescale.
     """
-    print("salsa init...")
     device = S_value.device
     dtype = S_value.dtype
 
@@ -283,7 +282,14 @@ def salsa_loop(
     S_value = S_value.to(cfg.device)
     if A_init is None or B_init is None:
         nvtx_range_push("init_salsa_factors")
-        A, B = init_salsa_factors(S_index, S_value, m, n, cfg.rank, gen=gen)
+        A, B = init_salsa_factors(
+            S_index,
+            S_value,
+            m,
+            n,
+            cfg.rank,
+            gen=gen,
+        )
         nvtx_range_pop()
     else:
         A, B = A_init.to(cfg.device), B_init.to(cfg.device)
@@ -314,7 +320,8 @@ def salsa_loop(
         eval_loader,
         device=cfg.device,
     )
-    print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
+    if cfg.verbose:
+        print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
     nvtx_range_pop()
     rmse_hist = []
     jacc_hist = []

@@ -50,7 +50,6 @@ def prune_zero_rows_cols(S_index, shape):
     r, c = S_index
     m, n = shape
     if r.unique().numel() == m and c.unique().numel() == n:
-        print(f"no all-zero row or col")
         return S_index, None, None, m, n # nothing to drop
     dev = S_index.device
     row_mask = torch.zeros(m, dtype=torch.bool, device=dev)
@@ -62,7 +61,6 @@ def prune_zero_rows_cols(S_index, shape):
     col_new = torch.full((n,), -1, dtype=torch.long, device=dev)
     col_new[col_mask] = torch.arange(col_mask.sum().item(), device=dev)
     new_idx = torch.stack([row_new[r], col_new[c]])
-    print(f"{int(row_mask.sum())} rows, {int(col_mask.sum())} cols")
 
     m_eff = row_mask.sum().item() if row_mask is not None else m
     n_eff = col_mask.sum().item() if col_mask is not None else n

@@ -37,7 +37,6 @@ def make_config_from_args() -> SumacConfig:
     parser.add_argument('--log_filename', type=str, default=None,
         help="filename for logging. If unset, stdout is used."
     )
-    parser.add_argument('--verbose', action="store_true")
     parser.add_argument('--autotune', type=str, default='cache',
         choices=['cache', 'force', 'disable', 'fallback'],
         help='CUDA kernel autotuning mode.'
@@ -82,7 +81,7 @@ def make_config_from_args() -> SumacConfig:
         learning_rate = args.learning_rate,
         optimizer = optimizer,
         eval_interval = args.eval_interval,
-        verbose = args.verbose,
+        verbose = True,
         autotune = autotune_mode,
         autotune_cache_dir = args.autotune_cache_dir,
         autotune_verbose = args.autotune_verbose,

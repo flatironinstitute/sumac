@@ -46,8 +46,6 @@ def load_data(filename: str, ex: example_type, dtype: torch.dtype = torch.float3
     assert isinstance(m, int)
     assert isinstance(n, int)
 
-    # TODO: Gate this on verbosity
-    print(f'm={m}, n={n}, E={len(S_value)}')
     return (m, n, S_index, S_value)
 
 
