@@ -3,7 +3,6 @@ from enum import Enum
 import math
 import os
 from pathlib import Path
-import random
 import torch
 
 class SumacMethod(Enum):
@@ -121,16 +120,6 @@ class SumacConfig:
             a data file to load. Ignored in normal use.
         log_filename (str): Output filename for log data
             from examples. Ignored in normal use.
-        eval_only (bool): Used in examples only. If True,
-            the example will skip training and only provide
-            an evaluation of provided matrix factors.
-        eval_path (str | None): Used in examples only, as the
-            directory to write the matrix factors into. In
-            eval-only mode, this directory should contain
-            the matrix factors to evaluate.
-        eval_save (bool): Used in examples only. If True,
-            the factors discovered through training will be
-            saved in eval_path; otherwise they are discarded.
     """
     method: SumacMethod = SumacMethod.SALSA
     rank: int = 16
@@ -159,9 +148,6 @@ class SumacConfig:
     # consumed by examples only
     input_filename: str | None = None
     log_filename: str | None = None
-    eval_only: bool = False
-    eval_path: str | None = None
-    eval_save: bool = False
 
 
     def __post_init__(self):
@@ -175,10 +161,8 @@ class SumacConfig:
             if (self.optimizer == OptimizerName.MUON
                 and self.method == SumacMethod.GD):
                 self.momentum = 0.95
-        if self.seed is not None:
-            if self.verbose:
-                print(f"seed = {self.seed}")
-            random.seed(self.seed)
+        if self.seed is not None and self.verbose:
+            print(f"seed = {self.seed}")
 
 
     def set_block_sizes(self, m: int, n: int):
@@ -204,15 +188,17 @@ class SumacConfig:
 
     
     def get_generator(self):
-        gen = torch.Generator(device = self.device)
-        gen_rows = None
-        gen_cols = None
-        if self.method == SumacMethod.SALSA:
-            gen_rows = torch.Generator(device = self.device)
-            gen_cols = torch.Generator(device = self.device)
-        if self.seed is not None:
-            gen.manual_seed(self.seed)
-            torch.manual_seed(self.seed)
-            if gen_rows is not None: gen_rows.manual_seed(self.seed + 1)
-            if gen_cols is not None: gen_cols.manual_seed(self.seed + 2)
-        return (gen, gen_rows, gen_cols)
+        gen = torch.Generator(device=self.device)
+        gen_rows = torch.Generator(device=self.device)
+        tmp_device = self.device if self.method == SumacMethod.SALSA else "cpu"
+        gen_aux = torch.Generator(device=tmp_device)
+        generators = (gen, gen_rows, gen_aux)
+
+        if self.seed is None:
+            for generator in generators:
+                generator.seed()
+        else:
+            for offset, generator in enumerate(generators):
+                generator.manual_seed(self.seed + offset)
+
+        return generators

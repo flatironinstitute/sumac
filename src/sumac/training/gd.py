@@ -60,7 +60,7 @@ def GD_loop(
     assert cfg.num_blocks is not None
     assert cfg.device is not None
 
-    (gen, _, _) = cfg.get_generator()
+    (gen, gen_blocks, gen_loader) = cfg.get_generator()
     
     # Move data to the training device.
     S_index = S_index.to(cfg.device)
@@ -86,8 +86,8 @@ def GD_loop(
             ) * scale
         )
     else:
-        A = torch.nn.Parameter(A_init.to(cfg.device))
-        B = torch.nn.Parameter(B_init.to(cfg.device))
+        A = torch.nn.Parameter(A_init.detach().to(cfg.device).clone())
+        B = torch.nn.Parameter(B_init.detach().to(cfg.device).clone())
     opt = make_optimizer(
         cfg.optimizer,
         [A, B],
@@ -99,12 +99,13 @@ def GD_loop(
     )
 
     # DataLoader
-    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen)
+    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen_blocks)
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_blocks,
         shuffle=cfg.shuffle_blocks,
-        collate_fn=collate_blocks
+        collate_fn=collate_blocks,
+        generator=gen_loader,
     )
 
     history = []
@@ -134,7 +135,6 @@ def GD_loop(
                     S_value=S_value,
                     edge_idx=edge_idx,
                     row_indices=row_indices,
-                    errZ_obj=True,
                 )
                 loss_block = errZ_block if errZ_block is not None else mse_block
                 loss = loss + loss_block
@@ -170,7 +170,6 @@ def GD_loop(
         num_blocks=cfg.num_blocks,
         full_block_loader=loader,
         device=A.device,
-        errZ_obj=True
     )
     print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
 

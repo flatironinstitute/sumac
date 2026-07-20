@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import math
 import torch
 from torch import Tensor
@@ -27,6 +28,16 @@ def _validate_finite_number(name: str, value: object) -> None:
         or not math.isfinite(value)
     ):
         raise ValueError(f"{name} must be a finite number, got {value!r}")
+
+
+@contextmanager
+def _matmul_precision(allow_tf32: bool):
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
 
 
 def _validate_sumac_inputs(
@@ -213,48 +224,48 @@ def sumac_factorize(
         config=config,
     )
 
-    torch.set_float32_matmul_precision('high' if config.allow_tf32 else 'highest')
-    config.device = resolve_sumac_device(S_index, S_value, config)
-    S_index = S_index.to(config.device)
-    S_value = S_value.to(device=config.device, dtype=config.dtype)
+    with _matmul_precision(config.allow_tf32):
+        config.device = resolve_sumac_device(S_index, S_value, config)
+        S_index = S_index.to(config.device)
+        S_value = S_value.to(device=config.device, dtype=config.dtype)
 
-    S_index, row_mask, col_mask, m_eff, n_eff = prune_zero_rows_cols(S_index, shape=(m,n))
-    config.set_block_sizes(m_eff, n_eff)
-    assert config.num_blocks is not None
-    assert config.eval_interval is not None
-    max_num_blocks = min(m_eff, n_eff)
-    if not 1 <= config.num_blocks <= max_num_blocks:
-        raise ValueError(
-            "config.num_blocks must satisfy "
-            f"1 <= num_blocks <= min(effective shape)={max_num_blocks}, "
-            f"got {config.num_blocks}"
-        )
+        S_index, row_mask, col_mask, m_eff, n_eff = prune_zero_rows_cols(S_index, shape=(m,n))
+        config.set_block_sizes(m_eff, n_eff)
+        assert config.num_blocks is not None
+        assert config.eval_interval is not None
+        max_num_blocks = min(m_eff, n_eff)
+        if not 1 <= config.num_blocks <= max_num_blocks:
+            raise ValueError(
+                "config.num_blocks must satisfy "
+                f"1 <= num_blocks <= min(effective shape)={max_num_blocks}, "
+                f"got {config.num_blocks}"
+            )
 
-    if A_init is not None and B_init is not None:
-        A_init = A_init.to(config.device)
-        B_init = B_init.to(config.device)
-        if row_mask is not None:
-            A_init = A_init[row_mask]
-        if col_mask is not None:
-            B_init = B_init[col_mask]
+        if A_init is not None and B_init is not None:
+            A_init = A_init.to(config.device)
+            B_init = B_init.to(config.device)
+            if row_mask is not None:
+                A_init = A_init[row_mask]
+            if col_mask is not None:
+                B_init = B_init[col_mask]
 
-    config.print_prefactor_report(S_value, m, n, cuda_device_count())
+        config.print_prefactor_report(S_value, m, n, cuda_device_count())
 
-    nvtx_range_push("core SUMAC loop")
-    with kernel_autotune_options(
-        mode=config.autotune.value,
-        cache_dir=config.autotune_cache_dir,
-        verbose=config.autotune_verbose,
-    ):
-        if config.method == SumacMethod.GD:
-            A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, config, A_init, B_init)
-        elif config.method == SumacMethod.SALSA:
-            A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, config, A_init, B_init)
-        else:
-            raise NotImplementedError("method must be chosen from GD or SALSA")
-    nvtx_range_pop()
+        nvtx_range_push("core SUMAC loop")
+        with kernel_autotune_options(
+            mode=config.autotune.value,
+            cache_dir=config.autotune_cache_dir,
+            verbose=config.autotune_verbose,
+        ):
+            if config.method == SumacMethod.GD:
+                A, B, costs = GD_loop(S_index, S_value, m_eff, n_eff, config, A_init, B_init)
+            elif config.method == SumacMethod.SALSA:
+                A, B, costs = salsa_loop(S_index, S_value, m_eff, n_eff, config, A_init, B_init)
+            else:
+                raise NotImplementedError("method must be chosen from GD or SALSA")
+        nvtx_range_pop()
 
-    A_ori, B_ori = restore_zero_rows_cols(A, B, m, n, config.rank, row_mask, col_mask)
+        A_ori, B_ori = restore_zero_rows_cols(A, B, m, n, config.rank, row_mask, col_mask)
 
-    print(f'SUMAC finished after {config.max_iterations} iterations.')
-    return A_ori, B_ori, costs
+        print(f'SUMAC finished after {config.max_iterations} iterations.')
+        return A_ori, B_ori, costs

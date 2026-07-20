@@ -3,12 +3,9 @@ import os
 import pickle
 import scipy.io as sio
 import torch
-from torch.utils.data import DataLoader
 from typing import Literal
 
 from sumac import sumac_factorize
-from sumac.datasets import RowBlockDataset, collate_blocks
-from sumac.eval import eval
 from sumac.config import SumacConfig
 
 
@@ -107,71 +104,3 @@ def load_factorize_save(config: SumacConfig, etype: example_type, save_path: str
         pickle.dump(costs, f)
     with open(f"{save_path}/opts.pkl", "wb") as f:
         pickle.dump(vars(config), f)
-
-    eval_device = A.device
-    do_eval(A, B, S_index, S_value, m, n, config, eval_device)
-
-
-
-## Final/Sole Error Evaluation
-
-def eval_only(cfg: SumacConfig, etype: example_type):
-    assert cfg.input_filename is not None
-
-    # ensure defaults
-    eval_device = cfg.device
-    cfg.eval_path = '' if cfg.eval_path is None else cfg.eval_path
-    cfg.num_blocks = 100 if cfg.num_blocks is None else cfg.num_blocks
-    if eval_device is None:
-        device_str = "cuda" if torch.cuda.is_available() else "cpu"
-        eval_device = torch.device(device_str)
-
-    (m, n, S_index, S_value) = load_data(cfg.input_filename, etype, cfg.dtype)
-    A, B = torch.load(f"{cfg.eval_path}/AB.pt", map_location="cpu")
-    do_eval(A, B, S_index, S_value, m, n, cfg, eval_device, eval_only=True)
-
-    #saving to txt
-    if cfg.eval_save:
-        print(A.shape, B.shape)
-        np.savetxt(f"{cfg.eval_path}/A.txt", A.cpu().numpy(), fmt="%.8f")
-        np.savetxt(f"{cfg.eval_path}/B.txt", B.cpu().numpy(), fmt="%.8f")
-    exit()
-
-
-def do_eval(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    S_index: torch.Tensor,
-    S_value: torch.Tensor,
-    m: int,
-    n: int,
-    cfg: SumacConfig,
-    eval_device: torch.device,
-    eval_only: bool = False
-):
-    assert cfg.num_blocks is not None
-    A_eval = A.detach().to(eval_device)
-    B_eval = B.detach().to(eval_device)
-    S_index_eval = S_index.to(eval_device)
-    S_value_eval = S_value.to(eval_device)
-
-    ds = RowBlockDataset(
-        S_index_eval,
-        S_value_eval,
-        m=m,
-        num_blocks=cfg.num_blocks,
-    )
-    loader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=collate_blocks)
-    rmse, jacc, errZ = eval(
-        A_eval,
-        B_eval,
-        S_index_eval,
-        S_value_eval,
-        m,
-        n,
-        num_blocks=cfg.num_blocks,
-        full_block_loader=loader,
-        device=eval_device,
-    )
-    label = "EVAL" if eval_only else "Final metrics"
-    print(f"{label}: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")

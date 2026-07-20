@@ -37,13 +37,6 @@ def make_config_from_args() -> SumacConfig:
     parser.add_argument('--log_filename', type=str, default=None,
         help="filename for logging. If unset, stdout is used."
     )
-    parser.add_argument('--eval_only', action='store_true',
-        help='Only evaluate metrics for factors saved in eval_path, no training is performed if set.'
-    )
-    parser.add_argument('--eval_path', type=str)
-    parser.add_argument('--eval_save',  action='store_true',
-        help='Save evaluation results to .txt file.'
-    )
     parser.add_argument('--verbose', action="store_true")
     parser.add_argument('--autotune', type=str, default='cache',
         choices=['cache', 'force', 'disable', 'fallback'],
@@ -95,7 +88,4 @@ def make_config_from_args() -> SumacConfig:
         autotune_verbose = args.autotune_verbose,
         input_filename = args.filename,
         log_filename = args.log_filename,
-        eval_only = args.eval_only,
-        eval_path = args.eval_path,
-        eval_save = args.eval_save
     )

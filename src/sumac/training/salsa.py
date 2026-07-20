@@ -307,7 +307,7 @@ def salsa_loop(
     nvtx_range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(A.to(cfg.device), B.to(cfg.device), S_index, S_value, m, n, cfg.num_blocks, 
-                            eval_loader, device=cfg.device, errZ_obj=True)
+                            eval_loader, device=cfg.device)
     print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
     nvtx_range_pop()
     rmse_hist = []
@@ -356,7 +356,6 @@ def salsa_loop(
                 cfg.num_blocks,
                 eval_loader,
                 device=cfg.device,
-                errZ_obj=True,
             )
 
             if cfg.device.type == "cuda":
