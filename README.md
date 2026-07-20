@@ -51,26 +51,32 @@ The package source is under ```src/sumac```, with examples in ```examples```.
 
 ### Python API
 
-The main entry point is `sumac.sumac_factorize`. Inputs are passed by keyword. The sparse matrix is represented in COO form by `S_index` with shape `(2, nnz)` and `S_value` with shape `(nnz,)`.
+The main entry point is `sumac.sumac_factorize`. Its arguments are keyword-only. The sparse matrix is represented in COO form by `S_index` with shape `(2, nnz)` and `S_value` with shape `(nnz,)`. Factorization settings are collected in a `SumacConfig` object.
 
 ```python
-from sumac import sumac_factorize
+import torch
+
+from sumac import SumacConfig, SumacMethod, sumac_factorize
+
+config = SumacConfig(
+    method=SumacMethod.SALSA,
+    rank=16,
+    max_iterations=100,
+    num_blocks=100,
+    device=torch.device("cuda"),
+)
 
 A, B, history = sumac_factorize(
     S_index=S_index,
     S_value=S_value,
     shape=(m, n),
-    rank=16,
-    method="SALSA",
-    max_iterations=100,
-    num_blocks=100,
-    device="cuda",
+    config=config,
 )
 ```
 
-The return values are the learned factors `A` and `B`, with shapes `(m, rank)` and `(n, rank)`, plus a metric history collected during training. If `device` is omitted, SUMAC infers it from `S_index` and `S_value`; if `device` is provided, the sparse input tensors are moved there before training.
+Optional `A_init` and `B_init` keyword arguments can supply initial factor tensors. The return values are the learned factors `A` and `B`, with shapes `(m, config.rank)` and `(n, config.rank)`, plus a metric history collected during training. If `config.device` is `None`, SUMAC infers the device from `S_index` and `S_value`; if it is set, the sparse input tensors are moved there before training.
 
-Common options are `method="SALSA"` or `method="GD"`, `rank`, `max_iterations`, `num_blocks`, `dtype`, `seed`, `momentum`, `learning_rate`, `optimizer`, `eval_interval`, `verbose`, and `allow_tf32`. CUDA kernel autotuning can be controlled with `autotune="cache"`, `"force"`, `"disable"`, or `"fallback"`; cached tuning results are stored under `$XDG_CACHE_HOME/sumac` by default, or `~/.cache/sumac` if `XDG_CACHE_HOME` is unset. Use `autotune_cache_dir` to override this location and `autotune_verbose=True` to print tuning decisions.
+`SumacConfig` is keyword-only and provides defaults for every field. See its docstring for the complete list of configuration options and their behavior.
 
 ### Application: Fly Connectome Data
 The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. The data is available at ```/mnt/home/lsaul/Datasets/flywire/connectome.txt```
