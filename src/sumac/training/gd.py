@@ -127,10 +127,6 @@ def GD_loop(
                 mse_block, sumSr_block, jacc_num_block, errZ_block = block_loss_and_pred(
                     A,
                     B,
-                    block_id=int(block_id),
-                    num_blocks=cfg.num_blocks,
-                    m=m,
-                    n=n,
                     S_index=S_index,
                     S_value=S_value,
                     edge_idx=edge_idx,
@@ -165,9 +161,6 @@ def GD_loop(
         B,
         S_index,
         S_value,
-        m,
-        n,
-        num_blocks=cfg.num_blocks,
         full_block_loader=loader,
         device=A.device,
     )

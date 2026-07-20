@@ -2,7 +2,6 @@ import torch
 
 from .kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
 from .kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
-from .datasets import block_span
 
 
 relu_bat_tuned = None
@@ -70,42 +69,26 @@ def block_loss_errz(
 def compute_local_rows(
     A: torch.Tensor,
     rows_all: torch.Tensor,
-    row_indices: torch.Tensor | None = None,
-    start: int | None = None,
+    row_indices: torch.Tensor,
 ):
-    if row_indices is not None:
-        row_indices = row_indices.to(device=rows_all.device, dtype=torch.long)
-        b = row_indices.numel()
-
-        local_map = torch.full(
-            (A.shape[0],),
-            fill_value=-1,
-            dtype=torch.long,
-            device=rows_all.device,
-        )
-        local_map[row_indices] = torch.arange(b, device=rows_all.device)
-        local_r = local_map[rows_all]
-
-        return local_r, b
-
-    if start is None:
-        raise ValueError("start must be provided when row_indices is None")
-
-    local_r = rows_all - start
-    return local_r, None
+    row_indices = row_indices.to(device=rows_all.device, dtype=torch.long)
+    local_map = torch.full(
+        (A.shape[0],),
+        fill_value=-1,
+        dtype=torch.long,
+        device=rows_all.device,
+    )
+    local_map[row_indices] = torch.arange(row_indices.numel(), device=rows_all.device)
+    return local_map[rows_all]
 
 
 def block_loss_and_pred(
     A: torch.Tensor,
     B: torch.Tensor,
-    block_id: int,
-    num_blocks: int,
-    m: int,
-    n: int,     # NOTE UNUSED
     S_index: torch.Tensor,           # (2, nnz)
     S_value: torch.Tensor,           # (nnz,)
     edge_idx: torch.Tensor,          # indices into S_index/S_value for this block
-    row_indices: torch.Tensor | None = None, # NEW: explicit row indices for this block
+    row_indices: torch.Tensor,
 ):
     """
     - Builds full block prediction Sr_I = ReLU(A_I @ B^T) (shape b x n).
@@ -117,15 +100,9 @@ def block_loss_and_pred(
     # torch.cuda.nvtx.range_push("get factor block")
     edge_idx = edge_idx.view(-1)
 
-    if row_indices is not None:
-        row_indices = row_indices.to(device=A.device, dtype=torch.long).view(-1)
-        A_block = A[row_indices, :]
-        b = row_indices.numel()
-        start = None
-    else:
-        start, end = block_span(block_id, m, num_blocks)
-        b = end - start
-        A_block = A[start:end, :]
+    row_indices = row_indices.to(device=A.device, dtype=torch.long).view(-1)
+    A_block = A[row_indices, :]
+    b = row_indices.numel()
 
     assert b > 0, "Empty block span"
 
@@ -137,11 +114,10 @@ def block_loss_and_pred(
     cols_all = cols_all.to(device=A.device, dtype=torch.long)
     vals_all = vals_all.to(device=A.device)
 
-    local_r, _ = compute_local_rows(
+    local_r = compute_local_rows(
         A=A,
         rows_all=rows_all,
         row_indices=row_indices,
-        start=start,
     )
 
     with nvtx_range("block_loss_errz"):
@@ -166,10 +142,7 @@ def eval(
     B: torch.Tensor,
     S_index: torch.Tensor,
     S_value: torch.Tensor,
-    m: int,
-    n: int,
-    num_blocks: int,
-    full_block_loader,   # yields (block_id, edge_idx) once per block_id # TODO
+    full_block_loader,
     device: torch.device | None = None,
 ):
     if device is None:
@@ -181,18 +154,13 @@ def eval(
     errZ_num = torch.zeros((), device=device, dtype=A.dtype)
 
     for block in full_block_loader:
-        for (block_id, edge_idx, row_indices) in block:
+        for (_block_id, edge_idx, row_indices) in block:
             edge_idx = edge_idx.to(device).view(-1)
-            block_id = int(block_id)
 
             nvtx_range_push("block_loss_and_pred")
             ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
                 A,
                 B,
-                block_id,
-                num_blocks,
-                m,
-                n,
                 S_index,
                 S_value,
                 edge_idx, 
