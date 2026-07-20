@@ -16,11 +16,13 @@ from sumac.kernels.relu_bat_c import (
     relu_bat_c_tf32_wgmma_tune_config,
 )
 from sumac.kernels.tuning import (
-    AUTOTUNE_MODES,
     autotune_cuda_kernel,
     kernel_autotune_options,
     relu_bat_c_key,
 )
+
+from sumac.config import AutotuneMode
+
 from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused_op
 from sumac.kernels.relu_batc_tf32_jit.api import (
     relu_bat_c_tf32_mma_sync,
@@ -399,7 +401,7 @@ if __name__ == "__main__":
         "--autotune",
         type=str,
         default="cache",
-        choices=tuple(mode for mode in AUTOTUNE_MODES if mode != "fallback"),
+        choices=['cache', 'force', 'disable', 'fallback'],
         help="CUDA kernel autotuning mode for the kernel benchmark",
     )
     parser.add_argument(
@@ -417,12 +419,14 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    autotune_mode = AutotuneMode(str.lower(args.autotune))
+
     torch.manual_seed(0)
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision('highest')
     assert torch.cuda.is_available()
 
     with kernel_autotune_options(
-        mode=args.autotune,
+        mode=autotune_mode,
         cache_dir=args.autotune_cache_dir,
         verbose=args.autotune_verbose,
     ):
