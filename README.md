@@ -89,7 +89,3 @@ To run sumac-GD
 ```bash
 python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode GD
 ```
-
-### Exploration: Lower bound of the rank (embedding dimension)
-
-Given a sparse matrix, what's the minimum (effective) rank needed for subzero matrix completion? We include a simple greedy algorithm in ```tests/check_min_rank.py```. To compute the (effective) rank for our example datasets, use ```check_min_rank.sh```.
