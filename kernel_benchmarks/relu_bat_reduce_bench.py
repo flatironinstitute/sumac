@@ -11,11 +11,13 @@ from sumac.kernels.relu_bat_reduce import (
     relu_bat_reduce_tune_config,
 )
 from sumac.kernels.tuning import (
-    AUTOTUNE_MODES,
     autotune_cuda_kernel,
     kernel_autotune_options,
     relu_bat_reduce_key,
 )
+
+from sumac.config import AutotuneMode
+
 from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 
 
@@ -213,7 +215,7 @@ if __name__ == "__main__":
         "--autotune",
         type=str,
         default="cache",
-        choices=tuple(mode for mode in AUTOTUNE_MODES if mode != "fallback"),
+        choices=['cache', 'force', 'disable', 'fallback'],
         help="CUDA kernel autotuning mode for the kernel benchmark",
     )
     parser.add_argument(
@@ -230,12 +232,12 @@ if __name__ == "__main__":
         help="Print CUDA kernel autotuning decisions and pruned trials",
     )
     args = parser.parse_args()
-
+    autotune_mode = AutotuneMode(str.lower(args.autotune))
     torch.manual_seed(0)
     assert torch.cuda.is_available()
 
     with kernel_autotune_options(
-        mode=args.autotune,
+        mode=autotune_mode,
         cache_dir=args.autotune_cache_dir,
         verbose=args.autotune_verbose,
     ):
