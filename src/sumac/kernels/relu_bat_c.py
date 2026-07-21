@@ -163,7 +163,8 @@ def relu_bat_c_fp32_constraints(
     props = torch.cuda.get_device_properties(A.device)
     if BM > getattr(props, "max_threads_per_block", 1024):
         return False
-    return props.shared_memory_per_block >= 8 * BK * A.shape[1]
+    shared_memory_per_block = getattr(props, "shared_memory_per_block", 0)
+    return shared_memory_per_block >= 8 * BK * A.shape[1]
 
 
 def relu_bat_c_tf32_sync_constraints(
@@ -177,7 +178,6 @@ def relu_bat_c_tf32_sync_constraints(
 ) -> bool:
     _, D = A.shape
     props = torch.cuda.get_device_properties(A.device)
-
     if props.major < 8:
         return False
     if D < 1:
@@ -198,7 +198,7 @@ def relu_bat_c_tf32_sync_constraints(
     max_smem = getattr(
         props,
         "shared_memory_per_block_optin",
-        props.shared_memory_per_block,
+        getattr(props, "shared_memory_per_block", 0),
     )
     smem_bytes = 2 * num_stages * BN * round_up(D, 8) * 4 + 127
     return smem_bytes <= max_smem

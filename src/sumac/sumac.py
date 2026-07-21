@@ -4,6 +4,8 @@ import warnings
 import torch
 from torch import Tensor
 
+from typing import TypeGuard
+
 from .kernels.tuning import kernel_autotune_options
 
 from sumac.config import AutotuneMode, OptimizerName, SumacConfig, SumacMethod
@@ -18,7 +20,7 @@ from sumac.training.gd import GD_loop
 from sumac.utils import resolve_sumac_device
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 

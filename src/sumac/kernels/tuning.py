@@ -9,11 +9,14 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
 from sumac.config import AutotuneMode
+
+if TYPE_CHECKING:
+    import optuna
 
 
 def _require_optuna():
@@ -267,6 +270,7 @@ def autotune_cuda_kernel(
                     else (options.cache_dir or default_kernel_autotune_cache_dir()) / cache_path_obj
                 )
                 store = JsonConfigStore(cache_file)
+            assert store is not None
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
@@ -330,11 +334,11 @@ def autotune_cuda_kernel(
 
             return fn(*args, **kwargs, **decision["params"])
 
-        wrapper.resolve_decision = resolve_decision
-        wrapper.resolve_params = (
+        wrapper.resolve_decision = resolve_decision  # type: ignore[attr-defined]
+        wrapper.resolve_params = (  # type: ignore[attr-defined]
             lambda *args, **kwargs: resolve_decision(*args, **kwargs)["params"]
         )
-        wrapper.clear_memo = memo.clear
+        wrapper.clear_memo = memo.clear  # type: ignore[attr-defined]
         return wrapper
 
     return decorator
@@ -355,7 +359,7 @@ def _run_study(
     disk_key: str,
     verbose: bool,
 ) -> TuneResult:
-    optuna = _require_optuna()
+    optuna_module = _require_optuna()
     static_kwargs = dict(kwargs)
 
     fallback_runtime_ms = float("inf")
@@ -393,7 +397,7 @@ def _run_study(
                     e,
                     verbose=verbose,
                 )
-                raise optuna.TrialPruned() from e
+                raise optuna_module.TrialPruned() from e
 
             if not constraint_ok:
                 _print_trial_pruned(
@@ -402,7 +406,7 @@ def _run_study(
                     params,
                     verbose=verbose,
                 )
-                raise optuna.TrialPruned()
+                raise optuna_module.TrialPruned()
 
         def run():
             return fn(*args, **merged)
@@ -417,7 +421,7 @@ def _run_study(
                 e,
                 verbose=verbose,
             )
-            raise optuna.TrialPruned() from e
+            raise optuna_module.TrialPruned() from e
 
         try:
             torch.cuda.synchronize()
@@ -429,7 +433,7 @@ def _run_study(
                 e,
                 verbose=verbose,
             )
-            raise optuna.TrialPruned() from e
+            raise optuna_module.TrialPruned() from e
 
         try:
             runtime_ms = _bench_callable(run, warmup=warmup, rep=rep)
@@ -442,16 +446,16 @@ def _run_study(
                 e,
                 verbose=verbose,
             )
-            raise optuna.TrialPruned() from e
+            raise optuna_module.TrialPruned() from e
 
         return runtime_ms
 
     study_name = f"{fn.__module__}.{fn.__qualname__}:{disk_key}"
-    previous_optuna_verbosity = optuna.logging.get_verbosity()
+    previous_optuna_verbosity = optuna_module.logging.get_verbosity()
     if not verbose:
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        optuna_module.logging.set_verbosity(optuna_module.logging.WARNING)
     try:
-        study = optuna.create_study(
+        study = optuna_module.create_study(
             study_name=study_name,
             direction="minimize",
             sampler=sampler,
@@ -459,7 +463,7 @@ def _run_study(
         study.optimize(objective, n_trials=n_trials)
     finally:
         if not verbose:
-            optuna.logging.set_verbosity(previous_optuna_verbosity)
+            optuna_module.logging.set_verbosity(previous_optuna_verbosity)
 
     best = study.best_trial
     best_cuda_runtime_ms = float(best.user_attrs["runtime_ms"])

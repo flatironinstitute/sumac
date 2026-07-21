@@ -1,4 +1,5 @@
 import torch
+from torch.utils.data import DataLoader
 
 from .kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
 from .kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
@@ -142,7 +143,7 @@ def eval(
     B: torch.Tensor,
     S_index: torch.Tensor,
     S_value: torch.Tensor,
-    full_block_loader,
+    full_block_loader: DataLoader,
     device: torch.device | None = None,
 ):
     if device is None:

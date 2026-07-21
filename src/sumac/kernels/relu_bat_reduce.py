@@ -94,7 +94,9 @@ def relu_bat_reduce_constraints(
 ) -> bool:
     _, D = A.shape
     props = torch.cuda.get_device_properties(A.device)
-
+    shared_memory_per_block = int(
+        getattr(props, "shared_memory_per_block", 0)
+    )
     if D >= 32 and num_ms > 4:
         return False
     if D >= 64 and num_ms > 2:
@@ -105,7 +107,7 @@ def relu_bat_reduce_constraints(
         return False
 
     smem_bytes = 4 * BK * D + 2 * BM * 8
-    return smem_bytes <= props.shared_memory_per_block
+    return smem_bytes <= shared_memory_per_block
 
 
 @lru_cache(maxsize=None)

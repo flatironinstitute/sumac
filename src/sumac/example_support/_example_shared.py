@@ -70,9 +70,8 @@ def _load_matlab(filename: str, ex: example_type, dtype: torch.dtype = torch.flo
 
 def _load_np_compatible(filename: str, ex: example_type):
     data = np.loadtxt(filename).T
-    S_index = torch.LongTensor(data[0:2,:])
-    S_value = torch.FloatTensor(data[2,:])
-
+    S_index = torch.tensor(data[0:2, :], dtype=torch.long)
+    S_value = torch.tensor(data[2, :], dtype=torch.float)
     if ex == 'connectome':
         m = n = int(S_index[0].max())
     else:
