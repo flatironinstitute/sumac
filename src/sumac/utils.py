@@ -3,9 +3,7 @@ import random
 import numpy as np
 from contextlib import contextmanager
 
-from typing import TypeGuard
 import warnings 
-import math
 
 # TODO: Consider merging with cuda_utils
 from sumac.kernels.cuda_utils import cuda_is_available
@@ -48,19 +46,6 @@ def resolve_sumac_device(
     )
 
 
-def _is_int(value: object) -> TypeGuard[int]:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _validate_finite_number(name: str, value: object) -> None:
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-    ):
-        raise ValueError(f"{name} must be a finite number, got {value!r}")
-
-
 @contextmanager
 def _matmul_precision(allow_tf32: bool):
     previous_precision = torch.get_float32_matmul_precision()
@@ -80,4 +65,3 @@ def _matmul_precision(allow_tf32: bool):
             yield
         finally:
             torch.set_float32_matmul_precision(previous_precision)
-

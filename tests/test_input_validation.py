@@ -51,20 +51,13 @@ def test_invalid_sparse_inputs(replacement, exception, match):
     ],
 )
 def test_invalid_config_fields(field, value, match):
-    arguments = valid_inputs()
-    setattr(arguments["config"], field, value)
-
     with pytest.raises((TypeError, ValueError), match=match):
-        sumac_factorize(**arguments)
+        SumacConfig(**{field: value}, verbose=False)
 
 
 def test_float64_and_tf32_are_mutually_exclusive():
-    arguments = valid_inputs()
-    arguments["config"].dtype = torch.float64
-    arguments["config"].allow_tf32 = True
-
     with pytest.raises(ValueError, match="mutually exclusive"):
-        sumac_factorize(**arguments)
+        SumacConfig(dtype=torch.float64, allow_tf32=True, verbose=False)
 
 
 def test_initial_factors_must_be_provided_together():
