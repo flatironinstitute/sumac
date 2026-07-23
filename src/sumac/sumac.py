@@ -1,10 +1,6 @@
-from contextlib import contextmanager
-import math
-import warnings
 import torch
 from torch import Tensor
 
-from typing import TypeGuard
 
 from .kernels.tuning import kernel_autotune_options
 
@@ -17,41 +13,7 @@ from sumac.kernels.cuda_utils import (
 )
 from sumac.training.salsa import salsa_loop
 from sumac.training.gd import GD_loop
-from sumac.utils import resolve_sumac_device
-
-
-def _is_int(value: object) -> TypeGuard[int]:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _validate_finite_number(name: str, value: object) -> None:
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or not math.isfinite(value)
-    ):
-        raise ValueError(f"{name} must be a finite number, got {value!r}")
-
-
-@contextmanager
-def _matmul_precision(allow_tf32: bool):
-    previous_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
-    with warnings.catch_warnings():
-        if not allow_tf32:
-            warnings.filterwarnings(
-                "ignore",
-                message=(
-                    "TensorFloat32 tensor cores for float32 matrix multiplication "
-                    "available but not enabled.*"
-                ),
-                category=UserWarning,
-                module=r"torch\._inductor\.compile_fx",
-            )
-        try:
-            yield
-        finally:
-            torch.set_float32_matmul_precision(previous_precision)
+from sumac.utils import resolve_sumac_device, _is_int, _matmul_precision, _validate_finite_number
 
 
 def _validate_sumac_inputs(
