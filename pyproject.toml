@@ -40,3 +40,12 @@ include = [
 "sumac.kernels.relu_batc_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
 "sumac.kernels.relu_bat_reduce_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
 "sumac.kernels.relu_batc_tf32_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
+
+[tool.mypy]
+check_untyped_defs = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*"]
+ignore_missing_imports = true

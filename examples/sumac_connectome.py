@@ -5,4 +5,3 @@ if __name__ == '__main__':
 
 ##launch scripts
 #GPU: python sumac_connectome.py --iters 1000  --num_blocks 100 
-#EVAL: python sumac_connectome.py --eval_only

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from sumac.config import SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import eval
-from sumac.kernels.cuda_utils import cuda_is_available, nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
+from sumac.kernels.cuda_utils import nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
 from sumac.kernels.relu_bat_c import relu_bat_c_fallback_launcher
 from sumac.kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
 
@@ -51,7 +51,6 @@ def init_salsa_factors(
     """
     Initialize with A > 0 and B < 0, then rescale.
     """
-    print("salsa init...")
     device = S_value.device
     dtype = S_value.dtype
 
@@ -90,6 +89,7 @@ def configure_kernel_prec(
     allow_tf32: bool,
     device,
     D: int,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     global relu_bat_c_tuned
     global relu_bat_c_kernel_mode
@@ -97,15 +97,6 @@ def configure_kernel_prec(
     global relu_bat_c_kernel_autotune_options
 
     autotune_options = active_kernel_autotune_options()
-    device = torch.device(device)
-    if device.type != "cuda" or not cuda_is_available():
-        if relu_bat_c_kernel_mode != "fallback":
-            relu_bat_c_tuned = relu_bat_c_fallback_launcher()
-            relu_bat_c_kernel_mode = "fallback"
-            relu_bat_c_kernel_d = D
-            relu_bat_c_kernel_autotune_options = autotune_options
-        return
-
     from ..kernels.relu_bat_c import (
         relu_bat_c_cuda_launcher,
         relu_bat_c_tf32_sync_launcher,
@@ -113,7 +104,7 @@ def configure_kernel_prec(
         select_relu_bat_c_kernel_mode,
     )
 
-    mode = select_relu_bat_c_kernel_mode(allow_tf32, device)
+    mode = select_relu_bat_c_kernel_mode(allow_tf32, device, dtype)
     if (
         mode == relu_bat_c_kernel_mode and
         D == relu_bat_c_kernel_d and
@@ -284,13 +275,21 @@ def salsa_loop(
         allow_tf32=cfg.allow_tf32,
         device=cfg.device,
         D=cfg.rank,
+        dtype=cfg.dtype,
     )
 
     S_index = S_index.to(cfg.device)
     S_value = S_value.to(cfg.device)
     if A_init is None or B_init is None:
         nvtx_range_push("init_salsa_factors")
-        A, B = init_salsa_factors(S_index, S_value, m, n, cfg.rank, gen=gen)
+        A, B = init_salsa_factors(
+            S_index,
+            S_value,
+            m,
+            n,
+            cfg.rank,
+            gen=gen,
+        )
         nvtx_range_pop()
     else:
         A, B = A_init.to(cfg.device), B_init.to(cfg.device)
@@ -313,9 +312,16 @@ def salsa_loop(
 
     nvtx_range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
-    rmse, jacc, errZ = eval(A.to(cfg.device), B.to(cfg.device), S_index, S_value, m, n, cfg.num_blocks, 
-                            eval_loader, device=cfg.device, errZ_obj=True)
-    print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
+    rmse, jacc, errZ = eval(
+        A.to(cfg.device),
+        B.to(cfg.device),
+        S_index,
+        S_value,
+        eval_loader,
+        device=cfg.device,
+    )
+    if cfg.verbose:
+        print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
     nvtx_range_pop()
     rmse_hist = []
     jacc_hist = []
@@ -358,12 +364,8 @@ def salsa_loop(
                 B.to(cfg.device),
                 S_index,
                 S_value,
-                m,
-                n,
-                cfg.num_blocks,
                 eval_loader,
                 device=cfg.device,
-                errZ_obj=True,
             )
 
             if cfg.device.type == "cuda":

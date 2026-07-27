@@ -60,18 +60,34 @@ def GD_loop(
     assert cfg.num_blocks is not None
     assert cfg.device is not None
 
-    (gen, _, _) = cfg.get_generator()
+    (gen, gen_blocks, gen_loader) = cfg.get_generator()
     
     # Move data to the training device.
     S_index = S_index.to(cfg.device)
     S_value = S_value.to(cfg.device)
     if A_init is None or B_init is None:
         scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.rank)
-        A = torch.nn.Parameter(torch.rand(m, cfg.rank, device=cfg.device) * scale)
-        B = torch.nn.Parameter(torch.rand(n, cfg.rank, device=cfg.device) * scale)
+        A = torch.nn.Parameter(
+            torch.rand(
+                m,
+                cfg.rank,
+                device=cfg.device,
+                dtype=cfg.dtype,
+                generator=gen,
+            ) * scale
+        )
+        B = torch.nn.Parameter(
+            torch.rand(
+                n,
+                cfg.rank,
+                device=cfg.device,
+                dtype=cfg.dtype,
+                generator=gen,
+            ) * scale
+        )
     else:
-        A = torch.nn.Parameter(A_init.to(cfg.device))
-        B = torch.nn.Parameter(B_init.to(cfg.device))
+        A = torch.nn.Parameter(A_init.detach().to(cfg.device).clone())
+        B = torch.nn.Parameter(B_init.detach().to(cfg.device).clone())
     opt = make_optimizer(
         cfg.optimizer,
         [A, B],
@@ -83,12 +99,13 @@ def GD_loop(
     )
 
     # DataLoader
-    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen)
+    ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen_blocks)
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_blocks,
         shuffle=cfg.shuffle_blocks,
-        collate_fn=collate_blocks
+        collate_fn=collate_blocks,
+        generator=gen_loader,
     )
 
     history = []
@@ -110,15 +127,10 @@ def GD_loop(
                 mse_block, sumSr_block, jacc_num_block, errZ_block = block_loss_and_pred(
                     A,
                     B,
-                    block_id=int(block_id),
-                    num_blocks=cfg.num_blocks,
-                    m=m,
-                    n=n,
                     S_index=S_index,
                     S_value=S_value,
                     edge_idx=edge_idx,
                     row_indices=row_indices,
-                    errZ_obj=True,
                 )
                 loss_block = errZ_block if errZ_block is not None else mse_block
                 loss = loss + loss_block
@@ -138,24 +150,23 @@ def GD_loop(
         S_norm = float(torch.norm(S_value).item())
         rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
         log = f"[epoch {epoch}/{cfg.max_iterations}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
-        print(log)
+        if cfg.verbose:
+            print(log)
         history.append(log)
         nvtx_range_pop()
     total = time.time() - t0
-    print(f"\nTotal elapsed time: {total:.2f} sec")
+    if cfg.verbose:
+        print(f"\nTotal elapsed time: {total:.2f} sec")
 
     rmse, jacc, errZ = eval(
         A,
         B,
         S_index,
         S_value,
-        m,
-        n,
-        num_blocks=cfg.num_blocks,
         full_block_loader=loader,
         device=A.device,
-        errZ_obj=True
     )
-    print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
+    if cfg.verbose:
+        print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
 
     return A.detach(), B.detach(), history

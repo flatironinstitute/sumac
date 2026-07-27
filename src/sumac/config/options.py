@@ -3,8 +3,13 @@ from enum import Enum
 import math
 import os
 from pathlib import Path
-import random
 import torch
+
+
+def _validate_finite_number(name: str, value: int | float) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+
 
 class SumacMethod(Enum):
     """Which strategy to use: SALSA (stochastic alternating least
@@ -121,16 +126,6 @@ class SumacConfig:
             a data file to load. Ignored in normal use.
         log_filename (str): Output filename for log data
             from examples. Ignored in normal use.
-        eval_only (bool): Used in examples only. If True,
-            the example will skip training and only provide
-            an evaluation of provided matrix factors.
-        eval_path (str | None): Used in examples only, as the
-            directory to write the matrix factors into. In
-            eval-only mode, this directory should contain
-            the matrix factors to evaluate.
-        eval_save (bool): Used in examples only. If True,
-            the factors discovered through training will be
-            saved in eval_path; otherwise they are discarded.
     """
     method: SumacMethod = SumacMethod.SALSA
     rank: int = 16
@@ -159,26 +154,100 @@ class SumacConfig:
     # consumed by examples only
     input_filename: str | None = None
     log_filename: str | None = None
-    eval_only: bool = False
-    eval_path: str | None = None
-    eval_save: bool = False
 
 
     def __post_init__(self):
+        self._validate_integer_options()
+        self._validate_numeric_options()
+
         if self.eval_interval is None:
             self.eval_interval = 100 if self.method == SumacMethod.GD else 10
+        if self.eval_interval <= 0:
+            raise ValueError(
+                "eval_interval must be a positive integer or None, "
+                f"got {self.eval_interval!r}"
+            )
+
         if self.autotune_cache_dir is None:
             self.autotune_cache_dir = default_kernel_autotune_cache_dir()
         self.autotune_cache_dir = str(self.autotune_cache_dir)
+
         if self.momentum < 0:
             self.momentum = 0.7
             if (self.optimizer == OptimizerName.MUON
                 and self.method == SumacMethod.GD):
                 self.momentum = 0.95
-        if self.seed is not None:
-            if self.verbose:
-                print(f"seed = {self.seed}")
-            random.seed(self.seed)
+        if not 0 <= self.momentum < 1:
+            raise ValueError(
+                "momentum must satisfy 0 <= momentum < 1, "
+                f"got {self.momentum!r}"
+            )
+
+        self._validate_adam_options()
+
+        if self.seed is not None and self.verbose:
+            print(f"seed = {self.seed}")
+
+
+    def _validate_integer_options(self) -> None:
+        if self.rank <= 0:
+            raise ValueError(f"rank must be a positive integer, got {self.rank!r}")
+        if self.max_iterations < 0:
+            raise ValueError(
+                "max_iterations must be a nonnegative integer, "
+                f"got {self.max_iterations!r}"
+            )
+        if self.num_blocks is not None and self.num_blocks < 1:
+            raise ValueError(
+                "num_blocks must be a positive integer or None, "
+                f"got {self.num_blocks!r}"
+            )
+        if self.batch_blocks <= 0:
+            raise ValueError(
+                "batch_blocks must be a positive integer, "
+                f"got {self.batch_blocks!r}"
+            )
+
+
+    def _validate_numeric_options(self) -> None:
+        _validate_finite_number("cache_mb", self.cache_mb)
+        if self.cache_mb <= 0:
+            raise ValueError(f"cache_mb must be positive, got {self.cache_mb!r}")
+        if self.dtype not in (torch.float32, torch.float64):
+            raise TypeError(
+                "dtype must be torch.float32 or torch.float64, "
+                f"got {self.dtype!r}"
+            )
+        if self.dtype == torch.float64 and self.allow_tf32:
+            raise ValueError(
+                "dtype=torch.float64 and allow_tf32=True are mutually exclusive"
+            )
+        _validate_finite_number("learning_rate", self.learning_rate)
+        if self.learning_rate < 0:
+            raise ValueError(
+                "learning_rate must be nonnegative, "
+                f"got {self.learning_rate!r}"
+            )
+        _validate_finite_number("momentum", self.momentum)
+
+
+    def _validate_adam_options(self) -> None:
+        if self.method != SumacMethod.GD or self.optimizer not in (
+            OptimizerName.ADAM,
+            OptimizerName.ADAMW,
+        ):
+            return
+
+        _validate_finite_number("adam_eps", self.adam_eps)
+        if self.adam_eps <= 0:
+            raise ValueError(f"adam_eps must be positive, got {self.adam_eps!r}")
+        for beta in self.adam_betas:
+            _validate_finite_number("adam_betas value", beta)
+            if not 0 <= beta < 1:
+                raise ValueError(
+                    "adam_betas values must satisfy 0 <= beta < 1, "
+                    f"got {self.adam_betas!r}"
+                )
 
 
     def set_block_sizes(self, m: int, n: int):
@@ -187,8 +256,15 @@ class SumacConfig:
             bytes_per_dtype = 8 if self.dtype == torch.float64 else 4
             self.cols_per_block = max(1, int(max_bytes // (m * bytes_per_dtype)))
             self.num_blocks = math.ceil(n / self.cols_per_block)
-        else:
-            self.cols_per_block = int(n // self.num_blocks)
+
+        max_num_blocks = min(m, n)
+        if self.num_blocks > max_num_blocks:
+            raise ValueError(
+                "num_blocks must satisfy "
+                f"1 <= num_blocks <= min(effective shape)={max_num_blocks}, "
+                f"got {self.num_blocks}"
+            )
+        self.cols_per_block = int(n // self.num_blocks)
 
 
     def print_prefactor_report(self, S_value: torch.Tensor, m: int, n: int, devcount: int):
@@ -204,15 +280,17 @@ class SumacConfig:
 
     
     def get_generator(self):
-        gen = torch.Generator(device = self.device)
-        gen_rows = None
-        gen_cols = None
-        if self.method == SumacMethod.SALSA:
-            gen_rows = torch.Generator(device = self.device)
-            gen_cols = torch.Generator(device = self.device)
-        if self.seed is not None:
-            gen.manual_seed(self.seed)
-            torch.manual_seed(self.seed)
-            if gen_rows is not None: gen_rows.manual_seed(self.seed + 1)
-            if gen_cols is not None: gen_cols.manual_seed(self.seed + 2)
-        return (gen, gen_rows, gen_cols)
+        gen = torch.Generator(device=self.device)
+        gen_rows = torch.Generator(device=self.device)
+        tmp_device = self.device if self.method == SumacMethod.SALSA else "cpu"
+        gen_aux = torch.Generator(device=tmp_device)
+        generators = (gen, gen_rows, gen_aux)
+
+        if self.seed is None:
+            for generator in generators:
+                generator.seed()
+        else:
+            for offset, generator in enumerate(generators):
+                generator.manual_seed(self.seed + offset)
+
+        return generators

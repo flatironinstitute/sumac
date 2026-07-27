@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import time
 from pytest import mark
 import numpy as np
+from numpy.typing import NDArray
+from typing import Any
 from sumac import sumac_factorize
 from sumac.data import dense_to_sparse
 import scipy as sp
@@ -52,7 +54,13 @@ def torch2scipy_svd(S_index, S_value, n, k=16):
     S_coo = sp.sparse.coo_matrix((data, (rows, cols)), shape=(n, n))
     S_coo.sum_duplicates() #remove dups
     S_sparse = S_coo.tocsr()
+
+    u: NDArray[Any] #make type checker happy
+    s: NDArray[Any]
+    vt: NDArray[Any]
+    
     u, s, vt = sp.sparse.linalg.svds(S_sparse, k=k)
+
     # sort in descending order, as svds may return results in random order
     idx = np.argsort(s)[::-1]
     s = s[idx]
