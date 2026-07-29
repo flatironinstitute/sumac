@@ -491,7 +491,6 @@ void MMA_SYNC_TF32_KERNEL_NAME(
                 Apacked_smem,
                 Cpacked_smem);
         }
-        __syncthreads();
     }
 
     #pragma unroll
