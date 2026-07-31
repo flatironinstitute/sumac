@@ -39,13 +39,18 @@ class ReluBatCTf32WgmmaTuneConfig:
 class ReluBatReduceTuneConfig:
     BM: list[int]
     BK: list[int]
-    nums_ms: list[int]
+    num_ms: list[int]
 
 
 T_TuneConfig = ReluBatCFp32TuneConfig | ReluBatCTf32SyncTuneConfig | ReluBatCTf32WgmmaTuneConfig | ReluBatReduceTuneConfig
 
-T_FnParams = Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Tensor]
-T_FnReturns = Tensor | Tuple[Tensor, Tensor]
+T_ReluBatCParams = Tuple[Tensor, Tensor, Tensor]
+T_ReluBatReduceParams = Tuple[Tensor, Tensor]
+T_FnParams = T_ReluBatCParams | T_ReluBatReduceParams
+
+T_ReluBatCReturn = Tensor
+T_ReluBatReduceReturn = Tuple[Tensor, Tensor]
+T_FnReturns = T_ReluBatCReturn | T_ReluBatReduceReturn
 
 class TuneResultMode(Enum):
     CUDA = "cuda"

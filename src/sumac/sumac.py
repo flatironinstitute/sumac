@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 
-from .kernels.tuning import kernel_autotune_options
+from sumac.kernels.tuning import kernel_autotune_options
 
 from sumac.config import SumacConfig, SumacMethod
 from sumac.data import prune_zero_rows_cols, restore_zero_rows_cols
@@ -70,7 +70,7 @@ def sumac_factorize(
         config.print_prefactor_report(S_value, m, n, cuda_device_count())
         nvtx_range_push("core SUMAC loop")
         with kernel_autotune_options(
-            mode=config.autotune.value,
+            mode=config.autotune,
             cache_dir=config.autotune_cache_dir,
             verbose=config.autotune_verbose,
         ):

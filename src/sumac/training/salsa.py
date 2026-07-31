@@ -7,14 +7,7 @@ from sumac.config import SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import eval
 from sumac.kernels.cuda_utils import nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
-from sumac.kernels.relu_bat_c import relu_bat_c_fallback_launcher
-from sumac.kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
-
-
-relu_bat_c_tuned = relu_bat_c_fallback_launcher()
-relu_bat_c_kernel_mode = "fallback"
-relu_bat_c_kernel_d = None
-relu_bat_c_kernel_autotune_options: KernelAutotuneOptions | None = None
+from sumac.kernels.tuning import get_tunable_kernel, T_KernelTuner, AutotuneReluBatReduce
 
 
 # TODO:
@@ -84,63 +77,24 @@ def init_salsa_factors(
     return refactor(A, B)
 
 
-def configure_kernel_prec(
-    *,
-    allow_tf32: bool,
-    device,
-    D: int,
-    dtype: torch.dtype = torch.float32,
-) -> None:
-    global relu_bat_c_tuned
-    global relu_bat_c_kernel_mode
-    global relu_bat_c_kernel_d
-    global relu_bat_c_kernel_autotune_options
-
-    autotune_options = active_kernel_autotune_options()
-    from ..kernels.relu_bat_c import (
-        relu_bat_c_cuda_launcher,
-        relu_bat_c_tf32_sync_launcher,
-        relu_bat_c_tf32_wgmma_launcher,
-        select_relu_bat_c_kernel_mode,
-    )
-
-    mode = select_relu_bat_c_kernel_mode(allow_tf32, device, dtype)
-    if (
-        mode == relu_bat_c_kernel_mode and
-        D == relu_bat_c_kernel_d and
-        autotune_options == relu_bat_c_kernel_autotune_options
-    ):
-        return
-
-    if mode == "tf32_wgmma":
-        relu_bat_c_tuned = relu_bat_c_tf32_wgmma_launcher(D, autotune_options)
-    elif mode == "tf32_mma_sync":
-        relu_bat_c_tuned = relu_bat_c_tf32_sync_launcher(D, autotune_options)
-    elif mode == "fallback":
-        relu_bat_c_tuned = relu_bat_c_fallback_launcher()
-    else:
-        relu_bat_c_tuned = relu_bat_c_cuda_launcher(autotune_options)
-
-    relu_bat_c_kernel_mode = mode
-    relu_bat_c_kernel_d = D
-    relu_bat_c_kernel_autotune_options = autotune_options
-
-
+# TODO: CONFIRM THAT COMPILATION STILL WORKS FOR THIS CASE
+# TODO: Consider reducing parameters passed into here that
+# are only used after the values are returned
 def lsq_update_single_gpu(
-    Ar_dev: torch.Tensor,
-    B_blk_dev: torch.Tensor,
-    pinvAt_dev: torch.Tensor,
-    dB_blk_dev: torch.Tensor,
-    edge_i: torch.Tensor,
-    edge_j: torch.Tensor,
-    blk_vals: torch.Tensor,  
-    momentum: torch.Tensor,
-    unbias: torch.Tensor,
+    kernel: T_KernelTuner,
+    Ar_dev: Tensor,
+    B_blk_dev: Tensor,
+    pinvAt_dev: Tensor,
+    dB_blk_dev: Tensor,
+    edge_i: Tensor,
+    edge_j: Tensor,
+    blk_vals: Tensor,  
+    momentum: Tensor,
+    unbias: Tensor,
     lrate: Tensor | float,
 ) -> tuple[Tensor, Tensor]:
 
-    # TODO: FOLLOW UP, ensre this signature is correct in all branches, remove type-ignore
-    stepM_blk = relu_bat_c_tuned(Ar_dev, B_blk_dev, pinvAt_dev) # type: ignore
+    stepM_blk = kernel((Ar_dev, B_blk_dev, pinvAt_dev))
 
     Lij_blk = torch.sum(Ar_dev[edge_i, :] * B_blk_dev[edge_j, :], dim=1)
     Mij_blk = torch.relu(Lij_blk)
@@ -163,16 +117,17 @@ def lsq_update_single_gpu(
 
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def batch_update_single_gpu(
-    S_idx_full: torch.Tensor,
-    S_val_full: torch.Tensor,
-    edge_idx: torch.Tensor,
-    Factor_fixed: torch.Tensor,
-    row_indices: torch.Tensor,
-    B: torch.Tensor,
-    dB: torch.Tensor,
-    momentum,
-    unbias,
-    lrate,
+    kernel: T_KernelTuner,
+    S_idx_full: Tensor,
+    S_val_full: Tensor,
+    edge_idx: Tensor,
+    Factor_fixed: Tensor,
+    row_indices: Tensor,
+    B: Tensor,
+    dB: Tensor,
+    momentum: Tensor,
+    unbias: Tensor,
+    lrate: float | Tensor,
     m_fixed: int,
 ):
     
@@ -194,8 +149,8 @@ def batch_update_single_gpu(
     edge_j = blk_idx[1]
     
 
-
     B_new, dB_new = lsq_update_single_gpu(
+        kernel=kernel,
         Ar_dev=Ar_dev,
         B_blk_dev=B,
         pinvAt_dev=pinvAt_dev,
@@ -212,6 +167,7 @@ def batch_update_single_gpu(
 
 
 def update_factor_salsa(
+    kernel: T_KernelTuner,
     S_idx_full: Tensor,
     S_val_full: Tensor,
     dataset: StochasticRowBlockDataset,
@@ -227,13 +183,14 @@ def update_factor_salsa(
     _, edge_idx, row_indices = dataset[block_id]
 
     # Need to resolve CUDA autotune params outside of the compiled region.
-    relu_bat_c_tuned.resolve_params(
+    kernel.resolve_decision((
         Factor_fixed[row_indices, :],
         Factor_update,
         Factor_fixed[row_indices, :],
-    )
+    ))
 
     nextF, dF = batch_update_single_gpu(
+        kernel=kernel,
         S_idx_full=S_idx_full,
         S_val_full=S_val_full,
         edge_idx=edge_idx,
@@ -271,12 +228,6 @@ def salsa_loop(
     assert gen_rows is not None
     assert gen_cols is not None
 
-    configure_kernel_prec(
-        allow_tf32=cfg.allow_tf32,
-        device=cfg.device,
-        D=cfg.rank,
-        dtype=cfg.dtype,
-    )
 
     S_index = S_index.to(cfg.device)
     S_value = S_value.to(cfg.device)
@@ -297,7 +248,6 @@ def salsa_loop(
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(B)
 
-
     # Datasets for row and column blocks
 
     nvtx_range_push("StochasitcRowBlockDataset rows")
@@ -310,9 +260,11 @@ def salsa_loop(
     nvtx_range_pop()
     ##init evaluation
 
+    eval_kernel = AutotuneReluBatReduce()
     nvtx_range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(
+        eval_kernel,
         A.to(cfg.device),
         B.to(cfg.device),
         S_index,
@@ -330,6 +282,7 @@ def salsa_loop(
     t_start_loop = time.time()    
     
     momentum = torch.tensor(cfg.momentum, device=A.device, dtype=A.dtype)
+    kernel = get_tunable_kernel(cfg)
     t_start = time.time()
     for iter_idx in range(1, cfg.max_iterations + 1):
         nvtx_range_push("Iteration " + str(iter_idx))
@@ -348,18 +301,19 @@ def salsa_loop(
             nvtx_range_push("update_factor_salsa B")
 
             # --- Update B ---
-            B, dB = update_factor_salsa(S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias, lrate)
+            B, dB = update_factor_salsa(kernel, S_index, S_value, ds_rows, block_id, A, B, dB, momentum, unbias, lrate)
             nvtx_range_pop()
 
             nvtx_range_push("update_factor_salsa A")
             # --- Update A ---
-            A, dA = update_factor_salsa(S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias, lrate)
+            A, dA = update_factor_salsa(kernel, S_index_T, S_value, ds_cols, block_id, B, A, dA, momentum, unbias, lrate)
             nvtx_range_pop()
 
         # Metrics and Reporting
         if cfg.eval_interval is not None and iter_idx % cfg.eval_interval == 0:
             eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
             rmse, jacc, errZ = eval(
+                eval_kernel,
                 A.to(cfg.device),
                 B.to(cfg.device),
                 S_index,

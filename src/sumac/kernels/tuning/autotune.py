@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 import torch
 
 from sumac.config import AutotuneMode
+from sumac.kernels.cuda_utils import cuda_is_available
 
 from .tuning_types import T_TuneConfig, TuneResult, KernelAutotuneOptions, TuneResultMode, T_FnParams, T_FnReturns
 from .json_cache import JsonConfigStore, normalize_for_json
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     import optuna
 
 
-def _require_optuna():
+def require_optuna():
     try:
         import optuna
     except ImportError as exc:
@@ -37,6 +38,14 @@ def _require_triton():
             "Install the CUDA/autotune extras to use custom CUDA kernels."
         ) from exc
     return triton
+
+
+def grid_size(config: T_TuneConfig) -> int:
+    size = 1
+    cfg_dict = asdict(config)
+    for values in cfg_dict.values():
+        size += len(values)
+    return size
 
 
 def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
@@ -83,6 +92,16 @@ def _print_trial_pruned(
 
 
 def _copy_config[T_Config: T_TuneConfig](cfg: T_Config, winners_dict: dict | None = None) -> T_Config:
+    """Duplicate an appropriately typed config object, with each of its (list-type) parameters
+    trimmed to only the first element.
+
+    If a dictionary of winners is provided, the values from this dictionary will be used
+    to replace the values in the base config object.
+
+    Returns:
+        T_Config: A config object with strongly typed expected keys, but whose list
+            members have only the (default or winning) values.
+    """
     trimdict = winners_dict or {f.name: getattr(cfg, f.name)[:1] for f in fields(cfg)}
     new_cfg = replace(cfg, **trimdict)
     return new_cfg
@@ -113,7 +132,10 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
     warmup: int
     rep: int
     sampler: optuna.samplers.BaseSampler            # in practice always optuna.samplers.GridSampler(search_space=tune_config),
-    wrapped_fn: Callable[[T_Params, T_Config], T_Returns]
+    wrapped_fn_name: str
+    wrapped_fn_module: str
+    decision_configs: T_Config | None
+    decision_runtime_ms: float
     interface_fn: Callable[[T_Params], T_Returns]
     decision_memo_cache: Dict[MemoryCacheKey, TuneResult]
     decision_disk_cache: JsonConfigStore
@@ -122,22 +144,29 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
 
     def __init__(self,
         configs: T_Config,
-        wrapped_fn: Callable[[T_Params, T_Config], T_Returns],
-        cache_path: str = "kenrel_autotune_cache.json",
-        n_trials: int = 24,
-        warmup: int = 25,
-        rep: int = 100,
+        wrapped_fn_name: str = "undef",
+        wrapped_fn_module: str = "undef",
+        cache_path: str = "kernel_autotune_cache.json",
+        n_trials: int = 1000, #24, # the lower limit was never actually used
+        warmup: int = 1, #25, # the higher limis are never actually used
+        rep: int = 5, #100,
         sampler: Optional[optuna.samplers.BaseSampler] = None,
         autotune_options: KernelAutotuneOptions | None = None
     ):
-        optuna = _require_optuna()
+        optuna = require_optuna()
         self.configs = configs
         self.cache_path = Path(cache_path)
+        self.wrapped_fn_name = wrapped_fn_name
+        self.wrapped_fn_module = wrapped_fn_module
+        self.decision_runtime_ms = float("inf")
         self.n_trials = n_trials
         self.warmup = warmup
         self.rep = rep
-        self.sampler = sampler or optuna.samplers.TPESampler(seed=0)
-        self.wrapped_fn = wrapped_fn
+        # QUERY: In practice, we never had a use where the sampler wasn't set to a grid search
+        # over the parameters, so I'm just hard-coding that here.
+        # Caller can still use a TPESampler if desired.
+        # self.sampler = sampler or optuna.samplers.TPESampler(seed=0)
+        self.sampler = sampler or optuna.samplers.GridSampler(search_space = asdict(configs))
         self.decision_memo_cache = {}
         self.options = autotune_options or active_kernel_autotune_options()
         self.decision_disk_cache = self._get_disk_cache()
@@ -160,7 +189,6 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         )
 
 
-    # TODO: okay c'mon now
     def _get_memory_cache_key(self, disk_key: ExperimentKey):
         cache_dir_key = self.options.cache_dir_key or str(self.options.cache_dir or default_kernel_autotune_cache_dir())
         cache_directory = str(self.cache_path) if self.cache_path.is_absolute() else cache_dir_key
@@ -181,14 +209,20 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         return JsonConfigStore(cache_file)
 
 
-    # TODO: replace args/kwargs with implementation-specific actual parameter sets
     def resolve_decision(self, params: T_Params):
-        if self.options.mode == AutotuneMode.FALLBACK:
-            self.interface_fn = self._fallback
+        must_fallback = self.options.mode == AutotuneMode.FALLBACK
+        must_fallback = must_fallback or not cuda_is_available()
+        for x in params:
+            must_fallback = must_fallback or not x.is_cuda
+            must_fallback = must_fallback or not x.dtype == torch.float32
+            # TODO: Q: do we need to insist that they're all on the *same* device too?
+
+        if must_fallback:   # by request or because cuda conditions aren't met
+            self._set_interface_fn()
             return
         if self.options.mode == AutotuneMode.DISABLE:
             # If disable, we use the first entry in each config field as the default
-            self._set_interface_fn(_copy_config(self.configs))
+            self._set_interface_fn(decision = _copy_config(self.configs))
             return
 
         disk_cache_key = self._get_key(params)
@@ -196,31 +230,31 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
 
         decision = self.decision_memo_cache.get(memo_cache_key)
         if decision is not None:
-            cfg = _copy_config(self.configs, decision.params)
-            self._set_interface_fn(cfg)
+            self._set_interface_fn(decision)
             return
 
-        normalized_disk_key = json.dumps(normalize_for_json(disk_cache_key), separators=(",", ":"))
+        normalized_disk_key = json.dumps(
+            normalize_for_json(disk_cache_key),
+            separators=(",", ":")
+        )
         if self.options.mode == AutotuneMode.CACHE:
             cached_result = self.decision_disk_cache.get(normalized_disk_key)
             if cached_result is not None:
                 _disk_decision = TuneResult(**cached_result)
                 self.decision_memo_cache[memo_cache_key] = _disk_decision
-                self._set_interface_fn(_copy_config(self.configs, _disk_decision.params))
+                self._set_interface_fn(_disk_decision)
                 return
 
+        # Cannot serve from cache--run the study
         result = self._run_study(params, normalized_disk_key)
 
         self.decision_memo_cache[memo_cache_key] = result
         self.decision_disk_cache.put(normalized_disk_key, asdict(result))
-        if result.mode == TuneResultMode.FALLBACK:
-            self.interface_fn = self._fallback
-        else:
-            self._set_interface_fn(_copy_config(self.configs, result.params))
+        self._set_interface_fn(result)
 
         if self.options.verbose:
             print(
-                f"[autotune:{self.wrapped_fn.__name__} tuned key={memo_cache_key}] "
+                f"[autotune:{self.wrapped_fn_name} tuned key={memo_cache_key}] "
                 f"mode={result.mode.value} params={result.params} "
                 f"runtime_ms={result.runtime_ms:.4f}"
             )
@@ -230,11 +264,11 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         params: T_Params,
         disk_key: str
     ) -> TuneResult:
-        optuna = _require_optuna()
+        optuna = require_optuna()
 
         fallback_runtime_ms = self._bench_fallback(params)
 
-        study_name = f"{self.wrapped_fn.__module__}.{self.wrapped_fn.__qualname__}:{disk_key}"
+        study_name = f"{self.wrapped_fn_module}.{self.wrapped_fn_name}:{disk_key}"
         objective = lambda trial: self._tuning_objective(trial, params, optuna)
 
         previous_optuna_verbosity = optuna.logging.get_verbosity()
@@ -278,21 +312,22 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             for name, values in asdict(self.configs).items()
         }
         selected_config = _copy_config(self.configs, selected_config_dict)
-        def _pr(msg: str, e: Exception | None = None):
+        def _print_partial(msg: str, e: Exception | None = None):
             _print_trial_pruned(trial.number, msg, selected_config_dict, e, self.options.verbose)
 
         # Check constraints (should be a function but it's too annoying to type)
         try:
             constraint_ok = self._constraint(params, selected_config)
         except Exception as e:
-            _pr("constraint_fn error", e)
+            _print_partial("constraint_fn error", e)
             raise optuna.TrialPruned() from e
 
         if not constraint_ok:
-            _pr("Constraint rejected config")
+            _print_partial("Constraint rejected config")
             raise optuna.TrialPruned()
 
-        def run(): return self.wrapped_fn(params, selected_config)
+        def run(): return self._candidate_fn(params, selected_config)
+
         try:
             failure_reason = "jit compile or kernel launch failure"
             run()
@@ -302,7 +337,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             runtime_ms = _bench_callable(run, warmup=self.warmup, rep=self.rep)
             trial.set_user_attr("runtime_ms", runtime_ms)
         except Exception as e:
-            _pr(failure_reason, e)
+            _print_partial(failure_reason, e)
         return runtime_ms
 
 
@@ -324,6 +359,30 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         return fallback_runtime_ms
 
 
+    def _set_interface_fn(self, decision: TuneResult | T_Config | None = None):
+        # NOTE: we assume that all fields in config should now be single-element lists.
+        # Implementing functions should expect to take CONFIG_PROPERTY[0] in any case.
+        if isinstance(decision, TuneResult):
+            self.decision_runtime_ms = decision.runtime_ms
+            self.decision_configs = _copy_config(self.configs, decision.params)
+            if decision.mode == TuneResultMode.FALLBACK:
+                self.decision_configs = None
+        else:
+            # handles fallback ("None") and Disable ("T_Config") cases
+            self.decision_configs = decision
+            self.decision_runtime_ms = float("inf")
+
+        cfgs = self.decision_configs
+        if cfgs is None:    # incl case where decision is None (AutotuneMode.FALLBACK)
+            self.interface_fn = self._fallback
+        else:
+            self.interface_fn = lambda params: self._candidate_fn(params, cfgs)
+
+
+    def _candidate_fn(self, params: T_Params, config: T_Config) -> T_Returns:
+        raise NotImplementedError("To be implemented by subclass.")
+
+
     def _fallback(self, params: T_Params) -> T_Returns:
         raise NotImplementedError("To be implemented by subclass.")
 
@@ -331,19 +390,6 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
     def _constraint(self, params: T_Params, config: T_Config) -> bool:
         raise NotImplementedError("To be implemented by subclass.")
 
-
-    def _set_interface_fn(self, config: T_Config):
-        # NOTE: we assume that all fields in config should now be single-element lists.
-        # Implementing functions should expect to take CONFIG_PROPERTY[0] in any case.
-        self.interface_fn = lambda params: self.wrapped_fn(params, config)
-
-
-    # NOTE that in the EXISTING usage what happens is we call a Launcher that runs the
-    # autotuning, identifies the best parameter set, then wraps the input function with
-    # an expansion of the optimal function-specific parameters.
-    # For OUR purposes, what we'll actually do is set __call__ to be the relevant
-    # function, with partial application of the parameters.
-    # This will work fine.
 
     def __call__(self, params: T_Params) -> T_Returns:
         return self.interface_fn(params)
