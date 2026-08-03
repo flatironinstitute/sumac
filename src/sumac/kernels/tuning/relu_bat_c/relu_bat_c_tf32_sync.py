@@ -4,7 +4,7 @@ from sumac.utils import round_up
 from sumac.kernels.tuning.autotune import AutotuneCudaKernel
 from sumac.kernels.relu_batc_tf32_jit.api import relu_bat_c_tf32_mma_sync
 from sumac.kernels.tuning.tuning_types import ReluBatCTf32SyncTuneConfig, T_ReluBatCParams, T_ReluBatCReturn
-from sumac.kernels.tuning.relu_bat_c import relu_bat_c_fallback
+from sumac.kernels.tuning.relu_bat_c.relu_bat_c_base import relu_bat_c_fallback
 
 
 def relu_bat_c_tf32_sync_tune_config(D: int) -> ReluBatCTf32SyncTuneConfig:

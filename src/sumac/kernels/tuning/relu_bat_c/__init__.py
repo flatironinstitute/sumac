@@ -1,5 +1,4 @@
 import torch
-from torch import Tensor
 
 from enum import Enum
 
@@ -8,18 +7,13 @@ from sumac.kernels.tuning import active_kernel_autotune_options, KernelAutotuneO
 from sumac.kernels.tuning.autotune import grid_size
 from sumac.config import SumacConfig
 
+from .relu_bat_c_base import relu_bat_c_fallback
 from .relu_bat_c_fp32 import AutotuneReluBatCFP32, relu_bat_c_fp32_tune_config
 from .relu_bat_c_tf32_sync import AutotuneReluBatCTf32Sync, relu_bat_c_tf32_sync_tune_config
 from .relu_bat_c_tf32_wgmma import (
     AutotuneReluBatCTf32Wgmma,
     relu_bat_c_tf32_wgmma_tune_config,
-    relu_bat_c_tf32_wgmma_available
 )
-
-
-@torch.compile(mode="max-autotune-no-cudagraphs")
-def relu_bat_c_fallback(A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-    return torch.relu(B @ A.T) @ C
 
 
 class _KernelModes(Enum):

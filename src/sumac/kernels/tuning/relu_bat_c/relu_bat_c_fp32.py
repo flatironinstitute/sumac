@@ -3,7 +3,7 @@ import torch
 from sumac.kernels.tuning.autotune import AutotuneCudaKernel
 from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused
 from sumac.kernels.tuning.tuning_types import ReluBatCFp32TuneConfig, T_ReluBatCParams, T_ReluBatCReturn
-from sumac.kernels.tuning.relu_bat_c import relu_bat_c_fallback
+from sumac.kernels.tuning.relu_bat_c.relu_bat_c_base import relu_bat_c_fallback
 
 
 relu_bat_c_fp32_tune_config = ReluBatCFp32TuneConfig(
