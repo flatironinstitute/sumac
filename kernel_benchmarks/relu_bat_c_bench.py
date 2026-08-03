@@ -144,9 +144,12 @@ def bench_one(
 
     relu_bat_c_fp32_tuned.resolve_decision((A, B, C))
     fp32_cuda_params = relu_bat_c_fp32_tuned.decision_config
-    assert fp32_cuda_params is not None
-    fp32_params_dict = asdict(fp32_cuda_params)
-    out_fp32_cuda = relu_bat_c_fused_op(A, B, C, **fp32_params_dict)
+    fp32_params_dict = {} if fp32_cuda_params is None else asdict(fp32_cuda_params)
+    if fp32_cuda_params is not None:
+        out_fp32_cuda = relu_bat_c_fused_op(A, B, C, BM=fp32_cuda_params.BM, BK=fp32_cuda_params.BK, MS=fp32_cuda_params.num_ms)
+    else:
+        print(f"\tWARNING: fp32 resolved to fallback.")
+        out_fp32_cuda = 0
     err_fp32_cuda = (out_fp32_cuda - ref).abs().max().item()
 
     relu_bat_c_tf32_mma_sync_tuned.resolve_decision((A, B, C))
@@ -199,7 +202,9 @@ def bench_one(
         return relu_bat_c_fallback(A, B, C)
 
     def fp32_cuda_run():
-        return relu_bat_c_fused_op(A, B, C, **fp32_params_dict)
+        if fp32_cuda_params is not None:
+            return relu_bat_c_fused_op(A, B, C, BM=fp32_cuda_params.BM, BK=fp32_cuda_params.BK, MS=fp32_cuda_params.num_ms)
+        return relu_bat_c_fallback(A, B, C)
 
     def tf32_mma_sync_run():
         return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params_dict)
