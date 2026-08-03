@@ -39,6 +39,7 @@ def _make_header_mma_sync_tf32(
     D_f: int,
     M_TILES: int,
     num_stages: int,
+    padded_d: bool,
     kernel_name: str,
     pack_kernel_name: str,
 ) -> str:
@@ -48,6 +49,7 @@ def _make_header_mma_sync_tf32(
 #define D_f {D_f}
 #define M_TILES {M_TILES}
 #define MMA_SYNC_TF32_STAGES {num_stages}
+#define MMA_SYNC_TF32_PADDED_D {1 if padded_d else 0}
 #define MMA_SYNC_TF32_KERNEL_NAME {kernel_name}
 #define MMA_SYNC_TF32_PACK_KERNEL_NAME {pack_kernel_name}
 """
@@ -122,6 +124,7 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
     D_f: int,
     M_TILES: int,
     num_stages: int,
+    padded_d: bool,
 ):
     kernel_name = _kernel_name_mma_sync_tf32(D_f)
     pack_kernel_name = _pack_kernel_name_mma_sync_tf32(D_f)
@@ -137,6 +140,7 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
             D_f,
             M_TILES,
             num_stages,
+            padded_d,
             kernel_name,
             pack_kernel_name,
         )
@@ -151,7 +155,8 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
         print(
             "compiling relu_bat_c TF32 cp.async kernel "
             f"with BM={BM}, BN={BN}, D_f={D_f}, "
-            f"M_TILES={M_TILES}, num_stages={num_stages}"
+            f"M_TILES={M_TILES}, num_stages={num_stages}, "
+            f"padded_d={padded_d}"
         )
 
     return compile_cuda_kernel(
@@ -184,6 +189,7 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
             D_f,
             M_TILES,
             2,
+            False,
             kernel_name,
             pack_kernel_name,
         )
@@ -293,6 +299,7 @@ def relu_bat_c_tf32_mma_sync_impl(
         D_f,
         M_TILES,
         num_stages,
+        D != D_f,
     )
     smem_bytes = _dynamic_smem_bytes(
         BM=BM,

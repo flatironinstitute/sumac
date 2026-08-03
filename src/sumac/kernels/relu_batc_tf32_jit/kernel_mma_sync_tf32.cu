@@ -8,6 +8,10 @@
 #define MMA_SYNC_TF32_PACK_KERNEL_NAME relu_bat_c_tf32_mma_sync_pack
 #endif
 
+#ifndef MMA_SYNC_TF32_PADDED_D
+#define MMA_SYNC_TF32_PADDED_D 0
+#endif
+
 // SM80+ mma.sync variant of Y=ReLU(B A.T)C kernel.
 //
 //mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 performs D = A @ B + D, where A and B are TF32 and D is FP32.
@@ -370,24 +374,32 @@ __device__ __forceinline__ void load_a_operand_from_b_coalesced(
 
     uint4 value = {0u, 0u, 0u, 0u};
     if (m < M) {
-        const int d0 = tile_k0 + 4 * half;
-        const float* row_src = B + static_cast<long long>(m) * D;
+        if constexpr (MMA_SYNC_TF32_PADDED_D != 0) {
+            const int d0 = tile_k0 + 4 * half;
+            const float* row_src =
+                B + static_cast<long long>(m) * D;
 
-        if ((D & 3) == 0 && d0 + 3 < D) {
-            value = load_global_u32x4_cs(row_src + d0);
+            if ((D & 3) == 0 && d0 + 3 < D) {
+                value = load_global_u32x4_cs(row_src + d0);
+            } else {
+                if (d0 + 0 < D) {
+                    value.x = load_global_u32_cs(row_src + d0 + 0);
+                }
+                if (d0 + 1 < D) {
+                    value.y = load_global_u32_cs(row_src + d0 + 1);
+                }
+                if (d0 + 2 < D) {
+                    value.z = load_global_u32_cs(row_src + d0 + 2);
+                }
+                if (d0 + 3 < D) {
+                    value.w = load_global_u32_cs(row_src + d0 + 3);
+                }
+            }
         } else {
-            if (d0 + 0 < D) {
-                value.x = load_global_u32_cs(row_src + d0 + 0);
-            }
-            if (d0 + 1 < D) {
-                value.y = load_global_u32_cs(row_src + d0 + 1);
-            }
-            if (d0 + 2 < D) {
-                value.z = load_global_u32_cs(row_src + d0 + 2);
-            }
-            if (d0 + 3 < D) {
-                value.w = load_global_u32_cs(row_src + d0 + 3);
-            }
+            const float* src =
+                B + static_cast<long long>(m) * D +
+                tile_k0 + 4 * half;
+            value = load_global_u32x4_cs(src);
         }
     }
 
