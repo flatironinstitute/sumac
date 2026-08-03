@@ -29,9 +29,18 @@ from sumac.kernels.relu_batc_tf32_jit.api import (
     relu_bat_c_tf32_wgmma,
 )
 
+
+def torch_eager_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+) -> torch.Tensor:
+    return torch.relu(B @ A.T) @ C
+
+
 @torch.compile(mode='max-autotune-no-cudagraphs')
 def torch_impl(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
-    return torch.relu(B @ A.T) @ C
+    return torch_eager_impl(A, B, C)
 
 def ms_to_tflops(M, N, D, ms):
         flops = M * N * (D + D - 1) + M * D * (N + N - 1)
@@ -65,10 +74,16 @@ def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
 def print_perf_summary(result: dict) -> None:
     rows = [
         (
-            "torch",
+            "torch eager",
+            result["torch_eager_ms"],
+            result["torch_eager_TFLOPs"],
+            1.0,
+        ),
+        (
+            "torch.compile",
             result["torch_ms"],
             result["torch_TFLOPs"],
-            1.0,
+            result["speedup_torch_compile"],
         ),
         (
             "cuda fused FP32 (1D)",
@@ -94,7 +109,10 @@ def print_perf_summary(result: dict) -> None:
         )
 
     print("[performance]")
-    print(f"  {'implementation':<32} {'time [ms]':>10} {'TFLOP/s':>10} {'speedup':>9}")
+    print(
+        f"  {'implementation':<32} {'time [ms]':>10} "
+        f"{'TFLOP/s':>10} {'vs eager':>11}"
+    )
     for name, ms, tflops, speedup in rows:
         print(f"  {name:<32} {ms:10.4f} {tflops:10.2f} {speedup:8.2f}x")
     print()
@@ -236,7 +254,10 @@ def bench_one(
     B = torch.randn((M, D), device=device, dtype=dtype)
     C = torch.randn((N, D), device=device, dtype=dtype)
     
-    ref = torch_impl(A, B, C)
+    ref = torch_eager_impl(A, B, C)
+    # Trigger torch.compile before its timed benchmark. Previously the
+    # correctness reference also served as this compilation warmup.
+    torch_impl(A, B, C)
     relu_bat_c_fp32_tuned = relu_bat_c_fp32_cuda_launcher(
         tune_trials,
         tune_warmup_ms,
@@ -319,6 +340,9 @@ def bench_one(
     def torch_run():
         return torch_impl(A, B, C)
 
+    def torch_eager_run():
+        return torch_eager_impl(A, B, C)
+
     def fp32_cuda_run():
         return relu_bat_c_fused_op(
             A,
@@ -337,7 +361,16 @@ def bench_one(
 
     torch.cuda.synchronize()
 
-    t_torch   = triton.testing.do_bench(torch_run, warmup=warmup_ms, rep=rep_ms)
+    t_torch_eager = triton.testing.do_bench(
+        torch_eager_run,
+        warmup=warmup_ms,
+        rep=rep_ms,
+    )
+    t_torch = triton.testing.do_bench(
+        torch_run,
+        warmup=warmup_ms,
+        rep=rep_ms,
+    )
     t_fp32_cuda = triton.testing.do_bench(
         fp32_cuda_run,
         warmup=warmup_ms,
@@ -359,7 +392,8 @@ def bench_one(
     return {
         "M": M, "N": N, "D": D, "dtype": str(dtype).replace("torch.", ""),
 
-        "torch_ms":   float(t_torch),
+        "torch_eager_ms": float(t_torch_eager),
+        "torch_ms": float(t_torch),
         "fp32_cuda_ms": float(t_fp32_cuda),
         "fp32_cuda_params": dict(fp32_cuda_params),
         "fp32_cuda_tune_ms": float(fp32_cuda_decision["runtime_ms"]),
@@ -374,7 +408,10 @@ def bench_one(
             None if wgmma_decision is None
             else float(wgmma_decision["runtime_ms"])
         ),
-        "torch_TFLOPs":   float(ms_to_tflops(M, N, D, t_torch)),
+        "torch_eager_TFLOPs": float(
+            ms_to_tflops(M, N, D, t_torch_eager)
+        ),
+        "torch_TFLOPs": float(ms_to_tflops(M, N, D, t_torch)),
         "fp32_cuda_TFLOPs": float(ms_to_tflops(M, N, D, t_fp32_cuda)),
         "tf32_mma_sync_TFLOPs": float(
             ms_to_tflops(M, N, D, t_tf32_mma_sync)
@@ -383,9 +420,14 @@ def bench_one(
             None if t_wgmma is None
             else float(ms_to_tflops(M, N, D, t_wgmma))
         ),
-        "speedup_fp32_cuda": float(t_torch / t_fp32_cuda),
-        "speedup_tf32_mma_sync": float(t_torch / t_tf32_mma_sync),
-        "speedup_wgmma": None if t_wgmma is None else float(t_torch / t_wgmma),
+        "speedup_torch_compile": float(t_torch_eager / t_torch),
+        "speedup_fp32_cuda": float(t_torch_eager / t_fp32_cuda),
+        "speedup_tf32_mma_sync": float(
+            t_torch_eager / t_tf32_mma_sync
+        ),
+        "speedup_wgmma": (
+            None if t_wgmma is None else float(t_torch_eager / t_wgmma)
+        ),
     }
 
 
@@ -430,8 +472,14 @@ if __name__ == "__main__":
         cache_dir=args.autotune_cache_dir,
         verbose=args.autotune_verbose,
     ):
+        # Four full waves on the current 188-SM GPU with the cached MMA-sync
+        # configurations:
+        #   D=16:  BM=256, 3 blocks/SM
+        #   D=32:  BM=128, 3 blocks/SM
+        #   D=64:  BM=128, 2 blocks/SM
+        #   D=128: BM=64,  2 blocks/SM
         r = bench_one(
-            M=250000,
+            M=577536,
             N=2500,
             D=16,
             dtype=torch.float32,
@@ -440,7 +488,7 @@ if __name__ == "__main__":
         )
         print_perf_summary(r)
         r = bench_one(
-            M=250000,
+            M=288768,
             N=2500,
             D=32,
             dtype=torch.float32,
@@ -449,7 +497,7 @@ if __name__ == "__main__":
         )
         print_perf_summary(r)
         r = bench_one(
-            M=250000,
+            M=192512,
             N=2500,
             D=64,
             dtype=torch.float32,
@@ -458,7 +506,7 @@ if __name__ == "__main__":
         )
         print_perf_summary(r)
         r = bench_one(
-            M=250000,
+            M=96256,
             N=2500,
             D=128,
             dtype=torch.float32,
@@ -466,14 +514,14 @@ if __name__ == "__main__":
             rep_ms=args.rep_ms,
         )
         print_perf_summary(r)
-        r = bench_one(
-            M=250000,
-            N=2500,
-            D=256,
-            dtype=torch.float32,
-            warmup_ms=args.warmup_ms,
-            rep_ms=args.rep_ms,
-        )
-        print_perf_summary(r)
+        # r = bench_one(
+        #     M=250000,
+        #     N=2500,
+        #     D=256,
+        #     dtype=torch.float32,
+        #     warmup_ms=args.warmup_ms,
+        #     rep_ms=args.rep_ms,
+        # )
+        # print_perf_summary(r)
     
     

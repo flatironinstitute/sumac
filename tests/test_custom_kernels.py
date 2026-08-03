@@ -62,8 +62,25 @@ def test_relu_batc_kernel(D: int):
     assert_max_abs_close(result, reference, FP32_MAX_ABS_ERROR)
 
 
-@pytest.mark.parametrize("D", [16, 32, 64, 128, 256])
-def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
+@pytest.mark.parametrize(
+    ("D", "num_stages", "N"),
+    [
+        (16, 1, 250),
+        (17, 1, 250),
+        (32, 1, 250),
+        (64, 1, 250),
+        (128, 1, 250),
+        (256, 1, 250),
+        (64, 2, 250),
+        (64, 3, 8),
+        (64, 3, 250),
+    ],
+)
+def test_relu_batc_tf32_mma_sync_kernel_max_abs(
+    D: int,
+    num_stages: int,
+    N: int,
+):
     if torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("TF32 MMA sync kernel requires SM80 or newer")
 
@@ -72,7 +89,6 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
     )
 
     torch.manual_seed(D)
-    N = 250
     M = 25000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
@@ -85,7 +101,7 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(D: int):
         BM=128,
         BN=16,
         M_TILES=2,
-        num_stages=1,
+        num_stages=num_stages,
     )
     reference = relu_bat_c_tf32_reference(A, B, C)
 

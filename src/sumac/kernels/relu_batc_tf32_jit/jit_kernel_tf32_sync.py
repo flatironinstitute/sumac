@@ -55,31 +55,36 @@ def _make_header_mma_sync_tf32(
 
 def _dynamic_smem_bytes(
     *,
+    BM: int,
     BN: int,
     D: int,
+    M_TILES: int,
     num_stages: int,
 ) -> int:
-    return 2 * num_stages * BN * D * 4 + 127
+    operand_pipeline_bytes = 2 * num_stages * BN * D * 4
+    compute_warps = BM // (M_TILES * 16)
+    b_stage_bytes = compute_warps * 512
+    return max(operand_pipeline_bytes, b_stage_bytes) + 127
 
 
 def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _packed_panel_elems(*, BN: int, D: int) -> int:
+def _packed_tile_elems(*, BN: int, D: int) -> int:
     return BN * D
 
 
-def _packed_panel_pairs(*, BN: int, D: int) -> int:
-    return _packed_panel_elems(BN=BN, D=D) // 2
+def _packed_tile_pairs(*, BN: int, D: int) -> int:
+    return _packed_tile_elems(BN=BN, D=D) // 2
 
 
-def _kernel_name_mma_sync_tf32() -> str:
-    return "relu_bat_c_tf32_mma_sync"
+def _kernel_name_mma_sync_tf32(D_f: int) -> str:
+    return f"relu_bat_c_tf32_mma_sync_d{D_f}"
 
 
-def _pack_kernel_name_mma_sync_tf32() -> str:
-    return "relu_bat_c_tf32_mma_sync_pack"
+def _pack_kernel_name_mma_sync_tf32(D_f: int) -> str:
+    return f"relu_bat_c_tf32_mma_sync_pack_d{D_f}"
 
 
 def _maybe_opt_in_dynamic_smem(kernel, smem_bytes: int) -> None:
@@ -118,8 +123,8 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
     M_TILES: int,
     num_stages: int,
 ):
-    kernel_name = _kernel_name_mma_sync_tf32()
-    pack_kernel_name = _pack_kernel_name_mma_sync_tf32()
+    kernel_name = _kernel_name_mma_sync_tf32(D_f)
+    pack_kernel_name = _pack_kernel_name_mma_sync_tf32(D_f)
     header_code, kernel_source, kernel_source_start_line = _split_kernel_file(
         _KERNEL_PATH_MMA_SYNC_TF32
     )
@@ -164,10 +169,9 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
     BN: int,
     D_f: int,
     M_TILES: int,
-    num_stages: int,
 ):
-    kernel_name = _kernel_name_mma_sync_tf32()
-    pack_kernel_name = _pack_kernel_name_mma_sync_tf32()
+    kernel_name = _kernel_name_mma_sync_tf32(D_f)
+    pack_kernel_name = _pack_kernel_name_mma_sync_tf32(D_f)
     header_code, kernel_source, kernel_source_start_line = _split_kernel_file(
         _KERNEL_PATH_MMA_SYNC_TF32
     )
@@ -179,7 +183,7 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
             BN,
             D_f,
             M_TILES,
-            num_stages,
+            2,
             kernel_name,
             pack_kernel_name,
         )
@@ -238,8 +242,8 @@ def relu_bat_c_tf32_mma_sync_impl(
         raise ValueError("D must be >= 1")
     if BN % 8 != 0:
         raise ValueError("BN must be divisible by MMA_N=8")
-    if num_stages < 1:
-        raise ValueError("num_stages must be >= 1")
+    if num_stages < 1 or num_stages > 3:
+        raise ValueError("num_stages must be in [1, 3]")
 
     warp_m_rows = M_TILES * 16
     if BM % warp_m_rows != 0:
@@ -248,27 +252,26 @@ def relu_bat_c_tf32_mma_sync_impl(
     compute_warps_per_block = BM // warp_m_rows
     threads_per_block = compute_warps_per_block * 32
 
-    num_panels = (N + BN - 1) // BN
-    D_pad = _round_up(D, 8)
-    Y = torch.empty((M, D_pad), device=A.device, dtype=torch.float32)
+    num_tiles = (N + BN - 1) // BN
+    D_f = _round_up(D, 8)
+    Y = torch.empty((M, D_f), device=A.device, dtype=torch.float32)
 
-    packed_shape = (num_panels, _packed_panel_elems(BN=BN, D=D_pad))
+    packed_shape = (num_tiles, _packed_tile_elems(BN=BN, D=D_f))
     A_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
     C_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
 
-    if num_panels > 0:
+    if num_tiles > 0:
         pack_kernel = get_relu_bat_c_pack_kernel_mma_sync_tf32(
             BM,
             BN,
-            D_pad,
+            D_f,
             M_TILES,
-            num_stages,
         )
         pack_threads = 256
-        panel_pairs = _packed_panel_pairs(BN=BN, D=D_pad)
+        tile_pairs = _packed_tile_pairs(BN=BN, D=D_f)
         pack_grid = (
-            (panel_pairs + pack_threads - 1) // pack_threads,
-            num_panels,
+            (tile_pairs + pack_threads - 1) // pack_threads,
+            num_tiles,
             1,
         )
         pack_kernel(
@@ -287,13 +290,15 @@ def relu_bat_c_tf32_mma_sync_impl(
     kernel = get_relu_bat_c_kernel_mma_sync_tf32(
         BM,
         BN,
-        D_pad,
+        D_f,
         M_TILES,
         num_stages,
     )
     smem_bytes = _dynamic_smem_bytes(
+        BM=BM,
         BN=BN,
-        D=D_pad,
+        D=D_f,
+        M_TILES=M_TILES,
         num_stages=num_stages,
     )
     _maybe_opt_in_dynamic_smem(kernel, smem_bytes)

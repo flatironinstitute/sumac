@@ -184,7 +184,7 @@ def relu_bat_c_tf32_sync_constraints(
         return False
     if BN % 8 != 0:
         return False
-    if num_stages < 1:
+    if num_stages < 1 or num_stages > 3:
         return False
 
     warp_m_rows = M_TILES * 16
@@ -200,7 +200,9 @@ def relu_bat_c_tf32_sync_constraints(
         "shared_memory_per_block_optin",
         getattr(props, "shared_memory_per_block", 0),
     )
-    smem_bytes = 2 * num_stages * BN * round_up(D, 8) * 4 + 127
+    operand_pipeline_bytes = 2 * num_stages * BN * round_up(D, 8) * 4
+    b_stage_bytes = compute_warps * 512
+    smem_bytes = max(operand_pipeline_bytes, b_stage_bytes) + 127
     return smem_bytes <= max_smem
 
 

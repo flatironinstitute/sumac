@@ -154,25 +154,49 @@ def active_kernel_autotune_options() -> KernelAutotuneOptions:
     return ACTIVE_AUTOTUNE_OPTIONS.get()
 
 
+def normalize_autotune_mode(mode: str | AutotuneMode) -> AutotuneMode:
+    if isinstance(mode, AutotuneMode):
+        return mode
+    return AutotuneMode(mode)
+
+
+def _cached_payload_matches_configs(
+    payload: Any,
+    configs: Dict[str, list],
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return False
+    if set(params) != set(configs):
+        return False
+    return all(params[name] in values for name, values in configs.items())
+
+
 @contextmanager
 def kernel_autotune_options(
     *,
-    mode: str = "cache",
+    mode: str | AutotuneMode = AutotuneMode.CACHE,
     cache_dir: str | Path | None = None,
     verbose: bool = False,
 ):
-    # normalized_mode = normalize_autotune_mode(mode)
+    normalized_mode = normalize_autotune_mode(mode)
     resolved_cache_dir = (
         default_kernel_autotune_cache_dir()
         if cache_dir is None
         else Path(cache_dir)
     )
     options = KernelAutotuneOptions(
-        mode=AutotuneMode(mode),
+        mode=normalized_mode,
         cache_dir=resolved_cache_dir,
         cache_dir_key=str(resolved_cache_dir),
         verbose=verbose,
-        session_id=next(AUTOTUNE_SESSION_IDS) if mode == "force" else 0,
+        session_id=(
+            next(AUTOTUNE_SESSION_IDS)
+            if normalized_mode is AutotuneMode.FORCE
+            else 0
+        ),
     )
     token = ACTIVE_AUTOTUNE_OPTIONS.set(options)
     try:
@@ -202,7 +226,13 @@ def autotune_cuda_kernel(
     fixed_options = autotune_options
     fixed_cache_file = None
     fixed_store = None
-    if fixed_options is not None and fixed_options.mode not in ("disable", "fallback"):
+    if (
+        fixed_options is not None
+        and fixed_options.mode not in (
+            AutotuneMode.DISABLE,
+            AutotuneMode.FALLBACK,
+        )
+    ):
         fixed_cache_file = (
             cache_path_obj
             if cache_path_is_absolute
@@ -218,7 +248,7 @@ def autotune_cuda_kernel(
         def resolve_decision(*args, **kwargs) -> Dict[str, Any]:
             options = fixed_options or active_kernel_autotune_options()
 
-            if options.mode == "fallback":
+            if options.mode is AutotuneMode.FALLBACK:
                 if fallback_fn is None:
                     raise ValueError(
                         f"autotune='fallback' was requested for {fn.__name__}, "
@@ -252,7 +282,7 @@ def autotune_cuda_kernel(
             if decision is not None:
                 return decision
 
-            if options.mode == "disable":
+            if options.mode is AutotuneMode.DISABLE:
                 decision = {
                     "mode": "cuda",
                     "params": dict(default_params),
@@ -274,7 +304,21 @@ def autotune_cuda_kernel(
 
             disk_key = json.dumps(_normalize_for_json(mem_key), separators=(",", ":"))
 
-            payload = None if options.mode == "force" else store.get(disk_key)
+            payload = (
+                None
+                if options.mode is AutotuneMode.FORCE
+                else store.get(disk_key)
+            )
+            if (
+                payload is not None
+                and not _cached_payload_matches_configs(payload, configs)
+            ):
+                if options.verbose:
+                    print(
+                        f"[autotune:{fn.__name__}] ignoring stale cached "
+                        f"parameters for key={mem_key}"
+                    )
+                payload = None
             if payload is not None:
                 memo[memo_key] = payload
                 return payload

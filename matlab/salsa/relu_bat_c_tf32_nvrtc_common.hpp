@@ -445,7 +445,9 @@ static bool valid_mma_sync_config(
     if (device.major < 8 || D < 1) {
         return false;
     }
-    if ((cfg.BN % 8) != 0 || cfg.num_stages < 1) {
+    if ((cfg.BN % 8) != 0 ||
+        cfg.num_stages < 1 ||
+        cfg.num_stages > 3) {
         return false;
     }
     const int warp_m_rows = cfg.M_TILES * 16;
