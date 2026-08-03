@@ -6,6 +6,7 @@ from dataclasses import fields
 
 from sumac.kernels.tuning import (
     grid_size,
+    make_choices,
     kernel_autotune_options,
     relu_bat_c_fallback,
     AutotuneReluBatCFP32,
@@ -114,7 +115,7 @@ def bench_one(
     C = torch.randn((N, D), device=device, dtype=dtype)
     
     ref = relu_bat_c_fallback(A, B, C)
-    n_trials_fp32 = max(tune_trials, grid_size(relu_bat_c_fp32_tune_config))
+    n_trials_fp32 = max(tune_trials, grid_size(make_choices(relu_bat_c_fp32_tune_config)))
     relu_bat_c_fp32_tuned = AutotuneReluBatCFP32(
         configs = relu_bat_c_fp32_tune_config,
         cache_path = "relu_bat_c_jit_autotune.json",
@@ -142,14 +143,14 @@ def bench_one(
         )
 
     relu_bat_c_fp32_tuned.resolve_decision((A, B, C))
-    fp32_cuda_params = relu_bat_c_fp32_tuned.decision_configs
+    fp32_cuda_params = relu_bat_c_fp32_tuned.decision_config
     assert fp32_cuda_params is not None
     fp32_params_dict = {f.name: getattr(fp32_cuda_params, f.name)[0] for f in fields(fp32_cuda_params)}
     out_fp32_cuda = relu_bat_c_fused_op(A, B, C, **fp32_params_dict)
     err_fp32_cuda = (out_fp32_cuda - ref).abs().max().item()
 
     relu_bat_c_tf32_mma_sync_tuned.resolve_decision((A, B, C))
-    sync_params = relu_bat_c_tf32_mma_sync_tuned.decision_configs
+    sync_params = relu_bat_c_tf32_mma_sync_tuned.decision_config
     assert sync_params is not None
     sync_params_dict = {f.name: getattr(sync_params, f.name)[0] for f in fields(sync_params)}
     out_tf32_mma_sync = relu_bat_c_tf32_mma_sync(A, B, C, **sync_params_dict)
@@ -160,7 +161,7 @@ def bench_one(
     err_wgmma = None
     if relu_bat_c_wgmma_tuned is not None:
         relu_bat_c_wgmma_tuned.resolve_decision((A, B, C))
-        wgmma_params = relu_bat_c_wgmma_tuned.decision_configs
+        wgmma_params = relu_bat_c_wgmma_tuned.decision_config
         assert wgmma_params is not None
         wgmma_params_dict = {
             f.name: getattr(wgmma_params, f.name)[0] for f in fields(wgmma_params)

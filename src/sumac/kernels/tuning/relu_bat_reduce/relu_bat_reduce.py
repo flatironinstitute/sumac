@@ -5,7 +5,7 @@ from torch import Tensor
 from sumac.utils import is_power_of_two
 from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 from sumac.kernels.tuning.autotune import AutotuneCudaKernel
-from sumac.kernels.tuning.tuning_types import ReluBatReduceTuneConfig, T_ReluBatReduceParams, T_ReluBatReduceReturn, KernelAutotuneOptions
+from sumac.kernels.tuning.tuning_types import ReluBatReduceTuneConfig, T_ReluBatReduceParams, T_ReluBatReduceReturn, KernelAutotuneOptions, make_config_list
 
 
 @torch.compile
@@ -22,18 +22,15 @@ def relu_bat_reduce_fallback(
     return sum_sr, sum_sr2
 
 
-relu_bat_reduce_tune_config = ReluBatReduceTuneConfig(
-    BM = [32, 64, 128, 256],
-    BK = [16, 32, 64, 128],
-    num_ms = [1, 2, 4, 6]
+default_config = ReluBatReduceTuneConfig(BM = 32, BK = 16, num_ms = 1)
+relu_bat_reduce_tune_config = make_config_list(
+    default_config,
+    {
+        'BM': [32, 64, 128, 256],
+        'BK': [16, 32, 64, 128],
+        'num_ms': [1, 2, 4, 6]    
+    }
 )
-
-
-def _unpack_config(cfg: ReluBatReduceTuneConfig):
-    BM = cfg.BM[0]
-    BK = cfg.BK[0]
-    num_ms = cfg.num_ms[0]
-    return (BM, BK, num_ms)
 
 
 class AutotuneReluBatReduce(AutotuneCudaKernel[ReluBatReduceTuneConfig, T_ReluBatReduceParams, T_ReluBatReduceReturn]):
@@ -48,8 +45,7 @@ class AutotuneReluBatReduce(AutotuneCudaKernel[ReluBatReduceTuneConfig, T_ReluBa
 
     def _candidate_fn(self, params: T_ReluBatReduceParams, config: ReluBatReduceTuneConfig):
         (A, B) = params
-        (BM, BK, num_ms) = _unpack_config(config)
-        return relu_bat_reduce_fused(A, B, BM, BK, num_ms)
+        return relu_bat_reduce_fused(A, B, config.BM, config.BK, config.num_ms)
 
 
     def _fallback(self, params: T_ReluBatReduceParams) -> T_ReluBatReduceReturn:
@@ -59,17 +55,16 @@ class AutotuneReluBatReduce(AutotuneCudaKernel[ReluBatReduceTuneConfig, T_ReluBa
 
     def _constraint(self, params: T_ReluBatReduceParams, config: ReluBatReduceTuneConfig) -> bool:
         (A, _) = params
-        (BM, BK, num_ms) = _unpack_config(config)
         _, D = A.shape
         props = torch.cuda.get_device_properties(A.device)
 
-        if D >= 32 and num_ms > 4: return False
-        if D >= 64 and num_ms > 2: return False
-        if not is_power_of_two(BM): return False
-        if BM > getattr(props, "max_threads_per_block", 1024): return False
+        if D >= 32 and config.num_ms > 4: return False
+        if D >= 64 and config.num_ms > 2: return False
+        if not is_power_of_two(config.BM): return False
+        if config.BM > getattr(props, "max_threads_per_block", 1024): return False
 
         shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0))
-        smem_bytes = 4 * BK * D + 2 * BM * 8
+        smem_bytes = 4 * config.BK * D + 2 * config.BM * 8
         return smem_bytes <= shared_memory_per_block
 
 

@@ -5,6 +5,7 @@ from enum import Enum
 from sumac.kernels.cuda_utils import cuda_is_available
 from sumac.kernels.tuning import active_kernel_autotune_options, KernelAutotuneOptions, AutotuneMode
 from sumac.kernels.tuning.autotune import grid_size
+from sumac.kernels.tuning.tuning_types import make_choices
 from sumac.config import SumacConfig
 
 from .relu_bat_c_base import relu_bat_c_fallback
@@ -13,6 +14,7 @@ from .relu_bat_c_tf32_sync import AutotuneReluBatCTf32Sync, relu_bat_c_tf32_sync
 from .relu_bat_c_tf32_wgmma import (
     AutotuneReluBatCTf32Wgmma,
     relu_bat_c_tf32_wgmma_tune_config,
+    relu_bat_c_tf32_wgmma_available
 )
 
 
@@ -53,7 +55,7 @@ def get_tunable_kernel(cfg: SumacConfig):
         return AutotuneReluBatCTf32Wgmma(
             configs = tune_config,
             cache_path = "relu_bat_c_tf32_wgmma_mode_autotune.json",
-            n_trials = grid_size(tune_config),
+            n_trials = grid_size(make_choices(tune_config)),
             autotune_options = autotune_opts
         )
 
@@ -62,7 +64,7 @@ def get_tunable_kernel(cfg: SumacConfig):
         return AutotuneReluBatCTf32Sync(
             configs = tune_config,
             cache_path = "relu_bat_c_tf32_mma_autotune.json",
-            n_trials = grid_size(tune_config),
+            n_trials = grid_size(make_choices(tune_config)),
             autotune_options = autotune_opts
         )
 

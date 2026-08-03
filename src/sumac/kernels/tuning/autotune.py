@@ -10,7 +10,7 @@ import torch
 from sumac.config import AutotuneMode
 from sumac.kernels.cuda_utils import cuda_is_available
 
-from .tuning_types import T_TuneConfig, TuneResult, KernelAutotuneOptions, TuneResultMode, T_FnParams, T_FnReturns
+from .tuning_types import T_TuneConfig, TuneResult, KernelAutotuneOptions, TuneResultMode, T_FnParams, T_FnReturns, make_choices
 from .json_cache import JsonConfigStore, normalize_for_json
 from .option_handling import active_kernel_autotune_options, default_kernel_autotune_cache_dir
 
@@ -40,10 +40,9 @@ def _require_triton():
     return triton
 
 
-def grid_size(config: T_TuneConfig) -> int:
+def grid_size(config_dict: dict[str, list[int] | list[str]]) -> int:
     size = 1
-    cfg_dict = asdict(config)
-    for values in cfg_dict.values():
+    for values in config_dict.values():
         size += len(values)
     return size
 
@@ -126,7 +125,7 @@ class MemoryCacheKey():
 
 
 class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns: T_FnReturns]():
-    configs: T_Config
+    configs: list[T_Config]
     cache_path: Path
     n_trials: int
     warmup: int
@@ -134,7 +133,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
     sampler: optuna.samplers.BaseSampler            # in practice always optuna.samplers.GridSampler(search_space=tune_config),
     wrapped_fn_name: str
     wrapped_fn_module: str
-    decision_configs: T_Config | None
+    decision_config: T_Config | None
     decision_runtime_ms: float
     interface_fn: Callable[[T_Params], T_Returns]
     decision_memo_cache: Dict[MemoryCacheKey, TuneResult]
@@ -143,7 +142,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
 
 
     def __init__(self,
-        configs: T_Config,
+        configs: list[T_Config],
         wrapped_fn_name: str = "undef",
         wrapped_fn_module: str = "undef",
         cache_path: str = "kernel_autotune_cache.json",
@@ -166,10 +165,11 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         # over the parameters, so I'm just hard-coding that here.
         # Caller can still use a TPESampler if desired.
         # self.sampler = sampler or optuna.samplers.TPESampler(seed=0)
-        self.sampler = sampler or optuna.samplers.GridSampler(search_space = asdict(configs))
+        self.sampler = sampler or optuna.samplers.GridSampler(search_space = make_choices(configs))
         self.decision_memo_cache = {}
         self.options = autotune_options or active_kernel_autotune_options()
         self.decision_disk_cache = self._get_disk_cache()
+        self.decision_config = None
 
 
     # def _get_key(self, A: Tensor, B: Tensor) -> ExperimentKey:
@@ -222,7 +222,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             return
         if self.options.mode == AutotuneMode.DISABLE:
             # If disable, we use the first entry in each config field as the default
-            self._set_interface_fn(decision = _copy_config(self.configs))
+            self._set_interface_fn(decision = self.configs[0])
             return
 
         disk_cache_key = self._get_key(params)
@@ -286,7 +286,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
 
         best = study.best_trial
         best_cuda_runtime_ms = float(best.user_attrs["runtime_ms"])
-        best_cuda_params = {name: best.params[name] for name in [f.name for f in fields(self.configs)]}
+        best_cuda_params = {name: best.params[name] for name in [f.name for f in fields(self.configs[0])]}
 
         if fallback_runtime_ms <= best_cuda_runtime_ms:
             return TuneResult(
@@ -309,9 +309,9 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
     ) -> float:
         selected_config_dict = {
             name: trial.suggest_categorical(name, values)
-            for name, values in asdict(self.configs).items()
+            for name, values in make_choices(self.configs).items()
         }
-        selected_config = _copy_config(self.configs, selected_config_dict)
+        selected_config = replace(self.configs[0], **selected_config_dict)
         def _print_partial(msg: str, e: Exception | None = None):
             _print_trial_pruned(trial.number, msg, selected_config_dict, e, self.options.verbose)
 
@@ -364,15 +364,15 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         # Implementing functions should expect to take CONFIG_PROPERTY[0] in any case.
         if isinstance(decision, TuneResult):
             self.decision_runtime_ms = decision.runtime_ms
-            self.decision_configs = _copy_config(self.configs, decision.params)
+            self.decision_config = replace(self.configs[0], **decision.params)
             if decision.mode == TuneResultMode.FALLBACK:
-                self.decision_configs = None
+                self.decision_config = None
         else:
             # handles fallback ("None") and Disable ("T_Config") cases
-            self.decision_configs = decision
+            self.decision_config = decision
             self.decision_runtime_ms = float("inf")
 
-        cfgs = self.decision_configs
+        cfgs = self.decision_config
         if cfgs is None:    # incl case where decision is None (AutotuneMode.FALLBACK)
             self.interface_fn = self._fallback
         else:
