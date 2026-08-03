@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -81,7 +81,7 @@ def make_config_list[T_Cfg: T_TuneConfig](base: T_Cfg, d: dict[str, list[int] | 
     return res
 
 
-class TuneResultMode(Enum):
+class TuneResultMode(StrEnum):
     CUDA = "cuda"
     FALLBACK = "fallback"
 

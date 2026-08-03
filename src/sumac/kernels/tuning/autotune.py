@@ -90,22 +90,6 @@ def _print_trial_pruned(
 # then can do new_instance = replace(INSTANCE, **trimdict)
 
 
-def _copy_config[T_Config: T_TuneConfig](cfg: T_Config, winners_dict: dict | None = None) -> T_Config:
-    """Duplicate an appropriately typed config object, with each of its (list-type) parameters
-    trimmed to only the first element.
-
-    If a dictionary of winners is provided, the values from this dictionary will be used
-    to replace the values in the base config object.
-
-    Returns:
-        T_Config: A config object with strongly typed expected keys, but whose list
-            members have only the (default or winning) values.
-    """
-    trimdict = winners_dict or {f.name: getattr(cfg, f.name)[:1] for f in fields(cfg)}
-    new_cfg = replace(cfg, **trimdict)
-    return new_cfg
-
-
 @dataclass(frozen=True)
 class ExperimentKey():
     major_version: int

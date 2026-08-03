@@ -62,14 +62,15 @@ class AutotuneReluBatCFP32(AutotuneCudaKernel[ReluBatCFp32TuneConfig, T_ReluBatC
 
     def _constraint(self, params: T_ReluBatCParams, config: ReluBatCFp32TuneConfig) -> bool:
         (A, _, _) = params
+        _, D = A.shape
 
-        if A.shape[1] >= 32 and config.num_ms > 2:
+        if D >= 32 and config.num_ms > 2:
             return False
-        if A.shape[1] >= 64 and config.num_ms > 1:
+        if D >= 64 and config.num_ms > 1:
             return False
 
         props = torch.cuda.get_device_properties(A.device)
         if config.BM > getattr(props, "max_threads_per_block", 1024):
             return False
         shared_memory_per_block = getattr(props, "shared_memory_per_block", 0)
-        return shared_memory_per_block >= 8 * config.BK * A.shape[1]
+        return shared_memory_per_block >= 8 * config.BK * D

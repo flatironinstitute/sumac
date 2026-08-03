@@ -2,7 +2,7 @@ import torch
 import triton
 import argparse
 
-from dataclasses import fields
+from dataclasses import asdict
 
 from sumac.kernels.tuning import (
     grid_size,
@@ -145,14 +145,15 @@ def bench_one(
     relu_bat_c_fp32_tuned.resolve_decision((A, B, C))
     fp32_cuda_params = relu_bat_c_fp32_tuned.decision_config
     assert fp32_cuda_params is not None
-    fp32_params_dict = {f.name: getattr(fp32_cuda_params, f.name)[0] for f in fields(fp32_cuda_params)}
+    fp32_params_dict = asdict(fp32_cuda_params)
     out_fp32_cuda = relu_bat_c_fused_op(A, B, C, **fp32_params_dict)
     err_fp32_cuda = (out_fp32_cuda - ref).abs().max().item()
 
     relu_bat_c_tf32_mma_sync_tuned.resolve_decision((A, B, C))
     sync_params = relu_bat_c_tf32_mma_sync_tuned.decision_config
     assert sync_params is not None
-    sync_params_dict = {f.name: getattr(sync_params, f.name)[0] for f in fields(sync_params)}
+    # sync_params_dict = {f.name: getattr(sync_params, f.name)[0] for f in fields(sync_params)}
+    sync_params_dict = asdict(sync_params)
     out_tf32_mma_sync = relu_bat_c_tf32_mma_sync(A, B, C, **sync_params_dict)
     err_tf32_mma_sync = (out_tf32_mma_sync - ref).abs().max().item()
 
@@ -163,9 +164,10 @@ def bench_one(
         relu_bat_c_wgmma_tuned.resolve_decision((A, B, C))
         wgmma_params = relu_bat_c_wgmma_tuned.decision_config
         assert wgmma_params is not None
-        wgmma_params_dict = {
-            f.name: getattr(wgmma_params, f.name)[0] for f in fields(wgmma_params)
-        }
+        # wgmma_params_dict = {
+        #     f.name: getattr(wgmma_params, f.name)[0] for f in fields(wgmma_params)
+        # }
+        wgmma_params_dict = asdict(wgmma_params)
         out_wgmma = relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params_dict)
         err_wgmma = (out_wgmma - ref).abs().max().item()
 
