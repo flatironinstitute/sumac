@@ -113,7 +113,7 @@ class AutotuneReluBatCTf32Wgmma(AutotuneCudaKernel[ReluBatCTf32WgmmaTuneConfig, 
 
         if props.major != 9: return False
         if D < 1: return False
-        # TODO: These would invalidate the config, move to the config definition as post_init
+        # TODO: These would invalidate the config, move to the config definition as post_init?
         if config.WGMMA_S_N not in (16, 32, 64, 128): return False
         if config.WGMMA_Y_N not in (16, 32, 64, 128): return False
         if config.BN % config.WGMMA_S_N != 0: return False

@@ -1,29 +1,21 @@
 import argparse
-from functools import lru_cache
-
-import optuna
+from dataclasses import asdict
 import torch
 import triton
 
-from sumac.kernels.relu_bat_reduce import (
-    grid_size as _grid_size,
-    relu_bat_reduce_constraints,
-    relu_bat_reduce_tune_config,
-)
 from sumac.kernels.tuning import (
-    autotune_cuda_kernel,
+    grid_size,
+    make_choices,
+    # autotune_cuda_kernel,
     kernel_autotune_options,
-    relu_bat_reduce_key,
+    # relu_bat_reduce_key,
+    relu_bat_reduce_fallback,
+    AutotuneReluBatReduce,
+    relu_bat_reduce_tune_config
 )
 
 from sumac.config import AutotuneMode
-
 from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
-
-
-def torch_impl(A: torch.Tensor, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    S = torch.relu(B @ A.T)
-    return S.sum(), (S * S).sum()
 
 
 def ms_to_tflops(M: int, N: int, D: int, ms: float) -> float:
@@ -47,18 +39,18 @@ def _format_abs_errs(errs: tuple[float, float]) -> str:
     return f"sum_abs_err: {errs[0]:.6e}, sum_sq_abs_err: {errs[1]:.6e}"
 
 
-def _require_valid_params(
-    name: str,
-    constraint_fn,
-    args: tuple,
-    params: dict,
-) -> None:
-    if constraint_fn(*args, **params):
-        return
-    raise RuntimeError(
-        f"{name} resolved invalid autotune params {params}. "
-        "Remove the corresponding autotune cache or rerun with autotune='force'."
-    )
+# def _require_valid_params(
+#     name: str,
+#     constraint_fn,
+#     args: tuple,
+#     params: dict,
+# ) -> None:
+#     if constraint_fn(*args, **params):
+#         return
+#     raise RuntimeError(
+#         f"{name} resolved invalid autotune params {params}. "
+#         "Remove the corresponding autotune cache or rerun with autotune='force'."
+#     )
 
 
 def print_perf_summary(result: dict) -> None:
@@ -84,35 +76,35 @@ def print_perf_summary(result: dict) -> None:
     print()
 
 
-@lru_cache(maxsize=None)
-def relu_bat_reduce_fp32_launcher(
-    n_trials: int,
-    warmup_ms: int,
-    rep_ms: int,
-):
-    tune_config = relu_bat_reduce_tune_config()
-    n_trials = max(n_trials, _grid_size(tune_config))
+# @lru_cache(maxsize=None)
+# def relu_bat_reduce_fp32_launcher(
+#     n_trials: int,
+#     warmup_ms: int,
+#     rep_ms: int,
+# ):
+#     tune_config = relu_bat_reduce_tune_config()
+#     n_trials = max(n_trials, _grid_size(tune_config))
 
-    @autotune_cuda_kernel(
-        configs=tune_config,
-        key_fn=relu_bat_reduce_key,
-        constraint_fn=relu_bat_reduce_constraints,
-        cache_path="relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
-        n_trials=n_trials,
-        warmup=warmup_ms,
-        rep=rep_ms,
-        sampler=optuna.samplers.GridSampler(search_space=tune_config),
-    )
-    def relu_bat_reduce_fp32_cuda(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        BM: int,
-        BK: int,
-        num_ms: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return relu_bat_reduce_fused(B, A, BM, BK, num_ms)
+#     @autotune_cuda_kernel(
+#         configs=tune_config,
+#         key_fn=relu_bat_reduce_key,
+#         constraint_fn=relu_bat_reduce_constraints,
+#         cache_path="relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
+#         n_trials=n_trials,
+#         warmup=warmup_ms,
+#         rep=rep_ms,
+#         sampler=optuna.samplers.GridSampler(search_space=tune_config),
+#     )
+#     def relu_bat_reduce_fp32_cuda(
+#         A: torch.Tensor,
+#         B: torch.Tensor,
+#         BM: int,
+#         BK: int,
+#         num_ms: int,
+#     ) -> tuple[torch.Tensor, torch.Tensor]:
+#         return relu_bat_reduce_fused(B, A, BM, BK, num_ms)
 
-    return relu_bat_reduce_fp32_cuda
+#     return relu_bat_reduce_fp32_cuda
 
 
 @torch.no_grad()
@@ -131,29 +123,30 @@ def bench_one(
     A = torch.randn((N, D), device=device, dtype=dtype)
     B = torch.randn((M, D), device=device, dtype=dtype)
 
-    ref = torch_impl(A, B)
-
-    fp32_tuned = relu_bat_reduce_fp32_launcher(
-        tune_trials,
-        tune_warmup_ms,
-        tune_rep_ms,
+    ref = relu_bat_reduce_fallback(A, B)
+    fp32_tuned = AutotuneReluBatReduce(
+        configs = relu_bat_reduce_tune_config,
+        n_trials = max(tune_trials, grid_size(make_choices(relu_bat_reduce_tune_config))),
+        cache_path = "relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
+        warmup = tune_warmup_ms,
+        rep = tune_rep_ms
     )
 
-    fp32_decision = fp32_tuned.resolve_decision(A, B)
-    fp32_params = fp32_decision["params"]
-    _require_valid_params(
-        "cuda fused FP32",
-        relu_bat_reduce_constraints,
-        (A, B),
-        fp32_params,
-    )
-    out_fp32 = relu_bat_reduce_fused(
-        B,
-        A,
-        fp32_params["BM"],
-        fp32_params["BK"],
-        fp32_params["num_ms"],
-    )
+    fp32_tuned.resolve_decision((A, B))
+    _chosen_params = fp32_tuned.decision_config
+    fp32_params = asdict(_chosen_params) if _chosen_params is not None else {}
+
+    ## ??
+    # _require_valid_params(
+    #     "cuda fused FP32",
+    #     relu_bat_reduce_constraints,
+    #     (A, B),
+    #     fp32_params,
+    # )
+    if _chosen_params is None:
+        out_fp32 = (torch.tensor([0.]), torch.tensor([0.]))
+    else:
+        out_fp32 = relu_bat_reduce_fused(B, A, **asdict(_chosen_params))
     err_fp32 = _abs_errs(out_fp32, ref)
 
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
@@ -164,7 +157,7 @@ def bench_one(
     print(f"  cuda fused FP32                 tuned params: {fp32_params}")
 
     def torch_run():
-        return torch_impl(A, B)
+        return relu_bat_reduce_fallback(A, B)
 
     def fp32_run():
         return relu_bat_reduce_fused(
@@ -179,18 +172,20 @@ def bench_one(
 
     t_torch = triton.testing.do_bench(torch_run, warmup=warmup_ms, rep=rep_ms)
     t_fp32 = triton.testing.do_bench(fp32_run, warmup=warmup_ms, rep=rep_ms)
+    assert isinstance(t_torch, float)
+    assert isinstance(t_fp32, float)
 
     return {
         "M": M,
         "N": N,
         "D": D,
         "dtype": str(dtype).replace("torch.", ""),
-        "torch_ms": float(t_torch),
-        "fp32_cuda_ms": float(t_fp32),
+        "torch_ms": t_torch,
+        "fp32_cuda_ms": t_fp32,
         "fp32_cuda_params": dict(fp32_params),
-        "fp32_cuda_tune_ms": float(fp32_decision["runtime_ms"]),
-        "torch_TFLOPs": float(ms_to_tflops(M, N, D, t_torch)),
-        "fp32_cuda_TFLOPs": float(ms_to_tflops(M, N, D, t_fp32)),
+        "fp32_cuda_tune_ms": fp32_tuned.decision_runtime_ms,
+        "torch_TFLOPs": ms_to_tflops(M, N, D, t_torch),
+        "fp32_cuda_TFLOPs": ms_to_tflops(M, N, D, t_fp32),
         "speedup_fp32_cuda": float(t_torch / t_fp32),
     }
 

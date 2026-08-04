@@ -19,7 +19,6 @@ from sumac.kernels.tuning import (
     relu_bat_c_tf32_sync_tune_config,
     relu_bat_c_tf32_wgmma_tune_config,
     relu_bat_c_tf32_wgmma_available,
-    T_TuneConfig
 )
 
 from sumac.config import AutotuneMode

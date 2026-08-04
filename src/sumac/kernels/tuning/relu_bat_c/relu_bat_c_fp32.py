@@ -15,33 +15,6 @@ relu_bat_c_fp32_tune_config = make_config_list(
     }
 )
 
-# relu_bat_c_fp32_tune_config = [
-#     ReluBatCFp32TuneConfig(
-#         BM = 32,
-#         BK = 16,
-#         num_ms = 1
-#     ),
-#     ReluBatCFp32TuneConfig(
-#         BM = 64,
-#         BK = 32,
-#         num_ms = 2,
-#     ),
-#     ReluBatCFp32TuneConfig(
-#         BM = 128,
-#         BK = 64,
-#         num_ms = 4,
-#     ),
-#     ReluBatCFp32TuneConfig(
-#         BM = 256,
-#         BK = 64,
-#         num_ms = 6
-
-#     # ReluBatCFp32TuneConfig(
-#     #     BM = [32, 64, 128, 256],
-#     #     BK = [16, 32, 64],
-#     #     num_ms = [1, 2, 4, 6]
-#     )
-# ]
 
 class AutotuneReluBatCFP32(AutotuneCudaKernel[ReluBatCFp32TuneConfig, T_ReluBatCParams, T_ReluBatCReturn]):
     def __init__(self, *args, **kwargs):
