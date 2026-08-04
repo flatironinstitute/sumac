@@ -111,8 +111,8 @@ def _print_correctness(
     fp32_params_dict: dict,
     sync_params_dict: dict,
     use_wgmma: bool,
-    wgmma_params_dict: dict = {},
     err_wgmma: float = -1.,
+    wgmma_params_dict: dict = {},
 ):
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
     print(
@@ -240,25 +240,12 @@ def bench_one(
     (wgmma_err, wgmma_params) = _tune_and_test_correctness(ref, tf32_wgmma_tuned, A, B, C, "tf32_wgmma", relu_bat_c_tf32_wgmma)
 
     use_wgmma = tf32_wgmma_tuned is not None
-    _print_correctness(M, N, D, dtype, fp32_err, sync_err, fp32_params, sync_params, use_wgmma, wgmma_params, wgmma_err)
+    _print_correctness(M, N, D, dtype, fp32_err, sync_err, fp32_params, sync_params, use_wgmma, wgmma_err, wgmma_params)
 
-    # Set up benchmarkable functions, wrapping the native operation with the
-    # chosen parameters.
-    # See if this can be replaced by the calls of the tuner class itself.
-    def torch_run():
-        return relu_bat_c_fallback(A, B, C)
-
-    def fp32_cuda_run():
-        return fp32_tuned((A, B, C))
-        # if fp32_tuned.decision_config is None:
-        #     return relu_bat_c_fallback(A, B, C)
-        # return relu_bat_c_fused_op(A, B, C, **fp32_params)
-
-    def tf32_mma_sync_run():
-        return tf32_mma_sync_tuned((A, B, C))
-        # if tf32_mma_sync_tuned.decision_config is None:
-        #     return relu_bat_c_fallback(A, B, C)
-        # return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params)
+    # Set up benchmarkable functions
+    def torch_run(): return relu_bat_c_fallback(A, B, C)
+    def fp32_cuda_run(): return fp32_tuned((A, B, C))
+    def tf32_mma_sync_run(): return tf32_mma_sync_tuned((A, B, C))
 
     def wgmma_run():
         if tf32_wgmma_tuned is None:
@@ -299,7 +286,6 @@ def bench_one(
         "speedup_tf32_mma_sync": t_torch / t_tf32_mma_sync,
         "speedup_wgmma": None if t_wgmma is None else t_torch / t_wgmma,
     }
-
 
 
 if __name__ == "__main__":
