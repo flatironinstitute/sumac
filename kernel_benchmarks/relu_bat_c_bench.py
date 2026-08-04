@@ -1,21 +1,25 @@
-import torch
-import triton
 import argparse
-
 from dataclasses import asdict
+import torch
+from torch import Tensor
+import triton
+from typing import Callable
+
 
 from sumac.kernels.tuning import (
     grid_size,
     make_choices,
     kernel_autotune_options,
     relu_bat_c_fallback,
+    AutotuneCudaKernel,
     AutotuneReluBatCFP32,
     AutotuneReluBatCTf32Sync,
     AutotuneReluBatCTf32Wgmma,
     relu_bat_c_fp32_tune_config,
     relu_bat_c_tf32_sync_tune_config,
     relu_bat_c_tf32_wgmma_tune_config,
-    relu_bat_c_tf32_wgmma_available
+    relu_bat_c_tf32_wgmma_available,
+    T_TuneConfig
 )
 
 from sumac.config import AutotuneMode
@@ -59,7 +63,7 @@ def ms_to_tflops(M, N, D, ms):
 #         return min(peak_TFLOP,(BW_GBs * FLOP_per_Byte)/1e3) #/1e3 to get to TFLOP/s
 
 
-def print_perf_summary(result: dict) -> None:
+def _print_perf_summary(result: dict) -> None:
     rows = [
         (
             "torch",
@@ -97,24 +101,52 @@ def print_perf_summary(result: dict) -> None:
     print()
 
 
-@torch.no_grad()
-def bench_one(
+def _print_correctness(
     M: int,
     N: int,
     D: int,
-    dtype=torch.float32,
-    device="cuda",
-    warmup_ms=0,
-    rep_ms=1,
-    tune_trials=200,
-    tune_warmup_ms=1,
-    tune_rep_ms=5,
+    dtype: torch.dtype,
+    err_fp32_cuda: float,
+    err_tf32_mma_sync: float,
+    fp32_params_dict: dict,
+    sync_params_dict: dict,
+    use_wgmma: bool,
+    wgmma_params_dict: dict = {},
+    err_wgmma: float = -1.,
 ):
-    A = torch.randn((N, D), device=device, dtype=dtype)
-    B = torch.randn((M, D), device=device, dtype=dtype)
-    C = torch.randn((N, D), device=device, dtype=dtype)
-    
-    ref = relu_bat_c_fallback(A, B, C)
+    print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
+    print(
+        "  cuda fused FP32 (1D)              "
+        f"max_abs_err vs torch: {err_fp32_cuda:.6e}"
+    )
+    print(f"  cuda fused FP32 (1D)              tuned params: {fp32_params_dict}")
+    print(
+        "  cuda fused TF32 MMA sync (1D)     "
+        f"max_abs_err vs torch: {err_tf32_mma_sync:.6e}"
+    )
+    print(
+        "  cuda fused TF32 MMA sync (1D)     "
+        f"tuned params: {sync_params_dict}"
+    )
+    if use_wgmma is not None:
+        print(
+            "  cuda fused TF32 WGMMA (1D)  "
+            f"max_abs_err vs torch: {err_wgmma:.6e}"
+        )
+        print(f"  cuda fused TF32 WGMMA (1D)  tuned params: {wgmma_params_dict}")
+    else:
+        print("  cuda fused TF32 WGMMA (1D)  skipped: requires SM90/Hopper")
+
+
+def _init_functions(
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    D: int,
+    tune_trials: int,
+    tune_warmup_ms: int,
+    tune_rep_ms: int
+):
     n_trials_fp32 = max(tune_trials, grid_size(make_choices(relu_bat_c_fp32_tune_config)))
     relu_bat_c_fp32_tuned = AutotuneReluBatCFP32(
         configs = relu_bat_c_fp32_tune_config,
@@ -141,121 +173,118 @@ def bench_one(
             warmup = tune_warmup_ms,
             rep = tune_rep_ms
         )
+    return (relu_bat_c_fp32_tuned, relu_bat_c_tf32_mma_sync_tuned, relu_bat_c_wgmma_tuned)
 
-    relu_bat_c_fp32_tuned.resolve_decision((A, B, C))
-    fp32_cuda_params = relu_bat_c_fp32_tuned.decision_config
-    fp32_params_dict = {} if fp32_cuda_params is None else asdict(fp32_cuda_params)
-    if fp32_cuda_params is not None:
-        out_fp32_cuda = relu_bat_c_fused_op(A, B, C, BM=fp32_cuda_params.BM, BK=fp32_cuda_params.BK, MS=fp32_cuda_params.num_ms)
+
+def _tune_and_test_correctness(
+    ref: Tensor,
+    fn_tuner: AutotuneCudaKernel | None,
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    label: str,
+    base_fn: Callable,
+    is_fp32: bool = False
+):
+    if fn_tuner is None:
+        return (0, {})
+    fn_tuner.resolve_decision((A, B, C))
+    _chosen_params = fn_tuner.decision_config
+    _params_dict = {} if _chosen_params is None else asdict(_chosen_params)
+    if is_fp32 and _chosen_params is not None:
+        _params_dict['MS'] = _chosen_params.num_ms
+        _params_dict.pop('num_ms', None)
+    if _chosen_params is not None:
+        out_fp32_cuda = base_fn(A, B, C, **_params_dict)
     else:
-        print(f"\tWARNING: fp32 resolved to fallback.")
+        print(f"\tWARNING: {label} resolved to fallback.")
         out_fp32_cuda = 0
-    err_fp32_cuda = (out_fp32_cuda - ref).abs().max().item()
-
-    relu_bat_c_tf32_mma_sync_tuned.resolve_decision((A, B, C))
-    sync_params = relu_bat_c_tf32_mma_sync_tuned.decision_config
-    assert sync_params is not None
-    # sync_params_dict = {f.name: getattr(sync_params, f.name)[0] for f in fields(sync_params)}
-    sync_params_dict = asdict(sync_params)
-    out_tf32_mma_sync = relu_bat_c_tf32_mma_sync(A, B, C, **sync_params_dict)
-    err_tf32_mma_sync = (out_tf32_mma_sync - ref).abs().max().item()
-
-    wgmma_params = None
-    wgmma_params_dict = {}
-    err_wgmma = None
-    if relu_bat_c_wgmma_tuned is not None:
-        relu_bat_c_wgmma_tuned.resolve_decision((A, B, C))
-        wgmma_params = relu_bat_c_wgmma_tuned.decision_config
-        assert wgmma_params is not None
-        # wgmma_params_dict = {
-        #     f.name: getattr(wgmma_params, f.name)[0] for f in fields(wgmma_params)
-        # }
-        wgmma_params_dict = asdict(wgmma_params)
-        out_wgmma = relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params_dict)
-        err_wgmma = (out_wgmma - ref).abs().max().item()
+    _err = (out_fp32_cuda - ref).abs().max().item()
+    return (_err, _params_dict)
 
 
-    print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
-    print(
-        "  cuda fused FP32 (1D)              "
-        f"max_abs_err vs torch: {err_fp32_cuda:.6e}"
-    )
-    print(f"  cuda fused FP32 (1D)              tuned params: {fp32_cuda_params}")
-    print(
-        "  cuda fused TF32 MMA sync (1D)     "
-        f"max_abs_err vs torch: {err_tf32_mma_sync:.6e}"
-    )
-    print(
-        "  cuda fused TF32 MMA sync (1D)     "
-        f"tuned params: {sync_params_dict}"
-    )
-    if wgmma_params is not None:
-        print(
-            "  cuda fused TF32 WGMMA (1D)  "
-            f"max_abs_err vs torch: {err_wgmma:.6e}"
+def _bench_fn(fn: Callable, warmup_ms: int, rep_ms: int):
+    time_ms = float( 
+        triton.testing.do_bench( #type: ignore
+            fn,
+            warmup=warmup_ms,
+            rep=rep_ms,
         )
-        print(f"  cuda fused TF32 WGMMA (1D)  tuned params: {wgmma_params_dict}")
-    else:
-        print("  cuda fused TF32 WGMMA (1D)  skipped: requires SM90/Hopper")
+    )
+    return time_ms
 
+
+@torch.no_grad()
+def bench_one(
+    M: int,
+    N: int,
+    D: int,
+    dtype=torch.float32,
+    device="cuda",
+    warmup_ms=0,
+    rep_ms=1,
+    tune_trials=200,
+    tune_warmup_ms=1,
+    tune_rep_ms=5,
+):
+    A = torch.randn((N, D), device=device, dtype=dtype)
+    B = torch.randn((M, D), device=device, dtype=dtype)
+    C = torch.randn((N, D), device=device, dtype=dtype)
+
+    ref = relu_bat_c_fallback(A, B, C)
+    (fp32_tuned, tf32_mma_sync_tuned, tf32_wgmma_tuned) = \
+        _init_functions(A, B, C, D, tune_trials, tune_warmup_ms, tune_rep_ms)
+
+    (fp32_err, fp32_params) = _tune_and_test_correctness(ref, fp32_tuned, A, B, C, "fp32", relu_bat_c_fused_op, True)
+    (sync_err, sync_params) = _tune_and_test_correctness(ref, tf32_mma_sync_tuned, A, B, C, "tf32_mma_sync", relu_bat_c_tf32_mma_sync)
+    (wgmma_err, wgmma_params) = _tune_and_test_correctness(ref, tf32_wgmma_tuned, A, B, C, "tf32_wgmma", relu_bat_c_tf32_wgmma)
+
+    use_wgmma = tf32_wgmma_tuned is not None
+    _print_correctness(M, N, D, dtype, fp32_err, sync_err, fp32_params, sync_params, use_wgmma, wgmma_params, wgmma_err)
+
+    # Set up benchmarkable functions, wrapping the native operation with the
+    # chosen parameters.
+    # See if this can be replaced by the calls of the tuner class itself.
     def torch_run():
         return relu_bat_c_fallback(A, B, C)
 
     def fp32_cuda_run():
-        if fp32_cuda_params is not None:
-            return relu_bat_c_fused_op(A, B, C, BM=fp32_cuda_params.BM, BK=fp32_cuda_params.BK, MS=fp32_cuda_params.num_ms)
-        return relu_bat_c_fallback(A, B, C)
+        if fp32_tuned.decision_config is None:
+            return relu_bat_c_fallback(A, B, C)
+        return relu_bat_c_fused_op(A, B, C, **fp32_params)
 
     def tf32_mma_sync_run():
-        return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params_dict)
+        if tf32_mma_sync_tuned.decision_config is None:
+            return relu_bat_c_fallback(A, B, C)
+        return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params)
 
     def wgmma_run():
-        return relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params_dict)
+        if tf32_wgmma_tuned is None or tf32_wgmma_tuned.decision_config is None:
+            return relu_bat_c_fallback(A, B, C)
+        return relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params)
 
     torch.cuda.synchronize()
 
-    t_torch   = float(
-        triton.testing.do_bench(torch_run, warmup=warmup_ms, rep=rep_ms)  #type: ignore
-    )
-    t_fp32_cuda = float( 
-        triton.testing.do_bench( #type: ignore
-            fp32_cuda_run,
-            warmup=warmup_ms,
-            rep=rep_ms,
-        )
-    )
-    t_tf32_mma_sync = float (
-        triton.testing.do_bench(  #type: ignore
-            tf32_mma_sync_run,
-            warmup=warmup_ms,
-            rep=rep_ms,
-        )
-    )
-    t_wgmma = None
-    if wgmma_params is not None:
-        t_wgmma = float(
-            triton.testing.do_bench(   #type: ignore
-                wgmma_run,
-                warmup=warmup_ms,
-                rep=rep_ms,
-            )
-        )
+    t_torch = _bench_fn(torch_run, warmup_ms, rep_ms)
+    t_fp32_cuda = _bench_fn(fp32_cuda_run, warmup_ms, rep_ms)
+    t_tf32_mma_sync = _bench_fn(tf32_mma_sync_run, warmup_ms, rep_ms)
+    t_wgmma = None if not use_wgmma else _bench_fn(wgmma_run, warmup_ms, rep_ms)
 
     return {
         "M": M, "N": N, "D": D, "dtype": str(dtype).replace("torch.", ""),
 
         "torch_ms":   t_torch,
         "fp32_cuda_ms": t_fp32_cuda,
-        "fp32_cuda_params": fp32_params_dict,
-        "fp32_cuda_tune_ms": relu_bat_c_fp32_tuned.decision_runtime_ms,
+        "fp32_cuda_params": fp32_params,
+        "fp32_cuda_tune_ms": fp32_tuned.decision_runtime_ms,
         "tf32_mma_sync_ms": t_tf32_mma_sync,
-        "tf32_mma_sync_params": sync_params_dict,
-        "tf32_mma_sync_tune_ms": relu_bat_c_tf32_mma_sync_tuned.decision_runtime_ms,
-        "wgmma_ms": None if t_wgmma is None else t_wgmma,
-        "wgmma_params": None if wgmma_params is None else wgmma_params_dict,
+        "tf32_mma_sync_params": sync_params,
+        "tf32_mma_sync_tune_ms": tf32_mma_sync_tuned.decision_runtime_ms,
+        "wgmma_ms": t_wgmma,
+        "wgmma_params": None if not use_wgmma else wgmma_params,
         "wgmma_tune_ms": (
-            None if relu_bat_c_wgmma_tuned is None
-            else relu_bat_c_wgmma_tuned.decision_runtime_ms
+            None if tf32_wgmma_tuned is None
+            else tf32_wgmma_tuned.decision_runtime_ms
         ),
         "torch_TFLOPs":   ms_to_tflops(M, N, D, t_torch),
         "fp32_cuda_TFLOPs": ms_to_tflops(M, N, D, t_fp32_cuda),
@@ -320,4 +349,4 @@ if __name__ == "__main__":
                 warmup_ms=args.warmup_ms,
                 rep_ms=args.rep_ms,
             )
-            print_perf_summary(r)
+            _print_perf_summary(r)
