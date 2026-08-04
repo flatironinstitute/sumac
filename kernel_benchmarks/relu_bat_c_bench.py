@@ -249,19 +249,21 @@ def bench_one(
         return relu_bat_c_fallback(A, B, C)
 
     def fp32_cuda_run():
-        if fp32_tuned.decision_config is None:
-            return relu_bat_c_fallback(A, B, C)
-        return relu_bat_c_fused_op(A, B, C, **fp32_params)
+        return fp32_tuned((A, B, C))
+        # if fp32_tuned.decision_config is None:
+        #     return relu_bat_c_fallback(A, B, C)
+        # return relu_bat_c_fused_op(A, B, C, **fp32_params)
 
     def tf32_mma_sync_run():
-        if tf32_mma_sync_tuned.decision_config is None:
-            return relu_bat_c_fallback(A, B, C)
-        return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params)
+        return tf32_mma_sync_tuned((A, B, C))
+        # if tf32_mma_sync_tuned.decision_config is None:
+        #     return relu_bat_c_fallback(A, B, C)
+        # return relu_bat_c_tf32_mma_sync(A, B, C, **sync_params)
 
     def wgmma_run():
-        if tf32_wgmma_tuned is None or tf32_wgmma_tuned.decision_config is None:
+        if tf32_wgmma_tuned is None:
             return relu_bat_c_fallback(A, B, C)
-        return relu_bat_c_tf32_wgmma(A, B, C, **wgmma_params)
+        return tf32_wgmma_tuned((A, B, C))
 
     torch.cuda.synchronize()
 
