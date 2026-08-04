@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import asdict
 import torch
+from torch import Tensor
 import triton
 
 from sumac.kernels.tuning import (
@@ -9,7 +10,7 @@ from sumac.kernels.tuning import (
     # autotune_cuda_kernel,
     kernel_autotune_options,
     # relu_bat_reduce_key,
-    relu_bat_reduce_fallback,
+    # relu_bat_reduce_fallback,
     AutotuneReluBatReduce,
     relu_bat_reduce_tune_config
 )
@@ -76,6 +77,12 @@ def print_perf_summary(result: dict) -> None:
     print()
 
 
+@torch.compile
+def relu_bat_reduce_fallback(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
+    S = torch.relu(B @ A.T)
+    return S.sum(), (S * S).sum()
+    
+
 # @lru_cache(maxsize=None)
 # def relu_bat_reduce_fp32_launcher(
 #     n_trials: int,
@@ -134,19 +141,15 @@ def bench_one(
 
     fp32_tuned.resolve_decision((A, B))
     _chosen_params = fp32_tuned.decision_config
-    fp32_params = asdict(_chosen_params) if _chosen_params is not None else {}
 
-    ## ??
-    # _require_valid_params(
-    #     "cuda fused FP32",
-    #     relu_bat_reduce_constraints,
-    #     (A, B),
-    #     fp32_params,
-    # )
     if _chosen_params is None:
         out_fp32 = (torch.tensor([0.]), torch.tensor([0.]))
+        fp32_params = {}
     else:
-        out_fp32 = relu_bat_reduce_fused(B, A, **asdict(_chosen_params))
+        fp32_params = asdict(_chosen_params)
+        fp32_params['MS'] = _chosen_params.num_ms
+        fp32_params.pop('num_ms', None)
+        out_fp32 = relu_bat_reduce_fused(B, A, **fp32_params)
     err_fp32 = _abs_errs(out_fp32, ref)
 
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
@@ -156,17 +159,9 @@ def bench_one(
     )
     print(f"  cuda fused FP32                 tuned params: {fp32_params}")
 
-    def torch_run():
-        return relu_bat_reduce_fallback(A, B)
+    def torch_run(): return relu_bat_reduce_fallback(A, B)
 
-    def fp32_run():
-        return relu_bat_reduce_fused(
-            B,
-            A,
-            fp32_params["BM"],
-            fp32_params["BK"],
-            fp32_params["num_ms"],
-        )
+    def fp32_run(): return fp32_tuned((B, A))
 
     torch.cuda.synchronize()
 
