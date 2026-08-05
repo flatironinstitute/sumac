@@ -125,17 +125,8 @@ def test_factorize_does_not_modify_input_tensors(monkeypatch, method):
         zero = loss.detach().new_zeros(())
         return loss, zero, zero, loss
 
-    class ReferenceReluBatC:
-        def resolve_params(self, *args, **kwargs):
-            return {}
-
-        def __call__(self, A, B, C):
-            return torch.relu(B @ A.T) @ C
-
     monkeypatch.setattr(gd, "block_loss_and_pred", fake_block_loss)
     monkeypatch.setattr(gd, "eval", lambda *args, **kwargs: (0.0, 0.0, 0.0))
-    monkeypatch.setattr(salsa, "configure_kernel_prec", lambda **kwargs: None)
-    monkeypatch.setattr(salsa, "relu_bat_c_tuned", ReferenceReluBatC())
     monkeypatch.setattr(salsa, "eval", lambda *args, **kwargs: (0.0, 0.0, 0.0))
 
     S_index = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64)
