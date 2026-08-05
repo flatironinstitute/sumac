@@ -130,7 +130,6 @@ def batch_update_single_gpu(
     lrate: float | Tensor,
     m_fixed: int,
 ):
-    
     dev = B.device
 
     m_batch = row_indices.shape[0]
