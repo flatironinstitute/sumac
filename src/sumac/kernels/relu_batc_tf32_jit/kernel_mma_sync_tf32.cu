@@ -14,63 +14,34 @@
 
 // SM80+ mma.sync variant of Y=ReLU(B A.T)C kernel.
 //
-//mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 performs D = A @ B + D, where A and B are TF32 and D is FP32.
+// mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 performs D = A @ B + D, where A and B are TF32 and D is FP32.
 //
-// A and C are prepacked into the MMA B-operand layout used by
-// mma.sync.m16n8k8. The ldmatrix layout groups two fragments into four
-// planes:
+// A and C are prepacked and converted to tf32 in the MMA B-operand layout used by
+// mma.sync.m16n8k8 with a short packing kernel to avoid having to convert them repeatedly 
+// in each threadblock of the compute kernel.
 //
-//   fragment 0 word 0, fragment 0 word 1,
-//   fragment 1 word 0, fragment 1 word 1.
-//
-// Each plane is an 8x8 matrix of b16 pieces, or equivalently 32 intact
-// 32-bit words. ldmatrix.x4 therefore returns two complete MMA B operands.
-//
-// B is staged before the tile pipeline starts. Each warp copies one 16x8
-// tile into the same four-plane representation, then ldmatrix.x4 returns
-// the complete row-major MMA A operand.
+// B is loaded from global memory into registers at the start of the compute kernel.
+// To coalesce the loads from global memory, but also provide the register layout required by mma.sync,
+// we stage it through shared memory in a swizzled pattern, then use ldmatrix to load into registers without bank conflicts.
 
 static constexpr int MMA_M = 16;
 static constexpr int MMA_N = 8;
 static constexpr int MMA_K = 8;
 
-static constexpr int WARP_NTHREADS = 32;
 static constexpr int WARP_M_ROWS = M_TILES * MMA_M;
-static constexpr int WARPS_PER_BLOCK = BM / WARP_M_ROWS;
 static constexpr int THREADS_PER_BLOCK =
-    WARPS_PER_BLOCK * WARP_NTHREADS;
+    (BM / WARP_M_ROWS) * 32;
 
 static constexpr int K_TILES = D_f / MMA_K;
 static constexpr int N_TILES = BN / MMA_N;
-static constexpr int MMA_B_OPERAND_WORDS_PER_LANE = 2;
 static constexpr int MMA_B_OPERAND_FRAGMENT_ELEMS =
-    WARP_NTHREADS * MMA_B_OPERAND_WORDS_PER_LANE;
-static constexpr int LDMATRIX_MATRIX_WORDS = WARP_NTHREADS;
-static constexpr int LDMATRIX_MATRICES_PER_X4 = 4;
-static constexpr int LDMATRIX_X4_GROUP_WORDS =
-    LDMATRIX_MATRICES_PER_X4 * LDMATRIX_MATRIX_WORDS;
-static constexpr int B_STAGE_MATRICES = 4;
-static constexpr int B_STAGE_WORDS_PER_WARP =
-    B_STAGE_MATRICES * LDMATRIX_MATRIX_WORDS;
-static constexpr int B_STAGE_BYTES_PER_WARP =
-    B_STAGE_WORDS_PER_WARP * sizeof(cuda::std::uint32_t);
-static constexpr int PACKED_TILE_ELEMS =
-    N_TILES * K_TILES * MMA_B_OPERAND_FRAGMENT_ELEMS;
-static constexpr int PACKED_TILE_PAIRS =
-    PACKED_TILE_ELEMS / MMA_B_OPERAND_WORDS_PER_LANE;
-static constexpr int PACKED_BUFFER_ELEMS =
-    MMA_SYNC_TF32_STAGES * PACKED_TILE_ELEMS;
-static constexpr int PACKED_BUFFER_BYTES =
-    PACKED_BUFFER_ELEMS * sizeof(cuda::std::uint32_t);
+    MMA_N * MMA_K;
+static constexpr int LDMATRIX_MATRIX_WORDS = 32;
+
+static constexpr int PACKED_TILE_ELEMS = BN * D_f;
 
 static_assert(MMA_SYNC_TF32_STAGES >= 1 && MMA_SYNC_TF32_STAGES <= 3,
               "cp.async staging supports 1..3 stages");
-static_assert(MMA_B_OPERAND_FRAGMENT_ELEMS == 64,
-              "ldmatrix packing assumes 64 words per MMA B fragment");
-static_assert(LDMATRIX_X4_GROUP_WORDS ==
-                  2 * MMA_B_OPERAND_FRAGMENT_ELEMS,
-              "ldmatrix.x4 must hold exactly two MMA B fragments");
-static_assert(B_STAGE_BYTES_PER_WARP == 512, "one warp stages one 16x8 FP32 B tile");
 
 using uint32_t = cuda::std::uint32_t;
 
@@ -197,21 +168,12 @@ __device__ __forceinline__ uint32_t f32_to_tf32_bits(float x)
 {
     uint32_t y;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("cvt.rn.tf32.f32 %0, %1;\n" : "=r"(y) : "f"(x)); //we can get rid of one extra int add on SM90+ by using rn rounding instead of rna
+    asm volatile("cvt.rn.tf32.f32 %0, %1;\n" : "=r"(y) : "f"(x)); 
 #else
     asm volatile("cvt.rna.tf32.f32 %0, %1;\n" : "=r"(y) : "f"(x));
 #endif
     return y;
 }
-
-__device__ __forceinline__ uint32_t f32_to_tf32_relu_bits(float x)
-{
-    uint32_t y;
-    asm volatile("cvt.rn.relu.tf32.f32 %0, %1;\n" : "=r"(y) : "f"(x));
-    return y;
-} //using this instead of f32_to_tf32_bits(fmaxf) SHOULD result in fewer instructions,
-  //but ptxas lowers this in a way that F2FP has identical src and dst register and
-  //each HMMA is then preceeded by 4 movs from those registers into the HMMA input ones.
 
 __device__ __forceinline__ void acc_frag_to_a_regs_relu_tf32(
     const float acc[4],
@@ -290,8 +252,7 @@ __device__ __forceinline__ int ldmatrix_group_word_offset(
     int minor_tile_even,
     int minor_tiles)
 {
-    return (major_tile * minor_tiles + minor_tile_even) *
-           MMA_B_OPERAND_FRAGMENT_ELEMS;
+    return (major_tile * minor_tiles + minor_tile_even) * MMA_N * MMA_K;
 }
 
 __device__ __forceinline__ void load_b_operand_pair_from_smem(
@@ -302,7 +263,7 @@ __device__ __forceinline__ void load_b_operand_pair_from_smem(
     int minor_tile_even,
     int minor_tiles)
 {
-    const int lane = threadIdx.x & (WARP_NTHREADS - 1);
+    const int lane = threadIdx.x & 31;
     const int group_offset = ldmatrix_group_word_offset(
         major_tile, minor_tile_even, minor_tiles);
 
@@ -319,7 +280,7 @@ __device__ __forceinline__ void load_b_operand_tail_from_smem(
     int minor_tile_even,
     int minor_tiles)
 {
-    const int lane = threadIdx.x & (WARP_NTHREADS - 1);
+    const int lane = threadIdx.x & 31;
     const int group_offset = ldmatrix_group_word_offset(
         major_tile, minor_tile_even, minor_tiles);
 
@@ -336,7 +297,24 @@ __device__ __forceinline__ int b_stage_slot_sw128(int row, int half)
     return 8 * band + (chunk ^ (band & 7));
 }
 
-__device__ __forceinline__ void load_a_operand_from_b_coalesced(
+// SW128 layout for one 16x8 FP32 tile:
+//
+// Split each 32B row into two 16B chunks and group four rows into
+// each 128B band:
+//
+//   band = row / 4
+//   logical_chunk = 2 * (row % 4) + half       // half = 0 or 1
+//   physical_chunk = logical_chunk ^ band
+//   slot = 8 * band + physical_chunk
+//
+// Logical-to-physical chunk order within successive bands:
+//
+//   band 0: 0 1 2 3 4 5 6 7
+//   band 1: 1 0 3 2 5 4 7 6
+//   band 2: 2 3 0 1 6 7 4 5
+//   band 3: 3 2 1 0 7 6 5 4
+
+__device__ __forceinline__ void load_B_swizzle_coalesced(
     uint32_t out[4],
     const float* __restrict__ B,
     uint32_t* __restrict__ warp_scratch,
@@ -345,32 +323,13 @@ __device__ __forceinline__ void load_a_operand_from_b_coalesced(
     int M,
     int D)
 {
-    const int lane = threadIdx.x & (WARP_NTHREADS - 1);
-    const int band = lane >> 3;
-    const int physical_chunk = lane & 7;
-    const int logical_chunk = physical_chunk ^ (band & 7);
-    const int row = 4 * band + (logical_chunk >> 1);
-    const int half = logical_chunk & 1;
+    const int lane = threadIdx.x & 31;
+    const int row = lane >> 1;
+    const int half = lane & 1;
     const int m = tile_m0 + row;
 
-    // Each adjacent lane pair copies a complete 32-byte B row, but
-    // lane ownership of the two half-rows is XOR-permuted within each
-    // 128-byte band. Since XOR is
-    // self-inverse, physical chunk p receives logical chunk p ^ band,
-    // which is the same SW128 layout produced by writing logical chunk c
-    // to physical chunk c ^ band.
-    //
-    // The ldmatrix row providers below expose that physical tile as four
-    // logical planes:
-    //
-    //   plane 0: rows  0..7, columns 0..3
-    //   plane 1: rows  8..15, columns 0..3
-    //   plane 2: rows  0..7, columns 4..7
-    //   plane 3: rows  8..15, columns 4..7
-    //
-    // ldmatrix.x4 then returns the four registers in the exact order
-    // expected by mma.sync's m16n8k8 row-major A operand.
-    uint32_t* dst = warp_scratch + 4 * lane;
+    uint32_t* dst =
+        warp_scratch + 4 * b_stage_slot_sw128(row, half);
 
     uint4 value = {0u, 0u, 0u, 0u};
     if (m < M) {
@@ -407,14 +366,11 @@ __device__ __forceinline__ void load_a_operand_from_b_coalesced(
     __syncwarp();
 
     uint32_t raw[4];
-    const int load_matrix = lane >> 3;
-    const int load_matrix_row = lane & 7;
-    const int load_half = load_matrix >> 1;
-    const int load_source_row =
-        (load_matrix & 1) * 8 + load_matrix_row;
+    const int source_row = lane & 15;
+    const int source_half = lane >> 4;
     const uint32_t* row_ptr =
         warp_scratch +
-        4 * b_stage_slot_sw128(load_source_row, load_half);
+        4 * b_stage_slot_sw128(source_row, source_half);
     ldmatrix_u32x4(&raw[0], &raw[2], row_ptr);
 
     #pragma unroll
@@ -452,7 +408,7 @@ __device__ __forceinline__ void pack_tile_pair_tf32(
     int D,
     int packed_pair_idx)
 {
-    const int lane = packed_pair_idx & (WARP_NTHREADS - 1);
+    const int lane = packed_pair_idx & 31;
     const int tile = packed_pair_idx >> 5;
     const int inner_tile = tile % K_TILES;
     const int n_tile = tile / K_TILES;
@@ -577,8 +533,8 @@ __device__ __forceinline__ void compute_tile_phase2(
         uint32_t S_mma_fragment[M_TILES][4];
         #pragma unroll
         for (int m_tile = 0; m_tile < M_TILES; ++m_tile) {
-            acc_frag_to_a_regs_relu_tf32( //MMA accumulator fragments have a different register layout
-                s[m_tile][n_tile],        //than MMA A-operand fragments, this helper converts them, applies relu and converts to TF32.
+            acc_frag_to_a_regs_relu_tf32( //MMA accumulator fragments and MMA A-operands have a different register layout.
+                s[m_tile][n_tile],        //Combined with the packing kernel's column permutation, this helper converts between them, applies relu and converts to TF32.
                 S_mma_fragment[m_tile]);
         }
 
@@ -649,7 +605,7 @@ void MMA_SYNC_TF32_PACK_KERNEL_NAME(
 
     const int n0 = tile * BN;
     for (int packed_pair_idx = packed_pair_global_idx;
-         packed_pair_idx < PACKED_TILE_PAIRS;
+         packed_pair_idx < PACKED_TILE_ELEMS / 2;
          packed_pair_idx += packed_pair_stride) {
         pack_tile_pair_tf32(
             A,
@@ -685,16 +641,17 @@ void MMA_SYNC_TF32_KERNEL_NAME(
     extern __shared__ unsigned char dynamic_smem[];
     unsigned char* packed_smem = align_smem_128(dynamic_smem);
     uint32_t* Apacked_smem = reinterpret_cast<uint32_t*>(packed_smem);
-    uint32_t* Cpacked_smem = reinterpret_cast<uint32_t*>(packed_smem + PACKED_BUFFER_BYTES);
+    uint32_t* Cpacked_smem =
+        Apacked_smem + MMA_SYNC_TF32_STAGES * PACKED_TILE_ELEMS;
 
     uint32_t b_regs[M_TILES][K_TILES][4];
-    uint32_t* warp_b_scratch = Apacked_smem + warp * B_STAGE_WORDS_PER_WARP;
+    uint32_t* warp_b_scratch = Apacked_smem + warp * MMA_M * MMA_K;
 
     #pragma unroll
     for (int m_tile = 0; m_tile < M_TILES; ++m_tile) {
         #pragma unroll
         for (int k_tile = 0; k_tile < K_TILES; ++k_tile) {
-            load_a_operand_from_b_coalesced(
+            load_B_swizzle_coalesced(
                 b_regs[m_tile][k_tile],
                 B,
                 warp_b_scratch,
@@ -747,10 +704,12 @@ void MMA_SYNC_TF32_KERNEL_NAME(
         __syncthreads();
 
         float s[M_TILES][N_TILES][4] = {0.f};
+
         compute_tile_phase1(
             packed_tile(Apacked_smem, stage),
             b_regs,
             s);
+
         compute_tile_phase2(
             packed_tile(Cpacked_smem, stage),
             s,
@@ -759,6 +718,7 @@ void MMA_SYNC_TF32_KERNEL_NAME(
         __syncthreads();
 
         const int next_tile = tile + MMA_SYNC_TF32_STAGES;
+
         if (next_tile < num_tiles) {
             issue_tile_copy(
                 stage,
