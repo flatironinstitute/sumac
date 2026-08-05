@@ -81,15 +81,6 @@ def _print_trial_pruned(
     print(message)
 
 
-
-# for f in [x.name for x in fields(DATACLASS_INSTANCE)]:
-#    setattr(NEW_INSTANCE, f, getattr(NEW_INSTANCE, f)[:1])
-# ASDICT = asdict(DATACLASS_INSTANCE)
-# new_instance = replace(DATACLASS_INSTANCE, **ASDICT)
-# or trimdict = {f.name: getattr(INSTANCE, f.name)[:1] for f in fields(INSTANCE)}
-# then can do new_instance = replace(INSTANCE, **trimdict)
-
-
 @dataclass(frozen=True)
 class ExperimentKey():
     major_version: int
@@ -156,7 +147,6 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         self.decision_config = None
 
 
-    # def _get_key(self, A: Tensor, B: Tensor) -> ExperimentKey:
     def _get_key(self, params: T_Params) -> ExperimentKey:
         (A, B) = params[:2]
         props = torch.cuda.get_device_properties(A.device)
@@ -205,7 +195,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             self._set_interface_fn()
             return
         if self.options.mode == AutotuneMode.DISABLE:
-            # If disable, we use the first entry in each config field as the default
+            # If disable, we use the first config entry as the default
             self._set_interface_fn(decision = self.configs[0])
             return
 
@@ -258,6 +248,8 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         previous_optuna_verbosity = optuna.logging.get_verbosity()
         if not self.options.verbose:
             optuna.logging.set_verbosity(optuna.logging.WARNING)
+        # TODO QUESTION: Do we potentially need to increase the verbosity
+        # if self.options.verbose is True? Prior verbosity might've been too low
         try:
             study = optuna.create_study(
                 study_name=study_name,
@@ -299,16 +291,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         def _print_partial(msg: str, e: Exception | None = None):
             _print_trial_pruned(trial.number, msg, selected_config_dict, e, self.options.verbose)
 
-        # Check constraints (should be a function but it's too annoying to type)
-        try:
-            constraint_ok = self._constraint(params, selected_config)
-        except Exception as e:
-            _print_partial("constraint_fn error", e)
-            raise optuna.TrialPruned() from e
-
-        if not constraint_ok:
-            _print_partial("Constraint rejected config")
-            raise optuna.TrialPruned()
+        self._check_constraints(params, selected_config, optuna, _print_partial)
 
         def run(): return self._candidate_fn(params, selected_config)
 
@@ -323,6 +306,18 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         except Exception as e:
             _print_partial(failure_reason, e)
         return runtime_ms
+
+
+    def _check_constraints(self, params: T_Params, cfg: T_Config, optuna: Any, _print: Callable):
+        try:
+            constraint_ok = self._constraint(params, cfg)
+        except Exception as e:
+            _print("constraint_fn error", e)
+            raise optuna.TrialPruned() from e
+
+        if not constraint_ok:
+            _print("Constraint rejected config")
+            raise optuna.TrialPruned()
 
 
     def _bench_fallback(self, params: T_Params) -> float:
@@ -344,8 +339,48 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
 
 
     def _set_interface_fn(self, decision: TuneResult | T_Config | None = None):
-        # NOTE: we assume that all fields in config should now be single-element lists.
-        # Implementing functions should expect to take CONFIG_PROPERTY[0] in any case.
+        """Sets the __call__ interface for this instance based on the results of autotuning,
+        and records the latest decision results in the self.decision_* variables.
+
+        This is a little dense, so here's a summary of the intended situation.
+
+        The purpose of this function is to set self.__call__ so that it always
+        takes a tuple of the parameters expected by whatever kind of kernel we are
+        (i.e. A, B, C for relu_bat_c and A, B for bat_reduce). self._fallback should
+        always just take those parameters. Whatever our candidate function is
+        (self._candidate_fn) will take those parameters, plus some config parameters;
+        in that case, we'll actually set self.__call__ to a lambda that's closed over
+        the selected configuration.
+
+        Anyway, when this fn is done, __call__ refers to either:
+        1) the fallback function,
+        2) the wrapped kernel with default parameters, or
+        3) the wrapped kernel with tuned parameters.
+
+        We also need to set the observed runtime, and record what the selected config
+        parameters actually were.
+
+        In case 1 and 2, we didn't run a study, so self.decision_runtime_ms is INF.
+        In case 1, there is no config, so we set self.decision_config to None.
+        In case 2, we set self.decision_config to the default (first config in the list).
+
+        In case 3, we actually did autotuning experiments (possibly from cache hit).
+        Then, self.decision_runtime_ms is set to the study result, and self.decision_config
+        is the parameters of the best result, EXCEPT in the case where the fallback function
+        was actually faster--then we set the decision_config to None and __call__ to the
+        fallback.
+        
+        For convenience, this information is all packed into the decision parameter:
+          - If it's None, that means we do fallback
+          - If it's a T_Config, that must be a default config
+          - Otherwise it's a TuneResult, which we'll read for the run-time and config,
+          again unless the fallback function outperformed.
+
+        Args:
+            decision (TuneResult | T_Config | None, optional): None (the default) for fallback
+                mode, a default T_Config for default mode, or the result of empirical
+                tuning testing (TuneResult) if we actually ran a study.
+        """
         if isinstance(decision, TuneResult):
             self.decision_runtime_ms = decision.runtime_ms
             self.decision_config = replace(self.configs[0], **decision.params)

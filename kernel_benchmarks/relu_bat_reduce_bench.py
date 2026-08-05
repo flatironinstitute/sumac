@@ -7,10 +7,7 @@ import triton
 from sumac.kernels.tuning import (
     grid_size,
     make_choices,
-    # autotune_cuda_kernel,
     kernel_autotune_options,
-    # relu_bat_reduce_key,
-    # relu_bat_reduce_fallback,
     AutotuneReluBatReduce,
     relu_bat_reduce_tune_config
 )
@@ -38,20 +35,6 @@ def _abs_errs(
 
 def _format_abs_errs(errs: tuple[float, float]) -> str:
     return f"sum_abs_err: {errs[0]:.6e}, sum_sq_abs_err: {errs[1]:.6e}"
-
-
-# def _require_valid_params(
-#     name: str,
-#     constraint_fn,
-#     args: tuple,
-#     params: dict,
-# ) -> None:
-#     if constraint_fn(*args, **params):
-#         return
-#     raise RuntimeError(
-#         f"{name} resolved invalid autotune params {params}. "
-#         "Remove the corresponding autotune cache or rerun with autotune='force'."
-#     )
 
 
 def print_perf_summary(result: dict) -> None:
@@ -82,37 +65,6 @@ def relu_bat_reduce_fallback(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
     S = torch.relu(B @ A.T)
     return S.sum(), (S * S).sum()
     
-
-# @lru_cache(maxsize=None)
-# def relu_bat_reduce_fp32_launcher(
-#     n_trials: int,
-#     warmup_ms: int,
-#     rep_ms: int,
-# ):
-#     tune_config = relu_bat_reduce_tune_config()
-#     n_trials = max(n_trials, _grid_size(tune_config))
-
-#     @autotune_cuda_kernel(
-#         configs=tune_config,
-#         key_fn=relu_bat_reduce_key,
-#         constraint_fn=relu_bat_reduce_constraints,
-#         cache_path="relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
-#         n_trials=n_trials,
-#         warmup=warmup_ms,
-#         rep=rep_ms,
-#         sampler=optuna.samplers.GridSampler(search_space=tune_config),
-#     )
-#     def relu_bat_reduce_fp32_cuda(
-#         A: torch.Tensor,
-#         B: torch.Tensor,
-#         BM: int,
-#         BK: int,
-#         num_ms: int,
-#     ) -> tuple[torch.Tensor, torch.Tensor]:
-#         return relu_bat_reduce_fused(B, A, BM, BK, num_ms)
-
-#     return relu_bat_reduce_fp32_cuda
-
 
 @torch.no_grad()
 def bench_one(

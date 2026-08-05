@@ -21,7 +21,6 @@ def normalize_for_json(x: Any) -> Any:
     return str(x)
 
 
-# TODO UPDATE TYPES FOR GET/SET OPERATIONS
 class JsonConfigStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)

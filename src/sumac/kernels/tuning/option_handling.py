@@ -29,7 +29,6 @@ def kernel_autotune_options(
     cache_dir: str | Path | None = None,
     verbose: bool = False,
 ):
-    # normalized_mode = normalize_autotune_mode(mode)
     resolved_cache_dir = (
         default_kernel_autotune_cache_dir()
         if cache_dir is None

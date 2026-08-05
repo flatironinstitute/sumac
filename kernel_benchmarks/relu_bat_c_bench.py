@@ -37,31 +37,6 @@ def ms_to_tflops(M, N, D, ms):
         return flops / s / 1e12
 
 
-# def flop_per_byte_fused(M, N, D, wordsize):
-#     flops = M * N * (D + D - 1) + M * D * (N + N - 1)
-
-#     elems_read = M * D + N * D + N * D
-#     elems_written = M * D
-    
-#     return flops/((elems_read + elems_written) * wordsize) 
-
-
-# def flop_per_byte_2kernels(M, N, D, wordsize):
-#     flops = M * N * (D + D - 1) + M * D * (N + N - 1)
-    
-#     elems_read_kernel1 = M * D + N * D
-#     elems_written_kernel1 = M * N
-    
-#     elems_read_kernel2 = M * N + N * D
-#     elems_written_kernel2 = M * D
-
-#     return flops/((elems_read_kernel1 + elems_read_kernel2 + elems_written_kernel1 + elems_written_kernel2) * wordsize)
-
-
-# def perf_roofline(FLOP_per_Byte, BW_GBs, peak_TFLOP):
-#         return min(peak_TFLOP,(BW_GBs * FLOP_per_Byte)/1e3) #/1e3 to get to TFLOP/s
-
-
 def _print_perf_summary(result: dict) -> None:
     rows = [
         (
@@ -191,6 +166,13 @@ def _tune_and_test_correctness(
     _chosen_params = fn_tuner.decision_config
     _params_dict = {} if _chosen_params is None else asdict(_chosen_params)
     if is_fp32 and _chosen_params is not None:
+        # Note this is purely a convenience--the name of this parameter
+        # in the class differs from the parameter in the custom kernel
+        # fn, so we have to correct it if we want to get away with
+        # lazily unpacking the dictionary as keyword arguments.
+        # But otherwise we'd have to spell out the arguments for each
+        # of the underlying cases.
+        # possible TODO: sync up the parameter names between fns and config
         _params_dict['MS'] = _chosen_params.num_ms
         _params_dict.pop('num_ms', None)
     if _chosen_params is not None:
