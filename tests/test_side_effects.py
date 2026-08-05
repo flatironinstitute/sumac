@@ -50,7 +50,7 @@ def test_get_generator_does_not_modify_torch_rng_state(seed):
 
 
 def test_gd_block_shuffle_does_not_consume_global_torch_rng(monkeypatch):
-    def fake_block_loss(A, B, *args, **kwargs):
+    def fake_block_loss(kernel, A, B, *args, **kwargs):
         loss = (A.sum() + B.sum()).square()
         zero = loss.detach().new_zeros(())
         return loss, zero, zero, loss
@@ -120,7 +120,7 @@ def test_factorize_restores_matmul_precision(monkeypatch):
 
 @pytest.mark.parametrize("method", [SumacMethod.GD, SumacMethod.SALSA])
 def test_factorize_does_not_modify_input_tensors(monkeypatch, method):
-    def fake_block_loss(A, B, *args, **kwargs):
+    def fake_block_loss(kernel, A, B, *args, **kwargs):
         loss = (A.sum() + B.sum()).square()
         zero = loss.detach().new_zeros(())
         return loss, zero, zero, loss
