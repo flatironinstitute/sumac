@@ -91,7 +91,7 @@ def bench_one(
         rep = tune_rep_ms
     )
 
-    fp32_tuned.resolve_decision((A, B))
+    fp32_tuned.resolve_decision((B, A))
     _chosen_params = fp32_tuned.decision_config
 
     if _chosen_params is None:

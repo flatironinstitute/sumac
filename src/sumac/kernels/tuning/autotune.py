@@ -43,7 +43,7 @@ def _require_triton():
 def grid_size(config_dict: dict[str, list[int] | list[str]]) -> int:
     size = 1
     for values in config_dict.values():
-        size += len(values)
+        size *= len(values)
     return size
 
 
@@ -127,7 +127,10 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         sampler: Optional[optuna.samplers.BaseSampler] = None,
         autotune_options: KernelAutotuneOptions | None = None
     ):
-        optuna = require_optuna()
+        self.options = autotune_options or active_kernel_autotune_options()
+        if self.options.mode != AutotuneMode.FALLBACK and cuda_is_available():
+            optuna = require_optuna()
+            self.sampler = sampler or optuna.samplers.GridSampler(search_space = make_choices(configs))
         self.configs = configs
         self.cache_path = Path(cache_path)
         self.wrapped_fn_name = wrapped_fn_name
@@ -136,13 +139,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         self.n_trials = n_trials
         self.warmup = warmup
         self.rep = rep
-        # QUERY: In practice, we never had a use where the sampler wasn't set to a grid search
-        # over the parameters, so I'm just hard-coding that here.
-        # Caller can still use a TPESampler if desired.
-        # self.sampler = sampler or optuna.samplers.TPESampler(seed=0)
-        self.sampler = sampler or optuna.samplers.GridSampler(search_space = make_choices(configs))
         self.decision_memo_cache = {}
-        self.options = autotune_options or active_kernel_autotune_options()
         self.decision_disk_cache = self._get_disk_cache()
         self.decision_config = None
 
@@ -238,6 +235,8 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         params: T_Params,
         disk_key: str
     ) -> TuneResult:
+        if not cuda_is_available():
+            raise ValueError("Can't happen: this branch should only occur when CUDA is available.")
         optuna = require_optuna()
 
         fallback_runtime_ms = self._bench_fallback(params)
@@ -305,6 +304,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             trial.set_user_attr("runtime_ms", runtime_ms)
         except Exception as e:
             _print_partial(failure_reason, e)
+            raise optuna.TrialPruned()
         return runtime_ms
 
 
