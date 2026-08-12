@@ -64,7 +64,14 @@ def print_perf_summary(result: dict) -> None:
 def relu_bat_reduce_fallback(A: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
     S = torch.relu(B @ A.T)
     return S.sum(), (S * S).sum()
-    
+
+
+class _BenchmarkReluBatReduce(AutotuneReluBatReduce):
+    """Keep fallback out of CUDA candidate selection for this benchmark."""
+
+    def _bench_fallback(self, params) -> float:
+        return float("inf")
+
 
 @torch.no_grad()
 def bench_one(
@@ -83,25 +90,25 @@ def bench_one(
     B = torch.randn((M, D), device=device, dtype=dtype)
 
     ref = relu_bat_reduce_fallback(A, B)
-    fp32_tuned = AutotuneReluBatReduce(
+    fp32_tuned = _BenchmarkReluBatReduce(
         configs = relu_bat_reduce_tune_config,
         n_trials = max(tune_trials, grid_size(make_choices(relu_bat_reduce_tune_config))),
         cache_path = "relu_bat_reduce_bench_fp32_kahan_sum2_autotune.json",
         warmup = tune_warmup_ms,
-        rep = tune_rep_ms
+        rep = tune_rep_ms,
     )
 
     fp32_tuned.resolve_decision((B, A))
     _chosen_params = fp32_tuned.decision_config
 
     if _chosen_params is None:
-        out_fp32 = (torch.tensor([0.]), torch.tensor([0.]))
-        fp32_params = {}
-    else:
-        fp32_params = asdict(_chosen_params)
-        fp32_params['MS'] = _chosen_params.num_ms
-        fp32_params.pop('num_ms', None)
-        out_fp32 = relu_bat_reduce_fused(B, A, **fp32_params)
+        raise RuntimeError(
+            "cuda fused FP32 benchmark did not resolve to a CUDA configuration"
+        )
+    fp32_params = asdict(_chosen_params)
+    fp32_params['MS'] = _chosen_params.num_ms
+    fp32_params.pop('num_ms', None)
+    out_fp32 = relu_bat_reduce_fused(B, A, **fp32_params)
     err_fp32 = _abs_errs(out_fp32, ref)
 
     print(f"[correctness] M={M} N={N} D={D} dtype={dtype}")
@@ -157,7 +164,7 @@ if __name__ == "__main__":
         "--autotune",
         type=str,
         default="cache",
-        choices=['cache', 'force', 'disable', 'fallback'],
+        choices=['cache', 'force', 'disable'],
         help="CUDA kernel autotuning mode for the kernel benchmark",
     )
     parser.add_argument(

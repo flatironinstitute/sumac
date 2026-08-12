@@ -105,7 +105,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
     n_trials: int
     warmup: int
     rep: int
-    sampler: optuna.samplers.BaseSampler            # in practice always optuna.samplers.GridSampler(search_space=tune_config),
+    sampler: Optional[optuna.samplers.BaseSampler]
     wrapped_fn_name: str
     wrapped_fn_module: str
     decision_config: T_Config | None
@@ -125,13 +125,11 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         warmup: int = 1, #25, # the higher limis are never actually used
         rep: int = 5, #100,
         sampler: Optional[optuna.samplers.BaseSampler] = None,
-        autotune_options: KernelAutotuneOptions | None = None
+        autotune_options: KernelAutotuneOptions | None = None,
     ):
         self.options = autotune_options or active_kernel_autotune_options()
-        if self.options.mode != AutotuneMode.FALLBACK and cuda_is_available():
-            optuna = require_optuna()
-            self.sampler = sampler or optuna.samplers.GridSampler(search_space = make_choices(configs))
         self.configs = configs
+        self.sampler = sampler
         self.cache_path = Path(cache_path)
         self.wrapped_fn_name = wrapped_fn_name
         self.wrapped_fn_module = wrapped_fn_module
@@ -238,6 +236,10 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         if not cuda_is_available():
             raise ValueError("Can't happen: this branch should only occur when CUDA is available.")
         optuna = require_optuna()
+        if self.sampler is None:
+            self.sampler = optuna.samplers.GridSampler(
+                search_space=make_choices(self.configs)
+            )
 
         fallback_runtime_ms = self._bench_fallback(params)
 
@@ -304,7 +306,7 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             trial.set_user_attr("runtime_ms", runtime_ms)
         except Exception as e:
             _print_partial(failure_reason, e)
-            raise optuna.TrialPruned()
+            raise optuna.TrialPruned() from e
         return runtime_ms
 
 

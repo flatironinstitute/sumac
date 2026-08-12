@@ -30,6 +30,34 @@ from sumac.kernels.relu_batc_tf32_jit.api import (
 )
 
 
+class _CudaOnlyBenchmarkTuner:
+    """Keep fallback out of CUDA candidate selection for this benchmark."""
+
+    def _bench_fallback(self, params) -> float:
+        return float("inf")
+
+
+class _BenchmarkReluBatCFP32(
+    _CudaOnlyBenchmarkTuner,
+    AutotuneReluBatCFP32,
+):
+    pass
+
+
+class _BenchmarkReluBatCTf32Sync(
+    _CudaOnlyBenchmarkTuner,
+    AutotuneReluBatCTf32Sync,
+):
+    pass
+
+
+class _BenchmarkReluBatCTf32Wgmma(
+    _CudaOnlyBenchmarkTuner,
+    AutotuneReluBatCTf32Wgmma,
+):
+    pass
+
+
 def ms_to_tflops(M, N, D, ms):
         flops = M * N * (D + D - 1) + M * D * (N + N - 1)
     
@@ -102,7 +130,7 @@ def _print_correctness(
         "  cuda fused TF32 MMA sync (1D)     "
         f"tuned params: {sync_params_dict}"
     )
-    if use_wgmma is not None:
+    if use_wgmma:
         print(
             "  cuda fused TF32 WGMMA (1D)  "
             f"max_abs_err vs torch: {err_wgmma:.6e}"
@@ -122,30 +150,30 @@ def _init_functions(
     tune_rep_ms: int
 ):
     n_trials_fp32 = max(tune_trials, grid_size(make_choices(relu_bat_c_fp32_tune_config)))
-    relu_bat_c_fp32_tuned = AutotuneReluBatCFP32(
+    relu_bat_c_fp32_tuned = _BenchmarkReluBatCFP32(
         configs = relu_bat_c_fp32_tune_config,
         cache_path = "relu_bat_c_jit_autotune.json",
         n_trials = n_trials_fp32,
         warmup = tune_warmup_ms,
-        rep = tune_rep_ms
+        rep = tune_rep_ms,
     )
     sync_config = relu_bat_c_tf32_sync_tune_config(D)
-    relu_bat_c_tf32_mma_sync_tuned = AutotuneReluBatCTf32Sync(
+    relu_bat_c_tf32_mma_sync_tuned = _BenchmarkReluBatCTf32Sync(
         configs = sync_config,
         cache_path = "relu_bat_c_tf32_mma_autotune.json",
         n_trials = tune_trials,
         warmup = tune_warmup_ms,
-        rep = tune_rep_ms
+        rep = tune_rep_ms,
     )
     relu_bat_c_wgmma_tuned = None
     if relu_bat_c_tf32_wgmma_available(A):
         tune_config = relu_bat_c_tf32_wgmma_tune_config(D)
-        relu_bat_c_wgmma_tuned = AutotuneReluBatCTf32Wgmma(
+        relu_bat_c_wgmma_tuned = _BenchmarkReluBatCTf32Wgmma(
             configs = tune_config,
             cache_path = "relu_bat_c_tf32_wgmma_mode_autotune.json",
             n_trials = tune_trials,
             warmup = tune_warmup_ms,
-            rep = tune_rep_ms
+            rep = tune_rep_ms,
         )
     return (relu_bat_c_fp32_tuned, relu_bat_c_tf32_mma_sync_tuned, relu_bat_c_wgmma_tuned)
 
@@ -164,8 +192,12 @@ def _tune_and_test_correctness(
         return (0, {})
     fn_tuner.resolve_decision((A, B, C))
     _chosen_params = fn_tuner.decision_config
-    _params_dict = {} if _chosen_params is None else asdict(_chosen_params)
-    if is_fp32 and _chosen_params is not None:
+    if _chosen_params is None:
+        raise RuntimeError(
+            f"{label} benchmark did not resolve to a CUDA configuration"
+        )
+    _params_dict = asdict(_chosen_params)
+    if is_fp32:
         # Note this is purely a convenience--the name of this parameter
         # in the class differs from the parameter in the custom kernel
         # fn, so we have to correct it if we want to get away with
@@ -175,11 +207,7 @@ def _tune_and_test_correctness(
         # possible TODO: sync up the parameter names between fns and config
         _params_dict['MS'] = _chosen_params.num_ms
         _params_dict.pop('num_ms', None)
-    if _chosen_params is not None:
-        out_fp32_cuda = base_fn(A, B, C, **_params_dict)
-    else:
-        print(f"\tWARNING: {label} resolved to fallback.")
-        out_fp32_cuda = 0
+    out_fp32_cuda = base_fn(A, B, C, **_params_dict)
     _err = (out_fp32_cuda - ref).abs().max().item()
     return (_err, _params_dict)
 
@@ -280,7 +308,7 @@ if __name__ == "__main__":
         "--autotune",
         type=str,
         default="cache",
-        choices=['cache', 'force', 'disable', 'fallback'],
+        choices=['cache', 'force', 'disable'],
         help="CUDA kernel autotuning mode for the kernel benchmark",
     )
     parser.add_argument(
