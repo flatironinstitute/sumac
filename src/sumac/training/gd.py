@@ -3,42 +3,40 @@ import time
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from torch import Tensor
+from torch import Tensor, Generator, device
 
 from sumac.config import OptimizerName, SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import block_loss_and_pred, eval
 from sumac.kernels.cuda_utils import nvtx_range_pop, nvtx_range_push
+from sumac.kernels.tuning import AutotuneReluBatReduce
 
 
 # TODO:
 # - further review
-# - remove performance reporting instrumentation
+# - remove performance reporting instrumentation?
 
 def make_optimizer(
-    name: OptimizerName,
+    cfg: SumacConfig,
     params: list[torch.nn.Parameter],
-    lr: float,
     weight_decay: float = 0.0,
-    momentum: float = 0.0,
-    adam_betas: tuple[float, float] = (0.9, 0.999),
-    adam_eps: float = 1e-8,
 ):
-    if name == OptimizerName.ADAM:
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
-    if name == OptimizerName.ADAMW:
-        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=adam_betas, eps=adam_eps)
-    if name == OptimizerName.SGD:
-        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
-    if name == OptimizerName.MUON:
+    lr = cfg.learning_rate
+    if cfg.optimizer == OptimizerName.ADAM:
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay, betas=cfg.adam_betas, eps=cfg.adam_eps)
+    if cfg.optimizer == OptimizerName.ADAMW:
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=cfg.adam_betas, eps=cfg.adam_eps)
+    if cfg.optimizer == OptimizerName.SGD:
+        return torch.optim.SGD(params, lr=lr, momentum=cfg.momentum, weight_decay=weight_decay)
+    if cfg.optimizer == OptimizerName.MUON:
         return torch.optim.Muon(
             params,
             lr=lr,
             weight_decay=weight_decay,
-            momentum=momentum,
+            momentum=cfg.momentum,
             adjust_lr_fn="match_rms_adamw",
         )
-    raise ValueError(f"Unknown optimizer: {name}")
+    raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
 
 
 def apply_clip_and_step(opt, A, B, cfg):
@@ -47,24 +45,15 @@ def apply_clip_and_step(opt, A, B, cfg):
     opt.step()
 
 
-# TODO: Can we slim this down
-def GD_loop(
-    S_index: Tensor,
+def _init_factors(
     S_value: Tensor,
+    cfg: SumacConfig,
     m: int,
     n: int,
-    cfg: SumacConfig,
-    A_init: Tensor | None = None,
-    B_init: Tensor | None = None,
+    gen: Generator,
+    A_init: Tensor | None,
+    B_init: Tensor | None,
 ):
-    assert cfg.num_blocks is not None
-    assert cfg.device is not None
-
-    (gen, gen_blocks, gen_loader) = cfg.get_generator()
-    
-    # Move data to the training device.
-    S_index = S_index.to(cfg.device)
-    S_value = S_value.to(cfg.device)
     if A_init is None or B_init is None:
         scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.rank)
         A = torch.nn.Parameter(
@@ -88,15 +77,59 @@ def GD_loop(
     else:
         A = torch.nn.Parameter(A_init.detach().to(cfg.device).clone())
         B = torch.nn.Parameter(B_init.detach().to(cfg.device).clone())
-    opt = make_optimizer(
-        cfg.optimizer,
-        [A, B],
-        lr=cfg.learning_rate,
-        weight_decay=0.0,
-        momentum=cfg.momentum,
-        adam_betas=cfg.adam_betas,
-        adam_eps=cfg.adam_eps,
-    )
+    return (A, B)
+
+
+def _init_block_loss(
+    eval_kernel: AutotuneReluBatReduce,
+    S_index: Tensor,
+    S_value: Tensor,
+    device: device
+):
+    def inner(
+        A: Tensor,
+        B: Tensor,
+        edge_idx: Tensor,
+        row_indices: Tensor,
+    ):
+        edge_idx = edge_idx.to(device).view(-1)
+        mse_block, sumSr_block, jacc_num_block, errZ_block = block_loss_and_pred(
+            eval_kernel,
+            A,
+            B,
+            S_index=S_index,
+            S_value=S_value,
+            edge_idx=edge_idx,
+            row_indices=row_indices,
+        )
+        loss_block = errZ_block if errZ_block is not None else mse_block
+        return (loss_block, torch.as_tensor(sumSr_block, device=device, dtype=A.dtype), jacc_num_block)
+
+    return inner
+
+
+# TODO: Can we slim this down more?
+def GD_loop(
+    S_index: Tensor,
+    S_value: Tensor,
+    m: int,
+    n: int,
+    cfg: SumacConfig,
+    A_init: Tensor | None = None,
+    B_init: Tensor | None = None,
+):
+    assert cfg.num_blocks is not None
+    assert cfg.device is not None
+
+    (gen, gen_blocks, gen_loader) = cfg.get_generator()
+    eval_kernel = AutotuneReluBatReduce()
+    _block_eval = _init_block_loss(eval_kernel, S_index, S_value, cfg.device)
+    
+    # Move data to the training device.
+    S_index = S_index.to(cfg.device)
+    S_value = S_value.to(cfg.device)
+    (A, B) = _init_factors(S_value, cfg, m, n, gen, A_init, B_init)
+    opt = make_optimizer(cfg, [A, B], weight_decay=0.0)
 
     # DataLoader
     ds = StochasticRowBlockDataset(S_index, S_value, m, cfg.num_blocks, gen_blocks)
@@ -123,18 +156,9 @@ def GD_loop(
             num_jacc_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
 
             for block_id, edge_idx, row_indices in blocks:
-                edge_idx = edge_idx.to(cfg.device).view(-1)
-                mse_block, sumSr_block, jacc_num_block, errZ_block = block_loss_and_pred(
-                    A,
-                    B,
-                    S_index=S_index,
-                    S_value=S_value,
-                    edge_idx=edge_idx,
-                    row_indices=row_indices,
-                )
-                loss_block = errZ_block if errZ_block is not None else mse_block
+                (loss_block, sumSr_block, jacc_num_block) = _block_eval(A, B, edge_idx, row_indices)
                 loss = loss + loss_block
-                sumSr_batch = sumSr_batch + torch.as_tensor(sumSr_block, device=cfg.device, dtype=A.dtype)
+                sumSr_batch = sumSr_batch + sumSr_block
                 num_jacc_batch = num_jacc_batch + jacc_num_block
 
             loss.backward()
@@ -159,6 +183,7 @@ def GD_loop(
         print(f"\nTotal elapsed time: {total:.2f} sec")
 
     rmse, jacc, errZ = eval(
+        eval_kernel,
         A,
         B,
         S_index,

@@ -46,6 +46,14 @@ def resolve_sumac_device(
     )
 
 
+def round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
 @contextmanager
 def _matmul_precision(allow_tf32: bool):
     previous_precision = torch.get_float32_matmul_precision()
