@@ -103,7 +103,12 @@ def _init_block_loss(
             row_indices=row_indices,
         )
         loss_block = errZ_block if errZ_block is not None else mse_block
-        return (loss_block, torch.as_tensor(sumSr_block, device=device, dtype=A.dtype), jacc_num_block)
+        return (
+            loss_block,
+            mse_block,
+            torch.as_tensor(sumSr_block, device=device, dtype=A.dtype),
+            jacc_num_block,
+        )
 
     return inner
 
@@ -120,6 +125,7 @@ def GD_loop(
 ):
     assert cfg.num_blocks is not None
     assert cfg.device is not None
+    assert cfg.eval_interval is not None
 
     (gen, gen_blocks, gen_loader) = cfg.get_generator()
     eval_kernel = AutotuneReluBatReduce()
@@ -146,37 +152,55 @@ def GD_loop(
 
     for epoch in range(1, cfg.max_iterations + 1):
         nvtx_range_push("epoch: " + str(epoch))
-        total_loss, sumSr, num_jacc = 0.0, 0.0, 0.0
+        report_epoch = epoch % cfg.eval_interval == 0
+        total_errZ, total_mse, sumSr, num_jacc = 0.0, 0.0, 0.0, 0.0
         t_start = time.time()
 
         for blocks in loader:
             opt.zero_grad(set_to_none=True)
             loss = torch.zeros((), device=cfg.device, dtype=A.dtype)
-            sumSr_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
-            num_jacc_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
+            if report_epoch:
+                mse_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
+                sumSr_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
+                num_jacc_batch = torch.zeros((), device=cfg.device, dtype=A.dtype)
 
             for block_id, edge_idx, row_indices in blocks:
-                (loss_block, sumSr_block, jacc_num_block) = _block_eval(A, B, edge_idx, row_indices)
+                (
+                    loss_block,
+                    mse_block,
+                    sumSr_block,
+                    jacc_num_block,
+                ) = _block_eval(A, B, edge_idx, row_indices)
                 loss = loss + loss_block
-                sumSr_batch = sumSr_batch + sumSr_block
-                num_jacc_batch = num_jacc_batch + jacc_num_block
+                if report_epoch:
+                    mse_batch = mse_batch + mse_block.detach()
+                    sumSr_batch = sumSr_batch + sumSr_block
+                    num_jacc_batch = num_jacc_batch + jacc_num_block
 
             loss.backward()
             apply_clip_and_step(opt, A, B, cfg)
 
-            total_loss += float(loss.detach().item())
-            sumSr += float(sumSr_batch.detach().item())
-            num_jacc += float(num_jacc_batch.detach().item())
+            if report_epoch:
+                total_errZ += float(loss.detach().item())
+                total_mse += float(mse_batch.item())
+                sumSr += float(sumSr_batch.detach().item())
+                num_jacc += float(num_jacc_batch.detach().item())
 
-        time_step = time.time() - t_start
-        denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
-        jacc = 1.0 - num_jacc / denom_jacc
-        S_norm = float(torch.norm(S_value).item())
-        rmse = math.sqrt(total_loss) / (S_norm + 1e-16)
-        log = f"[epoch {epoch}/{cfg.max_iterations}]: rmse={rmse:.6f}, jacc={jacc:.6f}, factor_step ={time_step:6.4f}"
-        if cfg.verbose:
-            print(log)
-        history.append(log)
+        if report_epoch:
+            time_step = time.time() - t_start
+            denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
+            jacc = 1.0 - num_jacc / denom_jacc
+            S_norm = float(torch.norm(S_value).item())
+            rmse = math.sqrt(total_mse) / (S_norm + 1e-16)
+            errZ = math.sqrt(total_errZ) / (S_norm + 1e-16)
+            log = (
+                f"[epoch {epoch}/{cfg.max_iterations}]: rmse={rmse:.6f}, "
+                f"jacc={jacc:.6f}, errZ={errZ:.6f}, "
+                f"factor_step={time_step:6.4f}"
+            )
+            if cfg.verbose:
+                print(log)
+            history.append(log)
         nvtx_range_pop()
     total = time.time() - t0
     if cfg.verbose:
