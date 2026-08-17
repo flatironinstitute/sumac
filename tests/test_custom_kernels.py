@@ -124,6 +124,17 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(
             },
         ),
         (
+            17,
+            {
+                "BM": 128,
+                "BN": 64,
+                "WGMMA_S_N": 64,
+                "WGMMA_Y_N": 32,
+                "num_stages": 2,
+                "wgmma_mode": "RS",
+            },
+        ),
+        (
             32,
             {
                 "BM": 128,

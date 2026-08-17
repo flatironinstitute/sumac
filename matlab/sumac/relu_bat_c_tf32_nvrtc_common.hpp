@@ -49,6 +49,7 @@ struct MmaSyncConfig {
     int D_f = 0;
     int M_TILES = 0;
     int num_stages = 0;
+    bool padded_d = false;
 };
 
 struct WgmmaConfig {
@@ -370,6 +371,7 @@ static MmaSyncConfig default_mma_sync_config(int D) {
         cfg.num_stages = 1;
     }
     cfg.D_f = round_up(D, 8);
+    cfg.padded_d = D != cfg.D_f;
     return cfg;
 }
 //These parameters come from autotuning for the connectome dataset benchmark with the sumac pytorch version on H100.
@@ -427,7 +429,13 @@ static int wgmma_threads_per_block(const WgmmaConfig& cfg) {
 }
 
 static int mma_sync_dynamic_smem_bytes(const MmaSyncConfig& cfg) {
-    return 2 * cfg.num_stages * cfg.BN * cfg.D_f * 4 + 127;
+    const int operand_pipeline_bytes =
+        2 * cfg.num_stages * cfg.BN * cfg.D_f *
+        static_cast<int>(sizeof(std::uint32_t));
+    const int compute_warps = cfg.BM / (cfg.M_TILES * 16);
+    const int b_stage_bytes =
+        compute_warps * 16 * 8 * static_cast<int>(sizeof(std::uint32_t));
+    return std::max(operand_pipeline_bytes, b_stage_bytes) + 127;
 }
 
 static int wgmma_dynamic_smem_bytes(const WgmmaConfig& cfg) {
@@ -443,6 +451,9 @@ static bool valid_mma_sync_config(
     const MmaSyncConfig& cfg,
     int D) {
     if (device.major < 8 || D < 1) {
+        return false;
+    }
+    if (cfg.D_f != round_up(D, 8) || cfg.padded_d != (D != cfg.D_f)) {
         return false;
     }
     if ((cfg.BN % 8) != 0 ||
@@ -553,6 +564,8 @@ static std::string build_mma_sync_source(const MmaSyncConfig& cfg) {
     src << "#define D_f " << cfg.D_f << "\n";
     src << "#define M_TILES " << cfg.M_TILES << "\n";
     src << "#define MMA_SYNC_TF32_STAGES " << cfg.num_stages << "\n";
+    src << "#define MMA_SYNC_TF32_PADDED_D "
+        << (cfg.padded_d ? 1 : 0) << "\n";
     src << "#define MMA_SYNC_TF32_KERNEL_NAME relu_bat_c_tf32_mma_sync\n";
     src << "#define MMA_SYNC_TF32_PACK_KERNEL_NAME relu_bat_c_tf32_mma_sync_pack\n";
     src << "\n";
@@ -564,15 +577,13 @@ static std::string build_wgmma_source(const WgmmaConfig& cfg) {
     std::ostringstream src;
     src << "#define BM " << cfg.BM << "\n";
     src << "#define BN " << cfg.BN << "\n";
-    src << "#define D_f " << cfg.D_y_f << "\n";
     src << "#define D_K_F " << cfg.D_k_f << "\n";
     src << "#define D_Y_F " << cfg.D_y_f << "\n";
-    src << "#define WGMMA_S_N_SHAPE " << cfg.WGMMA_S_N << "\n";
-    src << "#define WGMMA_Y_N_SHAPE " << cfg.WGMMA_Y_N << "\n";
+    src << "#define WGMMA_S_N " << cfg.WGMMA_S_N << "\n";
+    src << "#define WGMMA_Y_N " << cfg.WGMMA_Y_N << "\n";
     src << "#define SMEM_COPY_STAGES " << cfg.num_stages << "\n";
     src << "#define WGMMA_TF32_KERNEL_NAME relu_bat_c_tf32_wgmma\n";
     src << "#define WGMMA_TF32_PACK_KERNEL_NAME relu_bat_c_tf32_wgmma_pack\n";
-    src << "#define WGMMA_TF32_PACK_ONLY 0\n";
     src << "#define WGMMA_FIRST_MMA_SS " << (cfg.first_mma_ss ? 1 : 0) << "\n";
     src << "\n";
     src << read_text_file(kWgmmaKernelPath);
@@ -657,7 +668,8 @@ static ModuleEntry get_or_build_mma_sync_module(
           << "|BN=" << cfg.BN
           << "|D_f=" << cfg.D_f
           << "|M_TILES=" << cfg.M_TILES
-          << "|stages=" << cfg.num_stages;
+          << "|stages=" << cfg.num_stages
+          << "|padded_d=" << (cfg.padded_d ? 1 : 0);
     const std::string key = keyss.str();
 
     auto it = g_module_cache.find(key);
