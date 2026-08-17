@@ -86,7 +86,8 @@ class AutotuneReluBatCTf32Sync(AutotuneCudaKernel[ReluBatCTf32SyncTuneConfig, T_
         if props.major < 8: return False
         if D < 1: return False
         if config.BN % 8 != 0: return False
-        if config.num_stages < 1: return False
+        if config.num_stages < 1 or config.num_stages > 3: return False
+        
 
         warp_m_rows = config.M_TILES * 16
         if config.BM % warp_m_rows != 0: return False
@@ -96,5 +97,9 @@ class AutotuneReluBatCTf32Sync(AutotuneCudaKernel[ReluBatCTf32SyncTuneConfig, T_
 
         _block_mem = getattr(props, "shared_memory_per_block", 0)
         max_smem = getattr(props, "shared_memory_per_block_optin", _block_mem)
-        smem_bytes = 2 * config.num_stages * config.BN * round_up(D, 8) * 4 + 127
+
+        operand_pipeline_bytes = 2 * config.num_stages * config.BN * round_up(D, 8) * 4
+        b_stage_bytes = compute_warps * 512
+        smem_bytes = max(operand_pipeline_bytes, b_stage_bytes) + 127
+
         return smem_bytes <= max_smem

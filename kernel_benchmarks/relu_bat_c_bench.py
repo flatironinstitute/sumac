@@ -68,7 +68,7 @@ def ms_to_tflops(M, N, D, ms):
 def _print_perf_summary(result: dict) -> None:
     rows = [
         (
-            "torch",
+            "torch.compile",
             result["torch_ms"],
             result["torch_TFLOPs"],
             1.0,
@@ -97,7 +97,10 @@ def _print_perf_summary(result: dict) -> None:
         )
 
     print("[performance]")
-    print(f"  {'implementation':<32} {'time [ms]':>10} {'TFLOP/s':>10} {'speedup':>9}")
+    print(
+        f"  {'implementation':<32} {'time [ms]':>10} "
+        f"{'TFLOP/s':>10} {'speedup':>9}"
+    )
     for name, ms, tflops, speedup in rows:
         print(f"  {name:<32} {ms:10.4f} {tflops:10.2f} {speedup:8.2f}x")
     print()

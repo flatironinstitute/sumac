@@ -68,8 +68,8 @@ def relu_bat_c_tf32_mma_sync_fake(
     M, D = validate_relu_bat_c_shapes(A, B, C)
     if BN % 8 != 0:
         raise RuntimeError("BN must be divisible by MMA_N=8")
-    if num_stages < 1:
-        raise RuntimeError("num_stages must be >= 1")
+    if num_stages < 1 or num_stages > 3:
+        raise RuntimeError("num_stages must be in [1, 3]")
 
     warp_m_rows = M_TILES * 16
     if BM % warp_m_rows != 0:

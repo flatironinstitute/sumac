@@ -35,34 +35,43 @@ def _split_kernel_file(path: Path) -> tuple[str, str, int]:
 
 
 def _make_header_wgmma_tf32(
-    BM: int,
+    *,
     BN: int,
-    D_f: int,
+    D_k_f: int,
+    D_y_f: int,
     WGMMA_S_N: int,
     WGMMA_Y_N: int,
-    num_stages: int,
-    kernel_name: str,
     pack_kernel_name: str,
-    wgmma_mode: str = "RS",
     pack_only: bool = False,
-    D_y_f: int | None = None,
+    BM: int | None = None,
+    num_stages: int | None = None,
+    kernel_name: str | None = None,
+    wgmma_mode: str | None = None,
 ) -> str:
-    wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
-    D_k_f = D_f
-    if D_y_f is None:
-        D_y_f = D_f
-    return f"""
-#define BM {BM}
+    common_header = f"""
 #define BN {BN}
-#define D_f {D_y_f}
 #define D_K_F {D_k_f}
 #define D_Y_F {D_y_f}
-#define WGMMA_S_N_SHAPE {WGMMA_S_N}
-#define WGMMA_Y_N_SHAPE {WGMMA_Y_N}
-#define SMEM_COPY_STAGES {num_stages}
-#define WGMMA_TF32_KERNEL_NAME {kernel_name}
+#define WGMMA_S_N {WGMMA_S_N}
+#define WGMMA_Y_N {WGMMA_Y_N}
 #define WGMMA_TF32_PACK_KERNEL_NAME {pack_kernel_name}
 #define WGMMA_TF32_PACK_ONLY {1 if pack_only else 0}
+"""
+    if pack_only:
+        return common_header
+
+    if BM is None or num_stages is None or kernel_name is None:
+        raise ValueError(
+            "The WGMMA compute header requires BM, stages, and a name"
+        )
+    if wgmma_mode is None:
+        raise ValueError("The WGMMA compute header requires wgmma_mode")
+    wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
+
+    return common_header + f"""
+#define BM {BM}
+#define SMEM_COPY_STAGES {num_stages}
+#define WGMMA_TF32_KERNEL_NAME {kernel_name}
 #define WGMMA_FIRST_MMA_SS {1 if wgmma_mode == "SS" else 0}
 """
 
@@ -71,23 +80,15 @@ def _dynamic_smem_bytes(
     *,
     BM: int,
     BN: int,
-    D: int | None = None,
-    D_k: int | None = None,
-    D_y: int | None = None,
+    D_k_f: int,
+    D_y_f: int,
     num_stages: int,
     wgmma_mode: str,
 ) -> int:
     wgmma_mode = _normalize_wgmma_mode(wgmma_mode)
-    if D_k is None:
-        D_k = D
-    if D_y is None:
-        D_y = D
-    if D_k is None or D_y is None:
-        raise ValueError("Either D or both D_k and D_y must be provided")
-
-    elems = num_stages * BN * (D_k + D_y)
+    elems = num_stages * BN * (D_k_f + D_y_f)
     if wgmma_mode == "SS":
-        elems += BM * D_k
+        elems += BM * D_k_f
     return elems * 4 + 127
 
 
@@ -217,17 +218,16 @@ def get_relu_bat_c_kernel_wgmma_tf32(
 
     header_code = (
         _make_header_wgmma_tf32(
-            BM,
-            BN,
-            D_k_f,
-            WGMMA_S_N,
-            WGMMA_Y_N,
-            num_stages,
-            kernel_name,
-            pack_kernel_name,
-            wgmma_mode,
-            False,
+            BM=BM,
+            BN=BN,
+            D_k_f=D_k_f,
             D_y_f=D_y_f,
+            WGMMA_S_N=WGMMA_S_N,
+            WGMMA_Y_N=WGMMA_Y_N,
+            num_stages=num_stages,
+            kernel_name=kernel_name,
+            pack_kernel_name=pack_kernel_name,
+            wgmma_mode=wgmma_mode,
         )
         + "\n"
         + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32}"\n'
@@ -263,7 +263,6 @@ def get_relu_bat_c_kernel_wgmma_tf32(
 
 @lru_cache(maxsize=None)
 def get_relu_bat_c_pack_kernel_wgmma_tf32(
-    BM: int,
     BN: int,
     D_k_f: int,
     D_y_f: int,
@@ -273,7 +272,6 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
     _check_wgmma_n_shape("WGMMA_S_N", WGMMA_S_N)
     _check_wgmma_n_shape("WGMMA_Y_N", WGMMA_Y_N)
 
-    kernel_name = _kernel_name_wgmma_tf32()
     pack_kernel_name = _pack_kernel_name_wgmma_tf32()
     header_code, kernel_source, kernel_source_start_line = _split_kernel_file(
         _KERNEL_PATH_WGMMA_TF32
@@ -281,17 +279,13 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
 
     header_code = (
         _make_header_wgmma_tf32(
-            BM,
-            BN,
-            D_k_f,
-            WGMMA_S_N,
-            WGMMA_Y_N,
-            2,
-            kernel_name,
-            pack_kernel_name,
-            "RS",
-            True,
+            BN=BN,
+            D_k_f=D_k_f,
             D_y_f=D_y_f,
+            WGMMA_S_N=WGMMA_S_N,
+            WGMMA_Y_N=WGMMA_Y_N,
+            pack_kernel_name=pack_kernel_name,
+            pack_only=True,
         )
         + "\n"
         + f'#line 1 "{_KERNEL_PATH_WGMMA_TF32}"\n'
@@ -314,7 +308,7 @@ def get_relu_bat_c_pack_kernel_wgmma_tf32(
         header_code=header_code,
         debug_context=(
             "pack kernel "
-            f"BM={BM} BN={BN} D_k_f={D_k_f} D_y_f={D_y_f} "
+            f"BN={BN} D_k_f={D_k_f} D_y_f={D_y_f} "
             f"WGMMA_S_N={WGMMA_S_N} WGMMA_Y_N={WGMMA_Y_N} "
             f"kernel_name={pack_kernel_name}"
         ),
@@ -397,7 +391,6 @@ def relu_bat_c_tf32_wgmma_impl(
 
     if num_panels > 0:
         pack_kernel = get_relu_bat_c_pack_kernel_wgmma_tf32(
-            BM,
             BN,
             D_k_pad,
             D_y_pad,
@@ -440,8 +433,8 @@ def relu_bat_c_tf32_wgmma_impl(
     smem_bytes = _dynamic_smem_bytes(
         BM=BM,
         BN=BN,
-        D_k=D_k_pad,
-        D_y=D_y_pad,
+        D_k_f=D_k_pad,
+        D_y_f=D_y_pad,
         num_stages=num_stages,
         wgmma_mode=wgmma_mode,
     )
