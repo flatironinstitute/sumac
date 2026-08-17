@@ -1,15 +1,11 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-function [A,B,stats] = salsa_loop(S,A,B,opts)
+function [A,B,stats] = salsa_loop_cuda(S,A,B,opts)
 
 % START THE CLOCK
 tLoop = tic;
 
 % INITIALIZE
-if (~canUseGPU())
-  error('salsa_loop:GPURequired',...
-    'salsa_loop requires a GPU.');
-end
 T = transpose(S);
 Scoo = sparse_coo_metadata(S);
 Tcoo = sparse_coo_metadata(T);
@@ -19,6 +15,7 @@ dB = zeros(size(B),"single");
 minCost = Inf;
 cost = Inf;
 
+% GPU ARRAYS
 S = gpuArray(S);
 A = gpuArray(A);
 B = gpuArray(B);
@@ -55,7 +52,7 @@ for iter=1:opts.max_iterate
   tsec = toc(tLoop);
   if ((mod(iter,opts.stats_interval)==0) || (iter==opts.max_iterate) || (tsec>opts.time_limit))
     [cost,rmse,jacc,fnnz] = compute_errors(S,A,B,opts);
-    print_stats(iter,cost,rmse,jacc,fnnz,tsec);
+    print_stats(iter,cost,rmse,jacc,fnnz,tsec,cost<minCost);
   end
 
   % BEST
@@ -221,7 +218,7 @@ dB = (lsqB-B)*(1-opts.momentum) + dB*opts.momentum;
 
 % UNBIAS FOR EARLY STEPS
 unbias = 1-opts.momentum^stepnum;
-B = B + opts.lrate*dB/unbias;
+B = B + opts.step_size*dB/unbias;
 
 end
 
@@ -256,7 +253,7 @@ function tf32 = use_tf32_relu_bat_c(opts)
 
 persistent gpu_supports_tf32;
 
-requested = isfield(opts,'allow_tf32') && isscalar(opts.allow_tf32) && logical(opts.allow_tf32);
+requested = isfield(opts,'use_tf32') && isscalar(opts.use_tf32) && logical(opts.use_tf32);
 if (~requested)
   tf32 = false;
   return;

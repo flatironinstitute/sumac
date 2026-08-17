@@ -1,54 +1,25 @@
+from __future__ import annotations
+
 import torch
 from torch.utils.data import DataLoader
+from typing import TYPE_CHECKING
 
-from .kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
-from .kernels.tuning import KernelAutotuneOptions, active_kernel_autotune_options
+from sumac.kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
 
-
-relu_bat_tuned = None
-relu_bat_reduce_kernel_mode = None
-relu_bat_reduce_kernel_autotune_options: KernelAutotuneOptions | None = None
-
-
-def get_relu_bat_reduce(A: torch.Tensor, B: torch.Tensor):
-    global relu_bat_tuned
-    global relu_bat_reduce_kernel_mode
-    global relu_bat_reduce_kernel_autotune_options
-
-    from .kernels.relu_bat_reduce import (
-        relu_bat_reduce_fallback_launcher,
-        relu_bat_reduce_launcher,
-        select_relu_bat_reduce_kernel_mode,
-    )
-
-    autotune_options = active_kernel_autotune_options()
-    mode = select_relu_bat_reduce_kernel_mode(A, B)
-    if (
-        mode == relu_bat_reduce_kernel_mode
-        and relu_bat_tuned is not None
-        and autotune_options == relu_bat_reduce_kernel_autotune_options
-    ):
-        return relu_bat_tuned
-
-    if mode == "fallback":
-        relu_bat_tuned = relu_bat_reduce_fallback_launcher()
-    else:
-        relu_bat_tuned = relu_bat_reduce_launcher(autotune_options)
-
-    relu_bat_reduce_kernel_mode = mode
-    relu_bat_reduce_kernel_autotune_options = autotune_options
-    return relu_bat_tuned
+if TYPE_CHECKING:
+    from sumac.kernels.tuning import AutotuneReluBatReduce
+    from torch import Tensor
 
 
 @torch.compile(dynamic=True)
 def block_loss_errz(
-    A_block: torch.Tensor,
-    B: torch.Tensor,
-    local_r: torch.Tensor,
-    cols_all: torch.Tensor,
-    vals_all: torch.Tensor,
-    sum_sr: torch.Tensor,
-    sum_sr2: torch.Tensor,
+    A_block: Tensor,
+    B: Tensor,
+    local_r: Tensor,
+    cols_all: Tensor,
+    vals_all: Tensor,
+    sum_sr: Tensor,
+    sum_sr2: Tensor,
 ):
     vals_all64 = vals_all.to(torch.float64)
     A_obs = A_block[local_r].to(torch.float64)      
@@ -68,9 +39,9 @@ def block_loss_errz(
 
 
 def compute_local_rows(
-    A: torch.Tensor,
-    rows_all: torch.Tensor,
-    row_indices: torch.Tensor,
+    A: Tensor,
+    rows_all: Tensor,
+    row_indices: Tensor,
 ):
     row_indices = row_indices.to(device=rows_all.device, dtype=torch.long)
     local_map = torch.full(
@@ -84,12 +55,13 @@ def compute_local_rows(
 
 
 def block_loss_and_pred(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    S_index: torch.Tensor,           # (2, nnz)
-    S_value: torch.Tensor,           # (nnz,)
-    edge_idx: torch.Tensor,          # indices into S_index/S_value for this block
-    row_indices: torch.Tensor,
+    kernel: AutotuneReluBatReduce,
+    A: Tensor,
+    B: Tensor,
+    S_index: Tensor,           # (2, nnz)
+    S_value: Tensor,           # (nnz,)
+    edge_idx: Tensor,          # indices into S_index/S_value for this block
+    row_indices: Tensor,
 ):
     """
     - Builds full block prediction Sr_I = ReLU(A_I @ B^T) (shape b x n).
@@ -122,9 +94,8 @@ def block_loss_and_pred(
     )
 
     with nvtx_range("block_loss_errz"):
-        reduce_kernel = get_relu_bat_reduce(A_block, B)
-        reduce_kernel.resolve_params(A_block, B)
-        sum_sr, sum_sr2 = reduce_kernel(A_block, B)
+        kernel.resolve_decision((A_block, B))
+        sum_sr, sum_sr2 = kernel((A_block, B))
         mse_full, sumSr_block, jacc_num_block, errZ_num_block = block_loss_errz(
             A_block,
             B,
@@ -139,10 +110,11 @@ def block_loss_and_pred(
 
 @torch.no_grad()
 def eval(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    S_index: torch.Tensor,
-    S_value: torch.Tensor,
+    kernel: AutotuneReluBatReduce,
+    A: Tensor,
+    B: Tensor,
+    S_index: Tensor,
+    S_value: Tensor,
     full_block_loader: DataLoader,
     device: torch.device | None = None,
 ):
@@ -160,6 +132,7 @@ def eval(
 
             nvtx_range_push("block_loss_and_pred")
             ssqe_b, sumSr_b, num_j_b, errZ_b = block_loss_and_pred(
+                kernel,
                 A,
                 B,
                 S_index,

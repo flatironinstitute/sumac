@@ -4,7 +4,8 @@ from sumac.training import salsa
 
 
 class ReferenceReluBatC:
-    def __call__(self, A, B, C):
+    def __call__(self, tup):
+        (A, B, C) = tup
         return torch.relu(B @ A.T) @ C
 
 
@@ -22,8 +23,9 @@ def reference_update(A, B, delta_B, edge_i, edge_j, values, momentum, unbias, le
     return expected_B, expected_delta
 
 
-def test_single_salsa_factor_update_matches_reference(monkeypatch):
-    monkeypatch.setattr(salsa, "relu_bat_c_tuned", ReferenceReluBatC())
+def test_single_salsa_factor_update_matches_reference():
+    # monkeypatch.setattr(salsa, "relu_bat_c_tuned", ReferenceReluBatC())
+    _reference_tuner = ReferenceReluBatC()
 
     A = torch.tensor(
         [[1.0, 0.0], [0.0, 2.0], [1.0, 1.0]], dtype=torch.float64
@@ -43,6 +45,7 @@ def test_single_salsa_factor_update_matches_reference(monkeypatch):
     learning_rate = torch.tensor(0.2, dtype=torch.float64)
 
     result_B, result_delta = salsa.lsq_update_single_gpu(
+        _reference_tuner,   # type: ignore
         Ar_dev=A,
         B_blk_dev=B,
         pinvAt_dev=pinvAt,
@@ -71,8 +74,8 @@ def test_single_salsa_factor_update_matches_reference(monkeypatch):
     torch.testing.assert_close(result_B, expected_B)
 
 
-def test_batch_salsa_update_maps_shuffled_rows_to_local_indices(monkeypatch):
-    monkeypatch.setattr(salsa, "relu_bat_c_tuned", ReferenceReluBatC())
+def test_batch_salsa_update_maps_shuffled_rows_to_local_indices():
+    _ref_tuned = ReferenceReluBatC()
     batch_update = getattr(
         salsa.batch_update_single_gpu,
         "_torchdynamo_orig_callable",
@@ -100,6 +103,7 @@ def test_batch_salsa_update_maps_shuffled_rows_to_local_indices(monkeypatch):
     learning_rate = torch.tensor(0.2, dtype=torch.float64)
 
     result_B, result_delta = batch_update(
+        _ref_tuned, # type: ignore
         S_idx_full=S_index,
         S_val_full=S_value,
         edge_idx=edge_idx,
