@@ -16,7 +16,7 @@
 //
 // mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 performs D = A @ B + D, where A and B are TF32 and D is FP32.
 //
-// A and C are prepacked and converted to tf32 in the MMA B-operand layout used by
+// A and C are prepacked and converted to tf32 in the B-operand layout used by
 // mma.sync.m16n8k8 with a short packing kernel to avoid having to convert them repeatedly 
 // in each threadblock of the compute kernel.
 //
@@ -29,19 +29,16 @@ static constexpr int MMA_N = 8;
 static constexpr int MMA_K = 8;
 
 static constexpr int WARP_M_ROWS = M_TILES * MMA_M;
-static constexpr int THREADS_PER_BLOCK =
-    (BM / WARP_M_ROWS) * 32;
+static constexpr int THREADS_PER_BLOCK = (BM / WARP_M_ROWS) * 32;
 
 static constexpr int K_TILES = D_f / MMA_K;
 static constexpr int N_TILES = BN / MMA_N;
-static constexpr int MMA_B_OPERAND_FRAGMENT_ELEMS =
-    MMA_N * MMA_K;
-static constexpr int LDMATRIX_MATRIX_WORDS = 32;
+static constexpr int MMA_B_OPERAND_FRAGMENT_ELEMS = MMA_N * MMA_K;
+static constexpr int LDMATRIX_WORDS = 32;
 
 static constexpr int PACKED_TILE_ELEMS = BN * D_f;
 
-static_assert(MMA_SYNC_TF32_STAGES >= 1 && MMA_SYNC_TF32_STAGES <= 3,
-              "cp.async staging supports 1..3 stages");
+static_assert(MMA_SYNC_TF32_STAGES >= 1 && MMA_SYNC_TF32_STAGES <= 3, "cp.async staging supports 1..3 stages");
 
 using uint32_t = cuda::std::uint32_t;
 
@@ -264,8 +261,7 @@ __device__ __forceinline__ void load_b_operand_pair_from_smem(
     int minor_tiles)
 {
     const int lane = threadIdx.x & 31;
-    const int group_offset = ldmatrix_group_word_offset(
-        major_tile, minor_tile_even, minor_tiles);
+    const int group_offset = ldmatrix_group_word_offset(major_tile, minor_tile_even, minor_tiles);
 
     // Lanes 0..7 provide the rows of matrix 0, lanes 8..15 matrix 1,
     // and so on. 
@@ -281,11 +277,9 @@ __device__ __forceinline__ void load_b_operand_tail_from_smem(
     int minor_tiles)
 {
     const int lane = threadIdx.x & 31;
-    const int group_offset = ldmatrix_group_word_offset(
-        major_tile, minor_tile_even, minor_tiles);
+    const int group_offset = ldmatrix_group_word_offset(major_tile, minor_tile_even, minor_tiles);
 
-    const uint32_t* row_ptr =
-        packed_smem + group_offset + 4 * (lane & 15);
+    const uint32_t* row_ptr = packed_smem + group_offset + 4 * (lane & 15);
     ldmatrix_u32x2(out, row_ptr);
 }
 
@@ -302,17 +296,17 @@ __device__ __forceinline__ int b_stage_slot_sw128(int row, int half)
 // Split each 32B row into two 16B chunks and group four rows into
 // each 128B band:
 //
-//   band = row / 4
-//   logical_chunk = 2 * (row % 4) + half       // half = 0 or 1
-//   physical_chunk = logical_chunk ^ band
-//   slot = 8 * band + physical_chunk
+// band = row / 4
+// logical_chunk = 2 * (row % 4) + half       // half = 0 or 1
+// physical_chunk = logical_chunk ^ band
+// slot = 8 * band + physical_chunk
 //
-// Logical-to-physical chunk order within successive bands:
+// Logical-to-physical chunk order within bands:
 //
-//   band 0: 0 1 2 3 4 5 6 7
-//   band 1: 1 0 3 2 5 4 7 6
-//   band 2: 2 3 0 1 6 7 4 5
-//   band 3: 3 2 1 0 7 6 5 4
+// band 0: 0 1 2 3 4 5 6 7
+// band 1: 1 0 3 2 5 4 7 6
+// band 2: 2 3 0 1 6 7 4 5
+// band 3: 3 2 1 0 7 6 5 4
 
 __device__ __forceinline__ void load_B_swizzle_coalesced(
     uint32_t out[4],
@@ -328,15 +322,13 @@ __device__ __forceinline__ void load_B_swizzle_coalesced(
     const int half = lane & 1;
     const int m = tile_m0 + row;
 
-    uint32_t* dst =
-        warp_scratch + 4 * b_stage_slot_sw128(row, half);
+    uint32_t* dst = warp_scratch + 4 * b_stage_slot_sw128(row, half);
 
     uint4 value = {0u, 0u, 0u, 0u};
     if (m < M) {
         if constexpr (MMA_SYNC_TF32_PADDED_D != 0) {
             const int d0 = tile_k0 + 4 * half;
-            const float* row_src =
-                B + static_cast<long long>(m) * D;
+            const float* row_src = B + static_cast<long long>(m) * D;
 
             if ((D & 3) == 0 && d0 + 3 < D) {
                 value = load_global_u32x4_cs(row_src + d0);
@@ -355,9 +347,7 @@ __device__ __forceinline__ void load_B_swizzle_coalesced(
                 }
             }
         } else {
-            const float* src =
-                B + static_cast<long long>(m) * D +
-                tile_k0 + 4 * half;
+            const float* src = B + static_cast<long long>(m) * D + tile_k0 + 4 * half;
             value = load_global_u32x4_cs(src);
         }
     }
@@ -368,9 +358,7 @@ __device__ __forceinline__ void load_B_swizzle_coalesced(
     uint32_t raw[4];
     const int source_row = lane & 15;
     const int source_half = lane >> 4;
-    const uint32_t* row_ptr =
-        warp_scratch +
-        4 * b_stage_slot_sw128(source_row, source_half);
+    const uint32_t* row_ptr = warp_scratch + 4 * b_stage_slot_sw128(source_row, source_half);
     ldmatrix_u32x4(&raw[0], &raw[2], row_ptr);
 
     #pragma unroll
@@ -390,11 +378,10 @@ __device__ __forceinline__ void store_b_operand_for_ldmatrix(
     const int minor_tile_even = minor_tile & ~1;
     const int fragment_in_group = minor_tile & 1;
     const int first_matrix = 2 * fragment_in_group;
-    const int group_offset = ldmatrix_group_word_offset(
-        major_tile, minor_tile_even, minor_tiles);
+    const int group_offset = ldmatrix_group_word_offset(major_tile, minor_tile_even, minor_tiles);
 
-    packed[group_offset + (first_matrix + 0) * LDMATRIX_MATRIX_WORDS + lane] = fragment.x;
-    packed[group_offset + (first_matrix + 1) * LDMATRIX_MATRIX_WORDS + lane] = fragment.y;
+    packed[group_offset + (first_matrix + 0) * LDMATRIX_WORDS + lane] = fragment.x;
+    packed[group_offset + (first_matrix + 1) * LDMATRIX_WORDS + lane] = fragment.y;
 }
 
 
@@ -442,11 +429,9 @@ __device__ __forceinline__ void pack_tile_pair_tf32(
         c_pair.y = f32_to_tf32_bits(C[static_cast<long long>(c_n1) * D + c_col]);
     }
 
-    store_b_operand_for_ldmatrix(
-        A_packed, inner_tile, n_tile, N_TILES, lane, a_pair);
+    store_b_operand_for_ldmatrix(A_packed, inner_tile, n_tile, N_TILES, lane, a_pair);
 
-    store_b_operand_for_ldmatrix(
-        C_packed, n_tile, inner_tile, K_TILES, lane, c_pair);
+    store_b_operand_for_ldmatrix(C_packed, n_tile, inner_tile, K_TILES, lane, c_pair);
 }
 
 __device__ __forceinline__ void issue_tile_copy(
@@ -460,16 +445,11 @@ __device__ __forceinline__ void issue_tile_copy(
 {
     const int bytes = PACKED_TILE_ELEMS * sizeof(uint32_t);
     const int chunks = bytes / 16;
-    const unsigned char* tile_a =
-        reinterpret_cast<const unsigned char*>(
-            A_packed_global + tile * PACKED_TILE_ELEMS);
-    const unsigned char* tile_c =
-        reinterpret_cast<const unsigned char*>(
-            C_packed_global + tile * PACKED_TILE_ELEMS);
-    unsigned char* smem_a = reinterpret_cast<unsigned char*>(
-        packed_tile(Apacked_smem, stage));
-    unsigned char* smem_c = reinterpret_cast<unsigned char*>(
-        packed_tile(Cpacked_smem, stage));
+    const unsigned char* tile_a = reinterpret_cast<const unsigned char*>(A_packed_global + tile * PACKED_TILE_ELEMS);
+    const unsigned char* tile_c = reinterpret_cast<const unsigned char*>(C_packed_global + tile * PACKED_TILE_ELEMS);
+
+    unsigned char* smem_a = reinterpret_cast<unsigned char*>(packed_tile(Apacked_smem, stage));
+    unsigned char* smem_c = reinterpret_cast<unsigned char*>(packed_tile(Cpacked_smem, stage));
 
     #pragma unroll 1
     for (int chunk = tid; chunk < chunks; chunk += blockDim.x) {
@@ -604,9 +584,7 @@ void MMA_SYNC_TF32_PACK_KERNEL_NAME(
     }
 
     const int n0 = tile * BN;
-    for (int packed_pair_idx = packed_pair_global_idx;
-         packed_pair_idx < PACKED_TILE_ELEMS / 2;
-         packed_pair_idx += packed_pair_stride) {
+    for (int packed_pair_idx = packed_pair_global_idx; packed_pair_idx < PACKED_TILE_ELEMS / 2; packed_pair_idx += packed_pair_stride) {
         pack_tile_pair_tf32(
             A,
             C,
@@ -641,8 +619,7 @@ void MMA_SYNC_TF32_KERNEL_NAME(
     extern __shared__ unsigned char dynamic_smem[];
     unsigned char* packed_smem = align_smem_128(dynamic_smem);
     uint32_t* Apacked_smem = reinterpret_cast<uint32_t*>(packed_smem);
-    uint32_t* Cpacked_smem =
-        Apacked_smem + MMA_SYNC_TF32_STAGES * PACKED_TILE_ELEMS;
+    uint32_t* Cpacked_smem = Apacked_smem + MMA_SYNC_TF32_STAGES * PACKED_TILE_ELEMS;
 
     uint32_t b_regs[M_TILES][K_TILES][4];
     uint32_t* warp_b_scratch = Apacked_smem + warp * MMA_M * MMA_K;
@@ -695,9 +672,7 @@ void MMA_SYNC_TF32_KERNEL_NAME(
 
     for (int tile = 0; tile < num_tiles; ++tile) {
         const int newer_tiles_left = num_tiles - tile - 1;
-        const int newer_groups =
-            newer_tiles_left < (MMA_SYNC_TF32_STAGES - 1) ?
-                newer_tiles_left : (MMA_SYNC_TF32_STAGES - 1);
+        const int newer_groups = newer_tiles_left < (MMA_SYNC_TF32_STAGES - 1) ? newer_tiles_left : (MMA_SYNC_TF32_STAGES - 1);
         const int stage = tile % MMA_SYNC_TF32_STAGES;
 
         cp_async_wait_group(newer_groups);
