@@ -1,6 +1,6 @@
 ## Subzero Matrix Completion (sumac)
 
-Python implementation of subzero matrix completion, a rectified linear factorization of a sparse matrix $S \in \mathbb R^{m \times n}$ as $S = \text{ReLU}(A B^{\top})$ such that $A, B \in \mathbb R^{m \times d}, d \ll \min(m,n)$.
+Python implementation of subzero matrix completion, a rectified linear factorization of a sparse matrix $S \in \mathbb{R}^{m \times n}$ as $S \approx \text{ReLU}(A B^{\top})$ such that $A\in \mathbb{ R}^{m \times d}, B\in \mathbb{R}^{n \times d}, d \ll \min(m,n)$.
 
 We offer two major routines:
 - Stochastic Alternating Least Squares Algorithm (sumac-SALSA): update factors alternately using random subsets of the other factor and its associated subset of edges.
@@ -8,7 +8,7 @@ We offer two major routines:
 
 ### Installation
 
-Create and activate a Python virtual environment. SUMAC currently requires Python 3.10 or newer.
+Create and activate a Python virtual environment. SUMAC currently requires Python 3.12 or newer.
 
 ```bash
 python -m venv .venv
