@@ -49,3 +49,10 @@ pretty = true
 [[tool.mypy.overrides]]
 module = ["triton", "triton.*"]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    'ignore:^`torch\.jit\.script_method` is deprecated:DeprecationWarning:torch\.jit\._script$',
+    'ignore:^`torch\.jit\.script_method` is not supported in Python 3\.14\+:DeprecationWarning:torch\.jit\._script$',
+    'ignore:^TypedStorage is deprecated\.:UserWarning:torch\._inductor\.select_algorithm$',
+]
