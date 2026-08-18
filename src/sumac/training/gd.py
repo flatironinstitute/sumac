@@ -10,6 +10,7 @@ from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import block_loss_and_pred, eval
 from sumac.kernels.cuda_utils import nvtx_range_pop, nvtx_range_push
 from sumac.kernels.tuning import AutotuneReluBatReduce
+from sumac.training.salsa import init_salsa_factors
 
 
 # TODO:
@@ -46,6 +47,7 @@ def apply_clip_and_step(opt, A, B, cfg):
 
 
 def _init_factors(
+    S_index: Tensor,
     S_value: Tensor,
     cfg: SumacConfig,
     m: int,
@@ -55,25 +57,16 @@ def _init_factors(
     B_init: Tensor | None,
 ):
     if A_init is None or B_init is None:
-        scale = 0.5 * math.sqrt(S_value.mean().item() / cfg.rank)
-        A = torch.nn.Parameter(
-            torch.rand(
-                m,
-                cfg.rank,
-                device=cfg.device,
-                dtype=cfg.dtype,
-                generator=gen,
-            ) * scale
+        A, B = init_salsa_factors(
+            S_index,
+            S_value,
+            m,
+            n,
+            cfg.rank,
+            gen,
         )
-        B = torch.nn.Parameter(
-            torch.rand(
-                n,
-                cfg.rank,
-                device=cfg.device,
-                dtype=cfg.dtype,
-                generator=gen,
-            ) * scale
-        )
+        A = torch.nn.Parameter(A.detach())
+        B = torch.nn.Parameter(B.detach())
     else:
         A = torch.nn.Parameter(A_init.detach().to(cfg.device).clone())
         B = torch.nn.Parameter(B_init.detach().to(cfg.device).clone())
@@ -134,7 +127,7 @@ def GD_loop(
     # Move data to the training device.
     S_index = S_index.to(cfg.device)
     S_value = S_value.to(cfg.device)
-    (A, B) = _init_factors(S_value, cfg, m, n, gen, A_init, B_init)
+    (A, B) = _init_factors(S_index, S_value, cfg, m, n, gen, A_init, B_init)
     opt = make_optimizer(cfg, [A, B], weight_decay=0.0)
 
     # DataLoader
@@ -146,15 +139,41 @@ def GD_loop(
         collate_fn=collate_blocks,
         generator=gen_loader,
     )
+    eval_generator = torch.Generator()
+    eval_generator.manual_seed(gen_loader.initial_seed())
+    eval_loader = DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_blocks,
+        generator=eval_generator,
+    )
 
-    history = []
+    rmse, jacc, errZ = eval(
+        eval_kernel,
+        A,
+        B,
+        S_index,
+        S_value,
+        full_block_loader=eval_loader,
+        device=A.device,
+    )
+    if cfg.verbose:
+        print(
+            f"[epoch 0/{cfg.max_iterations}]: cost = {errZ:.6f}, "
+            f"rmse = {rmse:.6f}, jacc = {jacc:.6f}, time = 0.0000s"
+        )
+
+    cost_hist: list[float] = []
+    rmse_hist: list[float] = []
+    jacc_hist: list[float] = []
+    time_hist: list[float] = []
     t0 = time.time()
 
     for epoch in range(1, cfg.max_iterations + 1):
         nvtx_range_push("epoch: " + str(epoch))
         report_epoch = epoch % cfg.eval_interval == 0
         total_errZ, total_mse, sumSr, num_jacc = 0.0, 0.0, 0.0, 0.0
-        t_start = time.time()
 
         for blocks in loader:
             opt.zero_grad(set_to_none=True)
@@ -187,20 +206,24 @@ def GD_loop(
                 num_jacc += float(num_jacc_batch.detach().item())
 
         if report_epoch:
-            time_step = time.time() - t_start
             denom_jacc = float(torch.sum(S_value).item()) + sumSr - num_jacc
             jacc = 1.0 - num_jacc / denom_jacc
             S_norm = float(torch.norm(S_value).item())
             rmse = math.sqrt(total_mse) / (S_norm + 1e-16)
             errZ = math.sqrt(total_errZ) / (S_norm + 1e-16)
+            report_time = time.time()
+            elapsed = report_time - t0
             log = (
-                f"[epoch {epoch}/{cfg.max_iterations}]: rmse={rmse:.6f}, "
-                f"jacc={jacc:.6f}, errZ={errZ:.6f}, "
-                f"factor_step={time_step:6.4f}"
+                f"[epoch {epoch}/{cfg.max_iterations}]: cost = {errZ:.6f}, "
+                f"rmse = {rmse:.6f}, jacc = {jacc:.6f}, "
+                f"time = {elapsed:.4f}s"
             )
             if cfg.verbose:
                 print(log)
-            history.append(log)
+            cost_hist.append(errZ)
+            rmse_hist.append(rmse)
+            jacc_hist.append(jacc)
+            time_hist.append(elapsed)
         nvtx_range_pop()
     total = time.time() - t0
     if cfg.verbose:
@@ -216,6 +239,15 @@ def GD_loop(
         device=A.device,
     )
     if cfg.verbose:
-        print(f"EVAL: rmse={rmse:.6f}, jacc={jacc:.6f}, errZ={errZ:.6f}")
+        print(
+            f"EVAL: cost={errZ:.6f}, rmse={rmse:.6f}, "
+            f"jacc={jacc:.6f}, time={total:.4f}s"
+        )
 
+    history = {
+        "cost": cost_hist,
+        "rmse": rmse_hist,
+        "jacc": jacc_hist,
+        "time": time_hist,
+    }
     return A.detach(), B.detach(), history

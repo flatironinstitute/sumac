@@ -47,17 +47,18 @@ def init_salsa_factors(
     device = S_value.device
     dtype = S_value.dtype
 
-    S = torch.sparse_coo_tensor(
-        S_index.to(device=device, dtype=torch.long),
-        S_value,
-        size=(m, n),
-        device=device,
-        dtype=dtype,
-    ).coalesce()
-    R_A = torch.rand((n, d), device=device, dtype=dtype, generator=gen)
-    R_B = torch.rand((m, d), device=device, dtype=dtype, generator=gen)
-    A = torch.sqrt(torch.sparse.mm(S, R_A))
-    B = -torch.sqrt(torch.sparse.mm(S.T, R_B))
+    with torch.sparse.check_sparse_tensor_invariants(False): # This is to supress the check invariants warning since just calling the sparse_coo_tetnsor with check_invariants=False is apparenty not enough
+        S = torch.sparse_coo_tensor(
+            S_index.to(device=device, dtype=torch.long),
+            S_value,
+            size=(m, n),
+            device=device,
+            dtype=dtype,
+        ).coalesce()
+        R_A = torch.rand((n, d), device=device, dtype=dtype, generator=gen)
+        R_B = torch.rand((m, d), device=device, dtype=dtype, generator=gen)
+        A = torch.sqrt(torch.sparse.mm(S, R_A))
+        B = -torch.sqrt(torch.sparse.mm(S.T, R_B))
 
     Lij = torch.sum(A[S_index[0], :] * B[S_index[1], :], dim=1)
 
@@ -272,8 +273,12 @@ def salsa_loop(
         device=cfg.device,
     )
     if cfg.verbose:
-        print(f"iter = 0000, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}")
+        print(
+            f"[epoch 0/{cfg.max_iterations}]: cost = {errZ:.6f}, "
+            f"rmse = {rmse:.6f}, jacc = {jacc:.6f}, time = 0.0000s"
+        )
     nvtx_range_pop()
+    cost_hist = []
     rmse_hist = []
     jacc_hist = []
     time_hist = []
@@ -282,7 +287,6 @@ def salsa_loop(
     
     momentum = torch.tensor(cfg.momentum, device=A.device, dtype=A.dtype)
     kernel = get_tunable_kernel(cfg)
-    t_start = time.time()
     for iter_idx in range(1, cfg.max_iterations + 1):
         nvtx_range_push("Iteration " + str(iter_idx))
 
@@ -323,17 +327,22 @@ def salsa_loop(
 
             if cfg.device.type == "cuda":
                 synchronize_if_cuda(cfg.device)
-            elapsed = time.time() - t_start
+            elapsed = time.time() - t_start_loop
+            cost_hist.append(errZ)
             rmse_hist.append(rmse)
             jacc_hist.append(jacc)
             time_hist.append(elapsed)
             
             if cfg.verbose:
-                print(f"iter = {iter_idx:04d}, rmse = {rmse:.6f}, jacc = {jacc:.6f}, errZ = {errZ:.6}, time = {elapsed:.2f}s")
-            t_start = time.time()
+                print(
+                    f"[epoch {iter_idx}/{cfg.max_iterations}]: "
+                    f"cost = {errZ:.6f}, rmse = {rmse:.6f}, "
+                    f"jacc = {jacc:.6f}, time = {elapsed:.4f}s"
+                )
         nvtx_range_pop()
     # WRAP UP
     costs = {
+        'cost': cost_hist,
         'rmse': rmse_hist,
         'jacc': jacc_hist,
         'time': time_hist
@@ -343,4 +352,4 @@ def salsa_loop(
         total = time.time() - t_start_loop
         print(f"\nTotal elapsed time: {total:.2f} sec")
 
-    return A, B, costs
+    return A.detach(), B.detach(), costs
