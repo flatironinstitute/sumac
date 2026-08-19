@@ -79,13 +79,18 @@ Optional `A_init` and `B_init` keyword arguments can supply initial factor tenso
 `SumacConfig` is keyword-only and provides defaults for every field. See its docstring for the complete list of configuration options and their behavior.
 
 ### Application: Fly Connectome Data
+
 The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$. 
 
 To run sumac-SALSA
 ```bash
-python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode SALSA
+python examples/sumac_connectome.py --filename /path/to/connectome_data --mode SALSA
 ```
 To run sumac-GD
 ```bash
-python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode GD
+python examples/sumac_connectome.py --filename /path/to/connectome_data --mode GD
 ```
+
+
+Data for the examples can be found at:
+https://users.flatironinstitute.org/~lsaul/sparse_matrices/
