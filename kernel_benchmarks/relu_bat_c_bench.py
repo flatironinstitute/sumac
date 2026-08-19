@@ -332,7 +332,7 @@ if __name__ == "__main__":
     autotune_mode = AutotuneMode(str.lower(args.autotune))
 
     torch.manual_seed(0)
-    torch.set_float32_matmul_precision('highest')
+    torch.set_float32_matmul_precision('high')
     assert torch.cuda.is_available()
 
     for d in [16, 32, 64, 128, 256]:
