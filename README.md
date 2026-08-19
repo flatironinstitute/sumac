@@ -83,9 +83,9 @@ The connectome data is a large sparse matrix, with $m=n=139255, |S|=19773733$.
 
 To run sumac-SALSA
 ```bash
-python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode SALSA
+python examples/sumac_connectome.py --filename /path/to/connectome_data --mode SALSA
 ```
 To run sumac-GD
 ```bash
-python examples/sumac_connectome.py --filename /path/to/connectome.txt --mode GD
+python examples/sumac_connectome.py --filename /path/to/connectome_data --mode GD
 ```
