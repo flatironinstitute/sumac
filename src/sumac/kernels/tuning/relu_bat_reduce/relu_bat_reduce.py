@@ -1,11 +1,16 @@
-from functools import lru_cache
 import torch
 from torch import Tensor
 
 from sumac.utils import is_power_of_two
 from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 from sumac.kernels.tuning.autotune import AutotuneCudaKernel
-from sumac.kernels.tuning.tuning_types import ReluBatReduceTuneConfig, T_ReluBatReduceParams, T_ReluBatReduceReturn, KernelAutotuneOptions, make_config_list
+from sumac.kernels.tuning.tuning_types import (
+    KernelAutotuneOptions,
+    ReluBatReduceTuneConfig,
+    T_ReluBatReduceParams,
+    T_ReluBatReduceReturn,
+    make_config_list,
+)
 
 
 @torch.compile
@@ -43,6 +48,13 @@ class AutotuneReluBatReduce(AutotuneCudaKernel[ReluBatReduceTuneConfig, T_ReluBa
         super().__init__(*args, **kwargs)
 
 
+    def resolve_decision(self, params: T_ReluBatReduceParams):
+        if getattr(torch.version, "hip", None) is not None:
+            self._set_interface_fn()
+            return
+        return super().resolve_decision(params)
+
+
     def _candidate_fn(self, params: T_ReluBatReduceParams, config: ReluBatReduceTuneConfig):
         (A, B) = params
         return relu_bat_reduce_fused(A, B, config.BM, config.BK, config.num_ms)
@@ -68,11 +80,17 @@ class AutotuneReluBatReduce(AutotuneCudaKernel[ReluBatReduceTuneConfig, T_ReluBa
         return smem_bytes <= shared_memory_per_block
 
 
-@lru_cache
-def make_relu_bat_reduce(autotune_opts: KernelAutotuneOptions | None = None):
-    tuner = AutotuneReluBatReduce(
-        configs = relu_bat_reduce_tune_config,
-        cache_path = "relu_bat_reduce_jit_autotune.json",
-        autotune_options = autotune_opts
+def make_relu_bat_reduce(
+    autotune_opts: KernelAutotuneOptions | None = None,
+):
+    if getattr(torch.version, "hip", None) is not None:
+        from .relu_bat_reduce_fp32_mfma_amd import (
+            AutotuneReluBatReduceMfmaAMD,
+        )
+
+        return AutotuneReluBatReduceMfmaAMD(
+            autotune_options=autotune_opts,
+        )
+    return AutotuneReluBatReduce(
+        autotune_options=autotune_opts,
     )
-    return tuner

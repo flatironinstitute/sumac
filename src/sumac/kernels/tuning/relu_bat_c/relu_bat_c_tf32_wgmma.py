@@ -74,6 +74,8 @@ def relu_bat_c_tf32_wgmma_tune_config(D: int) -> list[ReluBatCTf32WgmmaTuneConfi
 
 
 def relu_bat_c_tf32_wgmma_available(A: torch.Tensor) -> bool:
+    if getattr(torch.version, "hip", None) is not None:
+        return False
     props = torch.cuda.get_device_properties(A.device)
     return props.major == 9
 
@@ -109,6 +111,8 @@ class AutotuneReluBatCTf32Wgmma(AutotuneCudaKernel[ReluBatCTf32WgmmaTuneConfig, 
     def _constraint(self, params: T_ReluBatCParams, config: ReluBatCTf32WgmmaTuneConfig) -> bool:
         (A, _, _) = params
         _, D = A.shape
+        if getattr(torch.version, "hip", None) is not None:
+            return False
         props = torch.cuda.get_device_properties(A.device)
 
         if props.major != 9: return False

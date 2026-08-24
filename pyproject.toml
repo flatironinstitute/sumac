@@ -19,6 +19,9 @@ cuda = [
     "optuna>=4.8,<5",
     "triton",
 ]
+rocm = [
+    "optuna>=4.8,<5",
+]
 dev = [
     "build>=1.2,<2",
     "pytest>=8,<9",
@@ -38,7 +41,10 @@ include = [
 
 [tool.setuptools.package-data]
 "sumac.kernels.relu_batc_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
+"sumac.kernels.relu_batc_jit_amd" = ["*.cpp", "*.h", "*.hpp"]
+"sumac.kernels.relu_batc_tf32_jit_amd" = ["*.cpp", "*.h", "*.hpp"]
 "sumac.kernels.relu_bat_reduce_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
+"sumac.kernels.relu_bat_reduce_jit_amd" = ["*.cpp", "*.h", "*.hpp"]
 "sumac.kernels.relu_batc_tf32_jit" = ["*.cu", "*.cuh", "*.h", "*.hpp"]
 
 [tool.mypy]

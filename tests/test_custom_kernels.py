@@ -4,8 +4,8 @@ from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
 import pytest 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="custom CUDA kernel tests require CUDA",
+    not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None,
+    reason="custom CUDA kernel tests require an NVIDIA CUDA build",
 )
 
 FP32_MAX_ABS_ERROR = 5e-3

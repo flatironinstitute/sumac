@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from sumac.kernels.cuda_utils import nvtx_range, nvtx_range_pop, nvtx_range_push
 
 if TYPE_CHECKING:
-    from sumac.kernels.tuning import AutotuneReluBatReduce
+    from sumac.kernels.tuning import T_ReluBatReduceTuner
     from torch import Tensor
 
 
@@ -55,7 +55,7 @@ def compute_local_rows(
 
 
 def block_loss_and_pred(
-    kernel: AutotuneReluBatReduce,
+    kernel: T_ReluBatReduceTuner,
     A: Tensor,
     B: Tensor,
     S_index: Tensor,           # (2, nnz)
@@ -110,7 +110,7 @@ def block_loss_and_pred(
 
 @torch.no_grad()
 def eval(
-    kernel: AutotuneReluBatReduce,
+    kernel: T_ReluBatReduceTuner,
     A: Tensor,
     B: Tensor,
     S_index: Tensor,

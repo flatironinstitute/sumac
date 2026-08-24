@@ -80,6 +80,8 @@ class AutotuneReluBatCTf32Sync(AutotuneCudaKernel[ReluBatCTf32SyncTuneConfig, T_
 
     def _constraint(self, params: T_ReluBatCParams, config: ReluBatCTf32SyncTuneConfig) -> bool:
         (A, _, _) = params
+        if getattr(torch.version, "hip", None) is not None:
+            return False
         props = torch.cuda.get_device_properties(A.device)
         _, D = A.shape
 

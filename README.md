@@ -29,6 +29,16 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -e ".[cuda]"
 ```
 
+For a ROCm install, first install a ROCm build of PyTorch together with the
+matching Triton package supplied by that PyTorch distribution. Then install the
+ROCm autotuning dependency and make the toolkit libraries discoverable:
+
+```bash
+export ROCM_HOME=/path/to/rocm
+python -m pip install -e ".[rocm]"
+```
+
+
 For development, install the developer extra:
 
 ```bash

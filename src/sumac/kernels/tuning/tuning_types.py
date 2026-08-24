@@ -19,6 +19,20 @@ class ReluBatCFp32TuneConfig:
 
 
 @dataclass
+class ReluBatCFp32MfmaTuneConfig:
+    BM: int
+    BN: int
+    M_TILES: int
+
+
+@dataclass
+class ReluBatCTf32MfmaTuneConfig:
+    BM: int
+    BN: int
+    M_TILES: int
+
+
+@dataclass
 class ReluBatCTf32SyncTuneConfig:
     BM: int
     BN: int
@@ -43,7 +57,22 @@ class ReluBatReduceTuneConfig:
     num_ms: int
 
 
-T_TuneConfig = ReluBatCFp32TuneConfig | ReluBatCTf32SyncTuneConfig | ReluBatCTf32WgmmaTuneConfig | ReluBatReduceTuneConfig
+@dataclass
+class ReluBatReduceMfmaTuneConfig:
+    BM: int
+    BN: int
+    M_TILES: int
+
+
+T_TuneConfig = (
+    ReluBatCFp32TuneConfig
+    | ReluBatCFp32MfmaTuneConfig
+    | ReluBatCTf32MfmaTuneConfig
+    | ReluBatCTf32SyncTuneConfig
+    | ReluBatCTf32WgmmaTuneConfig
+    | ReluBatReduceTuneConfig
+    | ReluBatReduceMfmaTuneConfig
+)
 
 T_ReluBatCParams = Tuple[Tensor, Tensor, Tensor]
 T_ReluBatReduceParams = Tuple[Tensor, Tensor]

@@ -7,7 +7,11 @@ from sumac.config import SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import eval
 from sumac.kernels.cuda_utils import nvtx_range_push, nvtx_range_pop, synchronize_if_cuda
-from sumac.kernels.tuning import get_tunable_kernel, T_KernelTuner, AutotuneReluBatReduce
+from sumac.kernels.tuning import (
+    get_tunable_kernel,
+    make_relu_bat_reduce,
+    T_KernelTuner,
+)
 
 
 # TODO:
@@ -260,7 +264,7 @@ def salsa_loop(
     nvtx_range_pop()
     ##init evaluation
 
-    eval_kernel = AutotuneReluBatReduce()
+    eval_kernel = make_relu_bat_reduce()
     nvtx_range_push("eval_loader init")
     eval_loader = DataLoader(ds_rows, batch_size=1, shuffle=False, collate_fn=collate_blocks)
     rmse, jacc, errZ = eval(

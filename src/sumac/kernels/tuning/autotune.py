@@ -23,8 +23,8 @@ def require_optuna():
         import optuna
     except ImportError as exc:
         raise RuntimeError(
-            "CUDA kernel autotuning requires the optional dependency 'optuna'. "
-            "Install the CUDA/autotune extras to use custom CUDA kernels."
+            "GPU kernel autotuning requires the optional dependency 'optuna'. "
+            "Install the CUDA or ROCm extra to use custom GPU kernels."
         ) from exc
     return optuna
 
@@ -34,8 +34,8 @@ def _require_triton():
         import triton
     except ImportError as exc:
         raise RuntimeError(
-            "CUDA kernel benchmarking requires the optional dependency 'triton'. "
-            "Install the CUDA/autotune extras to use custom CUDA kernels."
+            "GPU kernel benchmarking requires the optional dependency 'triton'. "
+            "Install the Triton build matching the active PyTorch distribution."
         ) from exc
     return triton
 
@@ -59,11 +59,11 @@ def _bench_callable(fn: Callable[[], Any], *, warmup: int, rep: int) -> float:
     )
 
 
-def _brief_exception(exc: Exception) -> str:
+def _exception_text(exc: Exception) -> str:
     text = str(exc).strip()
     if not text:
         return exc.__class__.__name__
-    return text.splitlines()[0]
+    return text
 
 
 def _print_trial_pruned(
@@ -77,7 +77,7 @@ def _print_trial_pruned(
         return
     message = f"[Trial {trial_number}] pruned: {reason}; params={params}"
     if exc is not None:
-        message += f"; error={_brief_exception(exc)}"
+        message += f"; error={_exception_text(exc)}"
     print(message)
 
 
@@ -234,7 +234,9 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
         disk_key: str
     ) -> TuneResult:
         if not cuda_is_available():
-            raise ValueError("Can't happen: this branch should only occur when CUDA is available.")
+            raise ValueError(
+                "Can't happen: this branch should only occur when a GPU is available."
+            )
         optuna = require_optuna()
         if self.sampler is None:
             self.sampler = optuna.samplers.GridSampler(
@@ -260,6 +262,18 @@ class AutotuneCudaKernel[T_Config: T_TuneConfig, T_Params: T_FnParams, T_Returns
             study.optimize(objective, n_trials=self.n_trials)
         finally:
             optuna.logging.set_verbosity(previous_optuna_verbosity)
+
+        completed_trials = [
+            trial
+            for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if not completed_trials:
+            return TuneResult(
+                mode=TuneResultMode.FALLBACK,
+                params={},
+                runtime_ms=fallback_runtime_ms,
+            )
 
         best = study.best_trial
         best_cuda_runtime_ms = float(best.user_attrs["runtime_ms"])

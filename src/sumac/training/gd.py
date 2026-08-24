@@ -9,7 +9,7 @@ from sumac.config import OptimizerName, SumacConfig
 from sumac.datasets import collate_blocks, StochasticRowBlockDataset
 from sumac.eval import block_loss_and_pred, eval
 from sumac.kernels.cuda_utils import nvtx_range_pop, nvtx_range_push
-from sumac.kernels.tuning import AutotuneReluBatReduce
+from sumac.kernels.tuning import make_relu_bat_reduce, T_ReluBatReduceTuner
 from sumac.training.salsa import init_salsa_factors
 
 
@@ -74,7 +74,7 @@ def _init_factors(
 
 
 def _init_block_loss(
-    eval_kernel: AutotuneReluBatReduce,
+    eval_kernel: T_ReluBatReduceTuner,
     S_index: Tensor,
     S_value: Tensor,
     device: device
@@ -121,7 +121,7 @@ def GD_loop(
     assert cfg.eval_interval is not None
 
     (gen, gen_blocks, gen_loader) = cfg.get_generator()
-    eval_kernel = AutotuneReluBatReduce()
+    eval_kernel = make_relu_bat_reduce()
     _block_eval = _init_block_loss(eval_kernel, S_index, S_value, cfg.device)
     
     # Move data to the training device.
