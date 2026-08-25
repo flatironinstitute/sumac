@@ -23,6 +23,7 @@ class ReluBatCFp32MfmaTuneConfig:
     BM: int
     BN: int
     M_TILES: int
+    num_stages: int
 
 
 @dataclass
@@ -30,6 +31,7 @@ class ReluBatCTf32MfmaTuneConfig:
     BM: int
     BN: int
     M_TILES: int
+    num_stages: int
 
 
 @dataclass

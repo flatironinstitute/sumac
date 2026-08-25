@@ -23,32 +23,45 @@ def relu_bat_c_tf32_mfma_tune_config(
 ) -> list[ReluBatCTf32MfmaTuneConfig]:
 
     if D >= 256:
-        template = ReluBatCTf32MfmaTuneConfig(BM=16, BN=16, M_TILES=1)
+        stage_choices = [1, 2, 3] if D > 256 else [2, 1, 3]
+        template = ReluBatCTf32MfmaTuneConfig(
+            BM=16, BN=16, M_TILES=1, num_stages=stage_choices[0]
+        )
         choices = {
             "BM": [16, 32, 64],
             "BN": [16, 32],
             "M_TILES": [1, 2],
+            "num_stages": stage_choices,
         }
     elif D >= 128:
-        template = ReluBatCTf32MfmaTuneConfig(BM=32, BN=16, M_TILES=1)
+        template = ReluBatCTf32MfmaTuneConfig(
+            BM=32, BN=16, M_TILES=1, num_stages=2
+        )
         choices = {
             "BM": [32, 64, 128],
             "BN": [16, 32, 64],
             "M_TILES": [1, 2, 4],
+            "num_stages": [2, 1, 3],
         }
     elif D >= 64:
-        template = ReluBatCTf32MfmaTuneConfig(BM=32, BN=16, M_TILES=1)
+        template = ReluBatCTf32MfmaTuneConfig(
+            BM=32, BN=16, M_TILES=1, num_stages=2
+        )
         choices = {
             "BM": [32, 64, 128, 256],
             "BN": [16, 32, 64, 128],
             "M_TILES": [1, 2, 4],
+            "num_stages": [2, 1, 3],
         }
     else:
-        template = ReluBatCTf32MfmaTuneConfig(BM=64, BN=16, M_TILES=1)
+        template = ReluBatCTf32MfmaTuneConfig(
+            BM=64, BN=16, M_TILES=1, num_stages=2
+        )
         choices = {
             "BM": [64, 128, 256],
             "BN": [16, 32, 64, 128],
             "M_TILES": [1, 2, 4],
+            "num_stages": [2, 1, 3],
         }
     return make_config_list(template, choices)
 
@@ -78,6 +91,7 @@ class AutotuneReluBatCTf32MfmaAMD(
             BM=config.BM,
             BN=config.BN,
             M_TILES=config.M_TILES,
+            num_stages=config.num_stages,
         )
 
     def _fallback(self, params: T_ReluBatCParams) -> T_ReluBatCReturn:
@@ -94,6 +108,8 @@ class AutotuneReluBatCTf32MfmaAMD(
         if not relu_bat_c_tf32_mfma_available(A.device, D):
             return False
         if config.BM <= 0 or config.BN <= 0 or config.M_TILES <= 0:
+            return False
+        if config.num_stages not in (1, 2, 3):
             return False
         if config.BN % 16 != 0:
             return False
@@ -115,7 +131,7 @@ class AutotuneReluBatCTf32MfmaAMD(
         if D < 1:
             return False
         D_f = round_up(D, 16)
-        smem_bytes = 2 * config.BN * D_f * 4
+        smem_bytes = 2 * config.num_stages * config.BN * D_f * 4
         default_smem = int(
             getattr(props, "shared_memory_per_block", 0) or 0
         )

@@ -571,7 +571,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Print custom GPU kernel autotuning decisions and pruned trials",
     )
+    parser.add_argument(
+        "--d-values",
+        "--d",
+        type=int,
+        nargs="+",
+        default=[16, 32, 64, 128, 256],
+        help="Inner dimensions to benchmark (default: 16 32 64 128 256)",
+    )
     args = parser.parse_args()
+
+    if any(d <= 0 for d in args.d_values):
+        parser.error("--d-values entries must all be positive")
 
     autotune_mode = AutotuneMode(str.lower(args.autotune))
 
@@ -579,7 +590,7 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('highest')
     assert torch.cuda.is_available()
 
-    for d in [16, 32, 64, 128, 256]:
+    for d in args.d_values:
         with kernel_autotune_options(
             mode=autotune_mode,
             cache_dir=args.autotune_cache_dir,

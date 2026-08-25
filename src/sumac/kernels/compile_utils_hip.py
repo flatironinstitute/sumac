@@ -3,7 +3,11 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import glob
+import hashlib
 import os
+import re
+import sys
+import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -17,6 +21,7 @@ import torch
 HIP_SUCCESS = 0
 HIPRTC_SUCCESS = 0
 HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_MEMORY_SIZE = 8
+HIP_JIT_DUMP_DIR_ENV = "SUMAC_HIP_JIT_DUMP_DIR"
 _get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
@@ -26,6 +31,75 @@ class HipJitError(RuntimeError):
 
 def _decode(value: bytes | None) -> str:
     return value.decode("utf-8", errors="replace") if value else "<unknown>"
+
+
+def _dump_filename_component(value: str, *, fallback: str) -> str:
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
+    return (component or fallback)[:80]
+
+
+def _dump_code_object(
+    image: bytes,
+    *,
+    kernel_name: str,
+    gpu_arch: str,
+    directory: str | os.PathLike[str],
+) -> Path:
+    """Atomically write one final HIP code object to a deterministic path."""
+    if isinstance(directory, str) and not directory.strip():
+        raise HipJitError("HIP JIT dump directory cannot be empty")
+    try:
+        dump_directory = Path(directory).expanduser()
+        dump_directory.mkdir(parents=True, exist_ok=True)
+        dump_directory = dump_directory.resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HipJitError(
+            f"Could not create HIP JIT dump directory {directory!r}: {exc}"
+        ) from exc
+    if not dump_directory.is_dir():
+        raise HipJitError(
+            f"HIP JIT dump destination is not a directory: {dump_directory}"
+        )
+
+    safe_kernel_name = _dump_filename_component(
+        kernel_name,
+        fallback="hip_kernel",
+    )
+    safe_arch = _dump_filename_component(gpu_arch, fallback="unknown_arch")
+    image_digest = hashlib.sha256(image).hexdigest()
+    output_path = dump_directory / (
+        f"{safe_kernel_name}-{safe_arch}-{image_digest}.hsaco"
+    )
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{safe_kernel_name}-",
+            suffix=".tmp",
+            dir=dump_directory,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            os.fchmod(temporary.fileno(), 0o600)
+            temporary.write(image)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, output_path)
+        temporary_path = None
+    except OSError as exc:
+        raise HipJitError(
+            f"Could not dump HIP code object for {kernel_name!r} to "
+            f"{output_path}: {exc}"
+        ) from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return output_path
 
 
 def _rocm_roots() -> list[Path]:
@@ -631,6 +705,18 @@ class HipKernel:
     _max_dynamic_smem: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def dump_code_object(
+        self,
+        directory: str | os.PathLike[str],
+    ) -> Path:
+        """Write the exact HIPRTC image loaded by this kernel to ``directory``."""
+        return _dump_code_object(
+            self.image,
+            kernel_name=self.kernel_name,
+            gpu_arch=self.gpu_arch,
+            directory=directory,
+        )
+
     def _function_for_device(self, device: int) -> ctypes.c_void_p:
         with self._lock:
             if device in self._functions:
@@ -828,7 +914,13 @@ def compile_hip_kernel(
     device: Any | None = None,
     hip_include_dirs: Optional[list[str]] = None,
     hip_options: Optional[list[str]] = None,
+    dump_dir: str | os.PathLike[str] | None = None,
 ) -> HipKernel:
+    """Compile a HIP kernel with HIPRTC.
+
+    Set ``dump_dir`` or the ``SUMAC_HIP_JIT_DUMP_DIR`` environment variable to
+    write the final code object returned by HIPRTC - for debugging purposes.
+    """
     if header_code:
         separator = "" if header_code.endswith("\n") else "\n"
         kernel_source = header_code + separator + kernel_source
@@ -851,7 +943,7 @@ def compile_hip_kernel(
         arch=arch,
         options=options,
     )
-    return HipKernel(
+    kernel = HipKernel(
         image=image,
         kernel_name=kernel_name,
         gpu_arch=arch,
@@ -859,5 +951,26 @@ def compile_hip_kernel(
         symbol_name=symbol_name,
     )
 
+    requested_dump_dir = dump_dir
+    if requested_dump_dir is None:
+        requested_dump_dir = os.environ.get(HIP_JIT_DUMP_DIR_ENV) or None
+    if requested_dump_dir is not None:
+        dumped_path = kernel.dump_code_object(requested_dump_dir)
+        symbol = kernel.symbol_name or kernel.kernel_name
+        print(
+            f"[hiprtc] dumped {kernel.kernel_name} "
+            f"(symbol {symbol}) to {dumped_path}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-__all__ = ["HipJitError", "HipKernel", "compile_hip_kernel", "hip_device_arch"]
+    return kernel
+
+
+__all__ = [
+    "HIP_JIT_DUMP_DIR_ENV",
+    "HipJitError",
+    "HipKernel",
+    "compile_hip_kernel",
+    "hip_device_arch",
+]

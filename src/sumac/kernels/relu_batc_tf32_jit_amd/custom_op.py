@@ -19,6 +19,7 @@ def relu_bat_c_tf32_mfma_amd_op(
     BM: int,
     BN: int,
     M_TILES: int,
+    num_stages: int,
 ) -> torch.Tensor:
     return _relu_bat_c_tf32_mfma_impl(
         A,
@@ -27,6 +28,7 @@ def relu_bat_c_tf32_mfma_amd_op(
         BM=BM,
         BN=BN,
         M_TILES=M_TILES,
+        num_stages=num_stages,
     )
 
 
@@ -38,6 +40,7 @@ def _(
     BM: int,
     BN: int,
     M_TILES: int,
+    num_stages: int,
 ) -> torch.Tensor:
     if A.dim() != 2 or B.dim() != 2 or C.dim() != 2:
         raise RuntimeError("expected 2D tensors")
@@ -52,6 +55,8 @@ def _(
         raise RuntimeError("BN must be divisible by 16")
     if BM % (M_TILES * 16) != 0:
         raise RuntimeError("BM must be divisible by M_TILES * 16")
+    if num_stages not in (1, 2, 3):
+        raise RuntimeError("num_stages must be one of 1, 2, or 3")
     return A.new_empty((M, D))
 
 

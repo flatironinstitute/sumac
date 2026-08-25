@@ -19,14 +19,18 @@ def _make_header_mfma(
     BN: int,
     M_TILES: int,
     D_f: int,
+    num_stages: int,
     kernel_name: str,
+    pack_kernel_name: str,
 ) -> str:
     return f"""
 #define BM {BM}
 #define BN {BN}
 #define M_TILES {M_TILES}
 #define D_f {D_f}
+#define MFMA_TF32_STAGES {num_stages}
 #define MFMA_TF32_KERNEL_NAME {kernel_name}
+#define MFMA_TF32_PACK_KERNEL_NAME {pack_kernel_name}
 """
 
 
@@ -38,8 +42,14 @@ def _base_gpu_arch(gpu_arch: str) -> str:
     return gpu_arch.split(":", 1)[0]
 
 
-def _mfma_dynamic_smem_bytes(*, BN: int, D_f: int) -> int:
-    return 2 * BN * D_f * 4
+def _mfma_dynamic_smem_bytes(
+    *, BN: int, D_f: int, num_stages: int
+) -> int:
+    return 2 * num_stages * BN * D_f * 4
+
+
+def _packed_tile_elems(*, BN: int, D_f: int) -> int:
+    return BN * D_f
 
 
 def _max_shared_memory_per_block(properties) -> int:
@@ -73,20 +83,32 @@ def get_relu_bat_c_tf32_kernel_mfma(
     BN: int,
     M_TILES: int,
     D_f: int,
+    num_stages: int,
     gpu_arch: str,
 ):
+    if num_stages not in (1, 2, 3):
+        raise ValueError("num_stages must be one of 1, 2, or 3")
     if _base_gpu_arch(gpu_arch) not in _MFMA_TF32_WAVE64_ARCHES:
         raise RuntimeError(
             "The TF32/XF32 MFMA kernel is only validated for gfx942; "
             f"got {gpu_arch}"
         )
     kernel_name = f"relu_bat_c_tf32_mfma_d{D_f}"
+    pack_kernel_name = f"relu_bat_c_tf32_mfma_pack_d{D_f}"
     header_code, kernel_source, kernel_source_line = _split_kernel_file(
         _KERNEL_PATH_MFMA
     )
 
     header_code = (
-        _make_header_mfma(BM, BN, M_TILES, D_f, kernel_name)
+        _make_header_mfma(
+            BM,
+            BN,
+            M_TILES,
+            D_f,
+            num_stages,
+            kernel_name,
+            pack_kernel_name,
+        )
         + "\n"
         + f'#line 1 "{_KERNEL_PATH_MFMA}"\n'
         + header_code
@@ -98,6 +120,50 @@ def get_relu_bat_c_tf32_kernel_mfma(
         kernel_name=kernel_name,
         header_code=header_code,
         gpu_arch=gpu_arch,
+        hip_options=["-ffast-math"],
+    )
+
+
+@lru_cache(maxsize=None)
+def get_relu_bat_c_tf32_pack_kernel_mfma(
+    BM: int,
+    BN: int,
+    M_TILES: int,
+    D_f: int,
+    gpu_arch: str,
+):
+    if _base_gpu_arch(gpu_arch) not in _MFMA_TF32_WAVE64_ARCHES:
+        raise RuntimeError(
+            "The TF32/XF32 MFMA kernel is only validated for gfx942; "
+            f"got {gpu_arch}"
+        )
+    kernel_name = f"relu_bat_c_tf32_mfma_d{D_f}"
+    pack_kernel_name = f"relu_bat_c_tf32_mfma_pack_d{D_f}"
+    header_code, kernel_source, kernel_source_line = _split_kernel_file(
+        _KERNEL_PATH_MFMA
+    )
+    header_code = (
+        _make_header_mfma(
+            BM,
+            BN,
+            M_TILES,
+            D_f,
+            2,
+            kernel_name,
+            pack_kernel_name,
+        )
+        + "\n"
+        + f'#line 1 "{_KERNEL_PATH_MFMA}"\n'
+        + header_code
+        + "\n"
+        + f'#line {kernel_source_line} "{_KERNEL_PATH_MFMA}"\n'
+    )
+    return compile_hip_kernel(
+        kernel_source,
+        kernel_name=pack_kernel_name,
+        header_code=header_code,
+        gpu_arch=gpu_arch,
+        hip_options=["-ffast-math"],
     )
 
 
@@ -141,7 +207,9 @@ def relu_bat_c_tf32_mfma_available(
 
         properties = torch.cuda.get_device_properties(device)
         D_f = _round_up(D, 16)
-        minimum_smem = _mfma_dynamic_smem_bytes(BN=16, D_f=D_f)
+        minimum_smem = _mfma_dynamic_smem_bytes(
+            BN=16, D_f=D_f, num_stages=1
+        )
         return minimum_smem <= _max_shared_memory_per_block(properties)
     except Exception:
         return False
@@ -154,6 +222,7 @@ def relu_bat_c_tf32_mfma(
     BM: int,
     BN: int,
     M_TILES: int,
+    num_stages: int = 2,
 ) -> torch.Tensor:
     _validate_inputs(A, B, C)
     if BM <= 0 or BN <= 0 or M_TILES <= 0:
@@ -163,6 +232,8 @@ def relu_bat_c_tf32_mfma(
         )
     if BN % 16 != 0:
         raise ValueError("BN must be divisible by the MFMA tile width 16")
+    if num_stages not in (1, 2, 3):
+        raise ValueError("num_stages must be one of 1, 2, or 3")
 
     wave_m_rows = M_TILES * 16
     if BM % wave_m_rows != 0:
@@ -196,7 +267,9 @@ def relu_bat_c_tf32_mfma(
         )
 
     D_f = _round_up(D, 16)
-    smem_bytes = _mfma_dynamic_smem_bytes(BN=BN, D_f=D_f)
+    smem_bytes = _mfma_dynamic_smem_bytes(
+        BN=BN, D_f=D_f, num_stages=num_stages
+    )
     max_smem = _max_shared_memory_per_block(properties)
     if smem_bytes > max_smem:
         raise ValueError(
@@ -204,11 +277,37 @@ def relu_bat_c_tf32_mfma(
             f"{max_smem}"
         )
 
+    num_panels = (N + BN - 1) // BN
+    packed_shape = (num_panels, _packed_tile_elems(BN=BN, D_f=D_f))
+    A_packed = torch.empty(packed_shape, device=A.device, dtype=A.dtype)
+    C_packed = torch.empty(packed_shape, device=A.device, dtype=C.dtype)
+
+    pack_kernel = get_relu_bat_c_tf32_pack_kernel_mfma(
+        BM,
+        BN,
+        M_TILES,
+        D_f,
+        gpu_arch,
+    )
+    pack_threads = 256
+    pack_grid = (
+        (_packed_tile_elems(BN=BN, D_f=D_f) + pack_threads - 1)
+        // pack_threads,
+        num_panels,
+        1,
+    )
+    pack_kernel(
+        grid=pack_grid,
+        block=(pack_threads, 1, 1),
+        args=[A, C, A_packed, C_packed, N, D],
+    )
+
     kernel = get_relu_bat_c_tf32_kernel_mfma(
         BM,
         BN,
         M_TILES,
         D_f,
+        num_stages,
         gpu_arch,
     )
     default_smem = int(
@@ -222,13 +321,14 @@ def relu_bat_c_tf32_mfma(
         grid=grid,
         block=(threads_per_block, 1, 1),
         shared_mem=smem_bytes,
-        args=[A, B, C, Y, N, M, D],
+        args=[A_packed, C_packed, B, Y, N, M, D],
     )
     return Y
 
 
 __all__ = [
     "get_relu_bat_c_tf32_kernel_mfma",
+    "get_relu_bat_c_tf32_pack_kernel_mfma",
     "relu_bat_c_tf32_mfma",
     "relu_bat_c_tf32_mfma_available",
 ]

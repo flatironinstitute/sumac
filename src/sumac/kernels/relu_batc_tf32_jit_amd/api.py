@@ -14,8 +14,11 @@ def relu_bat_c_tf32_mfma(
     BM: int,
     BN: int,
     M_TILES: int,
+    num_stages: int = 2,
 ) -> torch.Tensor:
-    return relu_bat_c_tf32_mfma_amd_op(A, B, C, BM, BN, M_TILES)
+    return relu_bat_c_tf32_mfma_amd_op(
+        A, B, C, BM, BN, M_TILES, num_stages
+    )
 
 
 __all__ = [
