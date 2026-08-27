@@ -11,7 +11,8 @@ from ..compile_utils_hip import compile_hip_kernel, hip_device_arch
 _KERNEL_PATH_MFMA = Path(__file__).with_name("kernel_mfma.cpp")
 _KERNEL_MARKER = "// KERNEL_START"
 
-_MFMA_FP32_WAVE64_ARCHES = {"gfx942"}
+_MFMA_FP32_WAVE64_ARCHES = {"gfx90a", "gfx942", "gfx950"}
+_MFMA_FP32_WAVE64_ARCHES_DESCRIPTION = "gfx90a, gfx942, or gfx950"
 
 
 def _make_header_mfma(
@@ -90,7 +91,8 @@ def get_relu_bat_c_kernel_mfma(
         raise ValueError("num_stages must be one of 1, 2, or 3")
     if _base_gpu_arch(gpu_arch) not in _MFMA_FP32_WAVE64_ARCHES:
         raise RuntimeError(
-            "The FP32 MFMA kernel is only validated for gfx942; "
+            "The FP32 MFMA kernel requires "
+            f"{_MFMA_FP32_WAVE64_ARCHES_DESCRIPTION}; "
             f"got {gpu_arch}"
         )
     kernel_name = f"relu_bat_c_fp32_mfma_d{D_f}"
@@ -134,7 +136,8 @@ def get_relu_bat_c_pack_kernel_mfma(
 ):
     if _base_gpu_arch(gpu_arch) not in _MFMA_FP32_WAVE64_ARCHES:
         raise RuntimeError(
-            "The FP32 MFMA kernel is only validated for gfx942; "
+            "The FP32 MFMA kernel requires "
+            f"{_MFMA_FP32_WAVE64_ARCHES_DESCRIPTION}; "
             f"got {gpu_arch}"
         )
     kernel_name = f"relu_bat_c_fp32_mfma_d{D_f}"
@@ -252,7 +255,8 @@ def relu_bat_c_fp32_mfma(
     gpu_arch = hip_device_arch(A.device)
     if _base_gpu_arch(gpu_arch) not in _MFMA_FP32_WAVE64_ARCHES:
         raise RuntimeError(
-            "The FP32 MFMA kernel is only validated for gfx942; "
+            "The FP32 MFMA kernel requires "
+            f"{_MFMA_FP32_WAVE64_ARCHES_DESCRIPTION}; "
             f"got {gpu_arch}"
         )
 

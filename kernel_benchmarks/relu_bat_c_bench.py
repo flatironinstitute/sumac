@@ -232,7 +232,8 @@ def _init_functions(
     if _is_rocm():
         if not relu_bat_c_fp32_mfma_available(A.device, D):
             raise RuntimeError(
-                "The HIP FP32 benchmark requires gfx942 and a D whose "
+                "The HIP FP32 benchmark requires gfx90a, gfx942, or gfx950 "
+                "and a D whose "
                 "minimum MFMA panel fits the device LDS budget"
             )
         mfma_config = relu_bat_c_fp32_mfma_tune_config(D)
@@ -552,6 +553,20 @@ if __name__ == "__main__":
     parser.add_argument("--rep-ms", type=int, default=20,
                         help="Benchmark measurement duration in milliseconds")
     parser.add_argument(
+        "--autotune-warmup-ms",
+        "--autotune_warmup_ms",
+        type=int,
+        default=1,
+        help="Per-candidate autotune warmup duration in milliseconds",
+    )
+    parser.add_argument(
+        "--autotune-rep-ms",
+        "--autotune_rep_ms",
+        type=int,
+        default=5,
+        help="Per-candidate autotune measurement duration in milliseconds",
+    )
+    parser.add_argument(
         "--autotune",
         type=str,
         default="cache",
@@ -583,6 +598,10 @@ if __name__ == "__main__":
 
     if any(d <= 0 for d in args.d_values):
         parser.error("--d-values entries must all be positive")
+    if args.autotune_warmup_ms < 0:
+        parser.error("--autotune-warmup-ms must be nonnegative")
+    if args.autotune_rep_ms <= 0:
+        parser.error("--autotune-rep-ms must be positive")
 
     autotune_mode = AutotuneMode(str.lower(args.autotune))
 
@@ -603,5 +622,7 @@ if __name__ == "__main__":
                 dtype=torch.float32,
                 warmup_ms=args.warmup_ms,
                 rep_ms=args.rep_ms,
+                tune_warmup_ms=args.autotune_warmup_ms,
+                tune_rep_ms=args.autotune_rep_ms,
             )
             _print_perf_summary(r)

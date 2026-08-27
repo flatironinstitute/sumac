@@ -118,7 +118,8 @@ def _init_functions(
     if _is_rocm():
         if not relu_bat_reduce_fp32_mfma_available(A.device, D):
             raise RuntimeError(
-                "The HIP FP32 reduction benchmark requires gfx942 and a D "
+                "The HIP FP32 reduction benchmark requires gfx90a, gfx942, "
+                "or gfx950 and a D "
                 "supported by the MFMA register/LDS bounds"
             )
         configs = relu_bat_reduce_mfma_tune_config
@@ -268,6 +269,20 @@ if __name__ == "__main__":
         help="Benchmark measurement duration in milliseconds",
     )
     parser.add_argument(
+        "--autotune-warmup-ms",
+        "--autotune_warmup_ms",
+        type=int,
+        default=1,
+        help="Per-candidate autotune warmup duration in milliseconds",
+    )
+    parser.add_argument(
+        "--autotune-rep-ms",
+        "--autotune_rep_ms",
+        type=int,
+        default=5,
+        help="Per-candidate autotune measurement duration in milliseconds",
+    )
+    parser.add_argument(
         "--autotune",
         type=str,
         default="cache",
@@ -288,6 +303,10 @@ if __name__ == "__main__":
         help="Print custom GPU kernel autotuning decisions and pruned trials",
     )
     args = parser.parse_args()
+    if args.autotune_warmup_ms < 0:
+        parser.error("--autotune-warmup-ms must be nonnegative")
+    if args.autotune_rep_ms <= 0:
+        parser.error("--autotune-rep-ms must be positive")
     autotune_mode = AutotuneMode(str.lower(args.autotune))
     torch.manual_seed(0)
     torch.set_float32_matmul_precision("highest")
@@ -306,5 +325,7 @@ if __name__ == "__main__":
                 dtype=torch.float32,
                 warmup_ms=args.warmup_ms,
                 rep_ms=args.rep_ms,
+                tune_warmup_ms=args.autotune_warmup_ms,
+                tune_rep_ms=args.autotune_rep_ms,
             )
             print_perf_summary(result)

@@ -118,7 +118,7 @@ __device__ __forceinline__ void direct_copy_wave_dword(
     const unsigned int wave_lds_address =
         __builtin_amdgcn_readfirstlane(lds_address);
 
-    // gfx942 buffer_loads load directly in LDS, without staging through registers, 
+    // CDNA buffer_loads load directly into LDS, without staging through registers,
     // similar to PTX's cp.async. 
     asm volatile(
         "s_mov_b32 m0, %0\n\t"
