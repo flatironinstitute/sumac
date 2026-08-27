@@ -33,7 +33,6 @@ static constexpr int THREADS_PER_BLOCK = (BM / WARP_M_ROWS) * 32;
 
 static constexpr int K_TILES = D_f / MMA_K;
 static constexpr int N_TILES = BN / MMA_N;
-static constexpr int MMA_B_OPERAND_FRAGMENT_ELEMS = MMA_N * MMA_K;
 static constexpr int LDMATRIX_WORDS = 32;
 
 static constexpr int PACKED_TILE_ELEMS = BN * D_f;
