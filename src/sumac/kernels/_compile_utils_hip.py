@@ -16,10 +16,10 @@ import torch
 from ._compile_utils_common import (
     _as_3tuple,
     _decode,
-    _encode_c_strings,
     _pack_kernel_args,
     _prepend_header,
     _resolve_launch_args,
+    _run_rtc,
 )
 
 
@@ -330,17 +330,6 @@ def _module_lookup_diagnostics(
     return "\n".join(details)
 
 
-def _hiprtc_program_log(lib: ctypes.CDLL, program: ctypes.c_void_p) -> str:
-    size = ctypes.c_size_t()
-    _check_hiprtc(lib.hiprtcGetProgramLogSize(program, ctypes.byref(size)), lib)
-    if size.value == 0:
-        return ""
-
-    buf = ctypes.create_string_buffer(size.value)
-    _check_hiprtc(lib.hiprtcGetProgramLog(program, buf), lib)
-    return _decode(buf.value)
-
-
 def _device_index(device: Any | None = None) -> int:
     if device is None:
         return int(torch.cuda.current_device())
@@ -418,6 +407,43 @@ def _hiprtc_options(
     return options
 
 
+def _extract_hiprtc_result(
+    lib: ctypes.CDLL,
+    program: ctypes.c_void_p,
+    name_expression: bytes | None,
+    *,
+    kernel_name: str,
+    arch: str,
+) -> tuple[bytes, str]:
+    if name_expression is None:
+        raise RuntimeError("HIPRTC extraction requires a name expression")
+
+    lowered_name = ctypes.c_char_p()
+    _check_hiprtc(
+        lib.hiprtcGetLoweredName(
+            program,
+            name_expression,
+            ctypes.byref(lowered_name),
+        ),
+        lib,
+    )
+    if not lowered_name.value:
+        raise HipJitError(
+            f"HIPRTC returned an empty lowered name for {kernel_name}"
+        )
+    symbol_name = _decode(lowered_name.value)
+
+    size = ctypes.c_size_t()
+    _check_hiprtc(lib.hiprtcGetCodeSize(program, ctypes.byref(size)), lib)
+    if size.value == 0:
+        raise HipJitError(
+            f"HIPRTC produced an empty code object for {kernel_name} ({arch})"
+        )
+    buffer = ctypes.create_string_buffer(size.value)
+    _check_hiprtc(lib.hiprtcGetCode(program, buffer), lib)
+    return bytes(buffer.raw), symbol_name
+
+
 @lru_cache(maxsize=None)
 def _compile_hiprtc_image(
     full_source: str,
@@ -427,67 +453,31 @@ def _compile_hiprtc_image(
     options: tuple[str, ...],
 ) -> tuple[bytes, str]:
     lib = _load_hiprtc()
-    program = ctypes.c_void_p()
-    source = full_source.encode("utf-8")
-    name = f"{kernel_name}.cpp".encode("utf-8")
-    name_expression = kernel_name.encode("utf-8")
-
-    _check_hiprtc(
-        lib.hiprtcCreateProgram(
-            ctypes.byref(program),
-            source,
-            name,
-            0,
-            None,
-            None,
+    return _run_rtc(
+        source=full_source,
+        program_name=f"{kernel_name}.cpp",
+        options=options,
+        success_code=HIPRTC_SUCCESS,
+        create_program=lib.hiprtcCreateProgram,
+        add_name_expression=lib.hiprtcAddNameExpression,
+        compile_program=lib.hiprtcCompileProgram,
+        get_program_log_size=lib.hiprtcGetProgramLogSize,
+        get_program_log=lib.hiprtcGetProgramLog,
+        destroy_program=lib.hiprtcDestroyProgram,
+        check=lambda code: _check_hiprtc(code, lib),
+        make_compile_error=lambda log: HipJitError(
+            f"HIPRTC failed compiling {kernel_name} for {arch}\n"
+            f"options: {' '.join(options)}\n{log}"
         ),
-        lib,
-    )
-
-    try:
-        _check_hiprtc(
-            lib.hiprtcAddNameExpression(program, name_expression),
+        extract_result=lambda program, expression: _extract_hiprtc_result(
             lib,
-        )
-        encoded_options = _encode_c_strings(options)
-        result = lib.hiprtcCompileProgram(
             program,
-            encoded_options.count,
-            encoded_options.pointers,
-        )
-        if result != HIPRTC_SUCCESS:
-            log = _hiprtc_program_log(lib, program)
-            raise HipJitError(
-                f"HIPRTC failed compiling {kernel_name} for {arch}\n"
-                f"options: {' '.join(options)}\n{log}"
-            )
-
-        lowered_name = ctypes.c_char_p()
-        _check_hiprtc(
-            lib.hiprtcGetLoweredName(
-                program,
-                name_expression,
-                ctypes.byref(lowered_name),
-            ),
-            lib,
-        )
-        if not lowered_name.value:
-            raise HipJitError(
-                f"HIPRTC returned an empty lowered name for {kernel_name}"
-            )
-        symbol_name = _decode(lowered_name.value)
-
-        size = ctypes.c_size_t()
-        _check_hiprtc(lib.hiprtcGetCodeSize(program, ctypes.byref(size)), lib)
-        if size.value == 0:
-            raise HipJitError(
-                f"HIPRTC produced an empty code object for {kernel_name} ({arch})"
-            )
-        buf = ctypes.create_string_buffer(size.value)
-        _check_hiprtc(lib.hiprtcGetCode(program, buf), lib)
-        return bytes(buf.raw), symbol_name
-    finally:
-        _check_hiprtc(lib.hiprtcDestroyProgram(ctypes.byref(program)), lib)
+            expression,
+            kernel_name=kernel_name,
+            arch=arch,
+        ),
+        name_expression=kernel_name,
+    )
 
 
 def _kernel_device(args: list[Any]) -> int:

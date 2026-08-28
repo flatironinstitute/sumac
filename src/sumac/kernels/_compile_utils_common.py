@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 
 _KernelArguments = list[Any] | tuple[Any, ...]
+_ResultT = TypeVar("_ResultT")
 
 
 def _decode(value: bytes | None) -> str:
@@ -82,6 +83,74 @@ def _encode_c_strings(values: tuple[str, ...]) -> _CStringArray:
     encoded = tuple(value.encode("utf-8") for value in values)
     pointers = (ctypes.c_char_p * len(encoded))(*encoded)
     return _CStringArray(encoded=encoded, pointers=pointers)
+
+
+def _run_rtc(
+    *,
+    source: str,
+    program_name: str,
+    options: tuple[str, ...],
+    success_code: int,
+    create_program: Callable[..., int],
+    compile_program: Callable[..., int],
+    get_program_log_size: Callable[..., int],
+    get_program_log: Callable[..., int],
+    destroy_program: Callable[..., int],
+    check: Callable[[int], None],
+    make_compile_error: Callable[[str], Exception],
+    extract_result: Callable[[ctypes.c_void_p, bytes | None], _ResultT],
+    name_expression: str | None = None,
+    add_name_expression: Callable[..., int] | None = None,
+) -> _ResultT:
+    """Compile and extract one runtime-compiler program."""
+    source_bytes = source.encode("utf-8")
+    program_name_bytes = program_name.encode("utf-8")
+    expression_bytes = (
+        name_expression.encode("utf-8")
+        if name_expression is not None
+        else None
+    )
+
+    program = ctypes.c_void_p()
+    check(
+        create_program(
+            ctypes.byref(program),
+            source_bytes,
+            program_name_bytes,
+            0,
+            None,
+            None,
+        )
+    )
+
+    try:
+        if expression_bytes is not None:
+            if add_name_expression is None:
+                raise RuntimeError(
+                    "name_expression requires add_name_expression"
+                )
+            check(add_name_expression(program, expression_bytes))
+
+        encoded_options = _encode_c_strings(options)
+        compile_result = compile_program(
+            program,
+            encoded_options.count,
+            encoded_options.pointers,
+        )
+        if compile_result != success_code:
+            log_size = ctypes.c_size_t()
+            check(get_program_log_size(program, ctypes.byref(log_size)))
+            if log_size.value == 0:
+                log = ""
+            else:
+                log_buffer = ctypes.create_string_buffer(log_size.value)
+                check(get_program_log(program, log_buffer))
+                log = _decode(log_buffer.value)
+            raise make_compile_error(log)
+
+        return extract_result(program, expression_bytes)
+    finally:
+        check(destroy_program(ctypes.byref(program)))
 
 
 @dataclass(slots=True)
