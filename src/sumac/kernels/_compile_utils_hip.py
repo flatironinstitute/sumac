@@ -596,8 +596,8 @@ def _hip_device_guard(device: int) -> Iterator[None]:
 
 
 class _HipBackend:
-    def initialize(self) -> None:
-        torch.cuda._lazy_init()
+    cleanup_failed_module = True
+    keep_image_alive = True
 
     def validate_launch(
         self,
@@ -623,7 +623,7 @@ class _HipBackend:
         if not 0 <= shared_mem < 2**31:
             raise ValueError("shared_mem must fit in a non-negative C int")
 
-    def resolve_launch_device(
+    def prepare_launch(
         self,
         arguments: list[Any],
         *,
@@ -631,6 +631,7 @@ class _HipBackend:
         requested_device: Any | None,
         default_device: int | None,
     ) -> int:
+        torch.cuda._lazy_init()
         return _launch_device(
             arguments,
             stream=stream,

@@ -6,6 +6,7 @@ import glob
 import os
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -14,11 +15,9 @@ from typing import Any, Optional
 import torch
 
 from ._compile_utils_common import (
-    _as_3tuple,
+    JitKernel,
     _decode,
-    _pack_kernel_args,
     _prepend_header,
-    _resolve_launch_args,
     _run_rtc,
 )
 
@@ -72,6 +71,8 @@ def _load_driver() -> ctypes.CDLL:
         ctypes.c_char_p,
     ]
     lib.cuModuleGetFunction.restype = ctypes.c_int
+    lib.cuModuleUnload.argtypes = [ctypes.c_void_p]
+    lib.cuModuleUnload.restype = ctypes.c_int
     lib.cuLaunchKernel.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint,
@@ -347,57 +348,146 @@ def _stream_ptr(stream: Any | None, device: int) -> int:
     return int(stream)
 
 
+class _CudaBackend:
+    cleanup_failed_module = False
+    keep_image_alive = False
+
+    def validate_launch(
+        self,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: Any,
+    ) -> None:
+        pass
+
+    def validate_dynamic_smem(self, shared_mem: Any) -> None:
+        pass
+
+    def prepare_launch(
+        self,
+        arguments: list[Any],
+        *,
+        stream: Any | None,
+        requested_device: Any | None,
+        default_device: int | None,
+    ) -> int:
+        device = _kernel_device(arguments)
+        torch.cuda._lazy_init()
+        return device
+
+    def device_guard(self, device: int) -> Any:
+        return nullcontext()
+
+    def runtime(self) -> ctypes.CDLL:
+        return _load_driver()
+
+    def stream_ptr(self, stream: Any | None, device: int) -> int:
+        return _stream_ptr(stream, device)
+
+    def convert_argument(self, argument: Any) -> ctypes._SimpleCData:
+        return _kernel_param(argument)
+
+    def load_module(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+        image_buffer: Any,
+    ) -> None:
+        _check_cuda(
+            runtime.cuModuleLoadData(ctypes.byref(module), image_buffer)
+        )
+
+    def get_function(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        module: ctypes.c_void_p,
+        *,
+        image: bytes,
+        kernel_name: str,
+        symbol_name: str,
+    ) -> None:
+        _check_cuda(
+            runtime.cuModuleGetFunction(
+                ctypes.byref(function),
+                module,
+                kernel_name.encode("utf-8"),
+            )
+        )
+
+    def set_dynamic_smem(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        size: int,
+    ) -> None:
+        _check_cuda(
+            runtime.cuFuncSetAttribute(
+                function,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                size,
+            )
+        )
+
+    def unload_module(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+    ) -> None:
+        _check_cuda(runtime.cuModuleUnload(module))
+
+    def unload_module_unchecked(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+    ) -> None:
+        runtime.cuModuleUnload(module)
+
+    def launch(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        *,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: int,
+        stream_ptr: int,
+        parameter_ptrs: Any,
+    ) -> None:
+        _check_cuda(
+            runtime.cuLaunchKernel(
+                function,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_mem,
+                ctypes.c_void_p(stream_ptr),
+                parameter_ptrs,
+                None,
+            )
+        )
+
+    def make_close_error(self, failures: list[Exception]) -> Exception:
+        return CudaJitError(
+            f"Failed to unload {len(failures)} CUDA module(s): {failures[0]}"
+        )
+
+
+_CUDA_BACKEND = _CudaBackend()
+
+
 @dataclass
-class CudaKernel:
+class CudaKernel(JitKernel):
     image: bytes
     kernel_name: str
     _modules: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _functions: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _max_dynamic_smem: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def _function_for_device(self, device: int) -> ctypes.c_void_p:
-        with self._lock:
-            if device in self._functions:
-                return self._functions[device]
-
-            lib = _load_driver()
-            module = ctypes.c_void_p()
-            image_buf = ctypes.create_string_buffer(self.image)
-            _check_cuda(lib.cuModuleLoadData(ctypes.byref(module), image_buf))
-
-            func = ctypes.c_void_p()
-            _check_cuda(
-                lib.cuModuleGetFunction(
-                    ctypes.byref(func),
-                    module,
-                    self.kernel_name.encode("utf-8"),
-                )
-            )
-            if self._max_dynamic_smem:
-                _check_cuda(
-                    lib.cuFuncSetAttribute(
-                        func,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        int(self._max_dynamic_smem),
-                    )
-                )
-
-            self._modules[device] = module
-            self._functions[device] = func
-            return func
-
-    def set_shared_memory_config(self, shared_mem: int) -> None:
-        self._max_dynamic_smem = max(self._max_dynamic_smem, int(shared_mem))
-        lib = _load_driver()
-        for func in self._functions.values():
-            _check_cuda(
-                lib.cuFuncSetAttribute(
-                    func,
-                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    int(self._max_dynamic_smem),
-                )
-            )
+    _backend = _CUDA_BACKEND
 
     def __call__(
         self,
@@ -408,42 +498,14 @@ class CudaKernel:
         shared_mem: int = 0,
         stream: Any | None = None,
     ) -> None:
-        grid, block, args = _resolve_launch_args(
-            launch_args,
+        super().__call__(
+            *launch_args,
             grid=grid,
             block=block,
             args=args,
+            shared_mem=shared_mem,
+            stream=stream,
         )
-
-        # torch.cuda.nvtx.range_push("kernel launch overhead")
-        grid3 = _as_3tuple(grid, "grid")
-        block3 = _as_3tuple(block, "block")
-        arg_list = list(args)
-        device = _kernel_device(arg_list)
-
-        torch.cuda._lazy_init()
-        func = self._function_for_device(device)
-        stream_ptr = _stream_ptr(stream, device)
-
-        packed_args = _pack_kernel_args(arg_list, _kernel_param)
-
-        lib = _load_driver()
-        _check_cuda(
-            lib.cuLaunchKernel(
-                func,
-                grid3[0],
-                grid3[1],
-                grid3[2],
-                block3[0],
-                block3[1],
-                block3[2],
-                int(shared_mem),
-                ctypes.c_void_p(stream_ptr),
-                packed_args.pointers,
-                None,
-            )
-        )
-        # torch.cuda.nvtx.range_pop()
 
 
 def compile_cuda_kernel(

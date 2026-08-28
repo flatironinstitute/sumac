@@ -177,7 +177,8 @@ def _pack_kernel_args(
 
 
 class _JitBackend(Protocol):
-    def initialize(self) -> None: ...
+    cleanup_failed_module: bool
+    keep_image_alive: bool
 
     def validate_launch(
         self,
@@ -188,7 +189,7 @@ class _JitBackend(Protocol):
 
     def validate_dynamic_smem(self, shared_mem: Any) -> None: ...
 
-    def resolve_launch_device(
+    def prepare_launch(
         self,
         arguments: list[Any],
         *,
@@ -289,7 +290,9 @@ class JitKernel:
 
                 try:
                     function = ctypes.c_void_p()
-                    symbol_name = self.symbol_name or self.kernel_name
+                    symbol_name = (
+                        getattr(self, "symbol_name", None) or self.kernel_name
+                    )
                     self._backend.get_function(
                         runtime,
                         function,
@@ -305,10 +308,12 @@ class JitKernel:
                             int(self._max_dynamic_smem),
                         )
                 except Exception:
-                    self._backend.unload_module_unchecked(runtime, module)
+                    if self._backend.cleanup_failed_module:
+                        self._backend.unload_module_unchecked(runtime, module)
                     raise
 
-            self._image_buffers[device] = image_buffer
+            if self._backend.keep_image_alive:
+                self._image_buffers[device] = image_buffer
             self._modules[device] = module
             self._functions[device] = function
             return function
@@ -332,7 +337,8 @@ class JitKernel:
 
                 self._modules.pop(device, None)
                 self._functions.pop(device, None)
-                self._image_buffers.pop(device, None)
+                if self._backend.keep_image_alive:
+                    self._image_buffers.pop(device, None)
 
             if failures:
                 raise self._backend.make_close_error(failures) from failures[0]
@@ -375,12 +381,11 @@ class JitKernel:
         self._backend.validate_launch(grid3, block3, shared_mem)
 
         argument_list = list(args)
-        self._backend.initialize()
-        launch_device = self._backend.resolve_launch_device(
+        launch_device = self._backend.prepare_launch(
             argument_list,
             stream=stream,
             requested_device=device,
-            default_device=self.default_device,
+            default_device=getattr(self, "default_device", None),
         )
         with self._backend.device_guard(launch_device):
             function = self._function_for_device(launch_device)
