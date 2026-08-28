@@ -1,11 +1,32 @@
+import pytest
 import torch
-from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused
-from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
-import pytest 
+
+
+IS_ROCM = getattr(torch.version, "hip", None) is not None
+
+if IS_ROCM:
+    from sumac.kernels.relu_bat_reduce_jit_amd.api import (
+        relu_bat_reduce_fp32_mfma,
+        relu_bat_reduce_fp32_mfma_available,
+    )
+    from sumac.kernels.relu_batc_jit_amd.api import (
+        relu_bat_c_fp32_mfma,
+        relu_bat_c_fp32_mfma_available,
+    )
+    from sumac.kernels.relu_batc_tf32_jit_amd.api import (
+        relu_bat_c_tf32_mfma,
+        relu_bat_c_tf32_mfma_available,
+    )
+else:
+    from sumac.kernels.relu_bat_reduce_jit.api import relu_bat_reduce_fused
+    from sumac.kernels.relu_batc_jit.api import relu_bat_c_fused
+    from sumac.kernels.relu_batc_tf32_jit.api import (
+        relu_bat_c_tf32_mma_sync,
+    )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None,
-    reason="custom CUDA kernel tests require an NVIDIA CUDA build",
+    not torch.cuda.is_available(),
+    reason="custom GPU kernel tests require a CUDA or ROCm accelerator",
 )
 
 FP32_MAX_ABS_ERROR = 5e-3
@@ -20,7 +41,8 @@ def relu_bat_c_tf32_reference(
     C: torch.Tensor,
 ) -> torch.Tensor:
     previous_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("high")
+    # Use the same full-FP32 reference for CUDA TF32 and AMD XF32.
+    torch.set_float32_matmul_precision("highest")
     try:
         return torch.relu(B @ A.T) @ C
     finally:
@@ -40,22 +62,34 @@ def assert_max_abs_close(
 
 @pytest.mark.parametrize("D", [13, 16, 17, 32, 64, 128])
 def test_relu_batc_kernel(D: int):
+    if IS_ROCM and not relu_bat_c_fp32_mfma_available(torch.device("cuda"), D):
+        pytest.skip(f"FP32 MFMA relu_bat_c kernel is unavailable for D={D}")
+
     N = 250
     M = 25000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
 
-    BM = 128
-    BK = 32
-    if D == 16:
-        MS = 4
-    elif D == 32:
-        MS = 2
+    if IS_ROCM:
+        result = relu_bat_c_fp32_mfma(
+            A,
+            B,
+            C,
+            BM=64,
+            BN=16,
+            M_TILES=1,
+            num_stages=1,
+        )
     else:
-        MS = 1
+        if D == 16:
+            MS = 4
+        elif D == 32:
+            MS = 2
+        else:
+            MS = 1
+        result = relu_bat_c_fused(A, B, C, BM=128, BK=32, MS=MS)
 
-    result = relu_bat_c_fused(A, B, C, BM=BM, BK=BK, MS=MS)
     reference = torch.relu(B @ A.T) @ C
 
     torch.cuda.synchronize()
@@ -76,17 +110,18 @@ def test_relu_batc_kernel(D: int):
         (64, 3, 250),
     ],
 )
-def test_relu_batc_tf32_mma_sync_kernel_max_abs(
+def test_relu_batc_tf32_kernel_max_abs(
     D: int,
     num_stages: int,
     N: int,
 ):
-    if torch.cuda.get_device_capability()[0] < 8:
+    if IS_ROCM:
+        if not relu_bat_c_tf32_mfma_available(torch.device("cuda"), D):
+            pytest.skip(
+                f"TF32/XF32 MFMA relu_bat_c kernel is unavailable for D={D}"
+            )
+    elif torch.cuda.get_device_capability()[0] < 8:
         pytest.skip("TF32 MMA sync kernel requires SM80 or newer")
-
-    from sumac.kernels.relu_batc_tf32_jit.api import (
-        relu_bat_c_tf32_mma_sync,
-    )
 
     torch.manual_seed(D)
     M = 25000
@@ -94,15 +129,27 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
     C = torch.randn(N, D, device="cuda", dtype=torch.float32)
 
-    result = relu_bat_c_tf32_mma_sync(
-        A,
-        B,
-        C,
-        BM=128,
-        BN=16,
-        M_TILES=2,
-        num_stages=num_stages,
-    )
+    if IS_ROCM:
+        result = relu_bat_c_tf32_mfma(
+            A,
+            B,
+            C,
+            BM=64,
+            BN=16,
+            M_TILES=1,
+            num_stages=num_stages,
+        )
+    else:
+        result = relu_bat_c_tf32_mma_sync(
+            A,
+            B,
+            C,
+            BM=128,
+            BN=16,
+            M_TILES=2,
+            num_stages=num_stages,
+        )
+
     reference = relu_bat_c_tf32_reference(A, B, C)
 
     torch.cuda.synchronize()
@@ -181,7 +228,7 @@ def test_relu_batc_tf32_mma_sync_kernel_max_abs(
     ],
 )
 def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
-    if torch.cuda.get_device_capability()[0] != 9:
+    if IS_ROCM or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("TF32 WGMMA kernel requires SM90")
 
     from sumac.kernels.relu_batc_tf32_jit.api import (
@@ -204,28 +251,58 @@ def test_relu_batc_tf32_wgmma_kernel_max_abs(D: int, params: dict):
 
 @pytest.mark.parametrize("D", [13, 16, 17, 32, 64, 128, 256])
 def test_relu_bat_reduce_kernel(D: int):
+    if IS_ROCM and not relu_bat_reduce_fp32_mfma_available(
+        torch.device("cuda"), D
+    ):
+        pytest.skip(f"FP32 MFMA relu_bat_reduce kernel is unavailable for D={D}")
+
     N = 250
     M = 25000
     A = torch.randn(N, D, device="cuda", dtype=torch.float32)
     B = torch.randn(M, D, device="cuda", dtype=torch.float32)
 
-    BM = 256
-    BK = 32
-    MS = 1
+    if IS_ROCM:
+        result_1, result_2 = relu_bat_reduce_fp32_mfma(
+            B,
+            A,
+            BM=64,
+            BN=16,
+            M_TILES=1,
+        )
+    else:
+        result_1, result_2 = relu_bat_reduce_fused(
+            B,
+            A,
+            BM=256,
+            BK=32,
+            MS=1,
+        )
 
-    result_1, result_2 = relu_bat_reduce_fused(B, A, BM=BM, BK=BK, MS=MS)
     tmp = torch.relu(B @ A.T)
     reference_1 = tmp.sum()
     reference_2 = (tmp * tmp).sum()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(result_1.squeeze(), reference_1)
-    torch.testing.assert_close(result_2.squeeze(), reference_2)
+    if IS_ROCM:
+        torch.testing.assert_close(
+            result_1.squeeze(), reference_1, rtol=2e-4, atol=1e-2
+        )
+        torch.testing.assert_close(
+            result_2.squeeze(), reference_2, rtol=2e-4, atol=1e-2
+        )
+    else:
+        torch.testing.assert_close(result_1.squeeze(), reference_1)
+        torch.testing.assert_close(result_2.squeeze(), reference_2)
 
 
 @pytest.mark.parametrize("D", [13, 16, 32])
 @pytest.mark.parametrize("include_sum_sr", [False, True])
 def test_relu_bat_reduce_kernel_backward(D: int, include_sum_sr: bool):
+    if IS_ROCM and not relu_bat_reduce_fp32_mfma_available(
+        torch.device("cuda"), D
+    ):
+        pytest.skip(f"FP32 MFMA relu_bat_reduce kernel is unavailable for D={D}")
+
     torch.manual_seed(D + int(include_sum_sr))
     M = 25000
     N = 250
@@ -234,11 +311,23 @@ def test_relu_bat_reduce_kernel_backward(D: int, include_sum_sr: bool):
     A_ref = A.detach().clone().requires_grad_(True)
     B_ref = B.detach().clone().requires_grad_(True)
 
-    BM = 128
-    BK = 32
-    MS = 1
+    if IS_ROCM:
+        sum_sr, sum_sr2 = relu_bat_reduce_fp32_mfma(
+            A,
+            B,
+            BM=64,
+            BN=16,
+            M_TILES=1,
+        )
+    else:
+        sum_sr, sum_sr2 = relu_bat_reduce_fused(
+            A,
+            B,
+            BM=128,
+            BK=32,
+            MS=1,
+        )
 
-    sum_sr, sum_sr2 = relu_bat_reduce_fused(A, B, BM=BM, BK=BK, MS=MS)
     loss = 1.3 * sum_sr2.squeeze()
     if include_sum_sr:
         loss = loss + 0.7 * sum_sr.squeeze()

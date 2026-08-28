@@ -11,11 +11,6 @@
 #endif
 
 // TF32 MFMA implementation of Y = ReLU(B A.T) C.
-//
-// A and C remain FP32 values; v_mfma_f32_16x16x8_xf32 applies the
-// TF32 input conversion. A packing kernel places both matrices into
-// the fragment layouts consumed by the two MFMA phases. We then use 
-// an async copy pipeline to overlap the loads to LDS with MFMA instructions.
 
 static constexpr int MFMA_M = 16;
 static constexpr int MFMA_N = 16;
@@ -91,6 +86,21 @@ union mfma_buffer_resource {
 __device__ __forceinline__ mfma_f32x4 mfma_zero_f32x4()
 {
     return mfma_f32x4{0.0f, 0.0f, 0.0f, 0.0f};
+}
+
+__device__ __forceinline__ float round_f32_to_xf32_rna(float value)
+{
+    // Page 43 of the CDNA 3 ISA reference states:
+    // "The XF32 instructions take 32-bit floats but round the mantissa to 10 bits
+    // in order to perform reduced-precision multiplication."
+    // However, page 264 says "... where mantissa is truncated to 10 bits".
+    // Numerical tests confirm the instruction uses truncation and not rounding. 
+    // We can improve accuracy of the kernel by adding half an XF32 ULP so that
+    // MFMA's final truncation implements round-to-nearest, ties-away-from-zero.
+    // We then get numerical behavior very close to our mma.sync and wgmma kernels.
+    unsigned int bits = __builtin_bit_cast(unsigned int, value);
+    bits += 0x00001000u;
+    return __builtin_bit_cast(float, bits);
 }
 
 __device__ __forceinline__ mfma_f32x4 mfma_m16n16k8_xf32(
@@ -270,7 +280,7 @@ void MFMA_TF32_PACK_KERNEL_NAME(
         a_fragment * OPERAND_FRAGMENT_ELEMS
         + a_lane * MFMA_INPUTS_PER_LANE
         + a_component;
-    A_packed[tile_offset + a_packed_idx] = a;
+    A_packed[tile_offset + a_packed_idx] = round_f32_to_xf32_rna(a);
 
     const int c_n_tile = panel_n / MFMA_N;
     const int c_n_in_tile = panel_n % MFMA_N;
@@ -288,7 +298,7 @@ void MFMA_TF32_PACK_KERNEL_NAME(
         c_fragment * OPERAND_FRAGMENT_ELEMS
         + c_lane * MFMA_INPUTS_PER_LANE
         + c_component;
-    C_packed[tile_offset + c_packed_idx] = c;
+    C_packed[tile_offset + c_packed_idx] = round_f32_to_xf32_rna(c);
 }
 
 extern "C" __global__
@@ -372,6 +382,22 @@ void MFMA_TF32_KERNEL_NAME(
                 C_pipeline);
         }
     }
+
+    // Apply the RNA bias to B
+    #pragma unroll
+    for (int m_tile = 0; m_tile < M_TILES; ++m_tile) {
+        #pragma unroll
+        for (int d_tile = 0; d_tile < D_K_TILES; ++d_tile) {
+            #pragma unroll
+            for (int component = 0;
+                 component < MFMA_INPUTS_PER_LANE;
+                 ++component) {
+                b_regs[m_tile][d_tile][component] = round_f32_to_xf32_rna(
+                    b_regs[m_tile][d_tile][component]);
+            }
+        }
+    }
+
     if constexpr (PIPELINE_STAGES == 3) {
         if (num_panels >= 3) {
             wait_direct_copy_groups<2>(wave);
@@ -428,7 +454,8 @@ void MFMA_TF32_KERNEL_NAME(
             for (int m_tile = 0; m_tile < M_TILES; ++m_tile) {
                 #pragma unroll
                 for (int r = 0; r < MFMA_OUTPUTS_PER_LANE; ++r) {
-                    score[m_tile][r] = fmaxf(score[m_tile][r], 0.0f);
+                    score[m_tile][r] = round_f32_to_xf32_rna(
+                        fmaxf(score[m_tile][r], 0.0f));
                 }
             }
 
