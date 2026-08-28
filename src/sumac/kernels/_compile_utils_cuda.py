@@ -16,10 +16,10 @@ import torch
 from ._compile_utils_common import (
     _as_3tuple,
     _decode,
-    _encode_c_strings,
     _pack_kernel_args,
     _prepend_header,
     _resolve_launch_args,
+    _run_rtc,
 )
 
 
@@ -208,17 +208,6 @@ def _check_nvrtc(code: int, lib: ctypes.CDLL | None = None) -> None:
     raise CudaJitError(f"NVRTC error {code}: {_decode(lib.nvrtcGetErrorString(code))}")
 
 
-def _program_log(lib: ctypes.CDLL, program: ctypes.c_void_p) -> str:
-    size = ctypes.c_size_t()
-    _check_nvrtc(lib.nvrtcGetProgramLogSize(program, ctypes.byref(size)), lib)
-    if size.value == 0:
-        return ""
-
-    buf = ctypes.create_string_buffer(size.value)
-    _check_nvrtc(lib.nvrtcGetProgramLog(program, buf), lib)
-    return _decode(buf.value)
-
-
 def _normalize_arch(compute_capability: Optional[str]) -> str:
     if compute_capability is None:
         torch.cuda._lazy_init()
@@ -262,6 +251,27 @@ def _nvrtc_options(
     return options
 
 
+def _extract_nvrtc_image(
+    lib: ctypes.CDLL,
+    program: ctypes.c_void_p,
+    *,
+    arch: str,
+) -> bytes:
+    if hasattr(lib, "nvrtcGetCUBINSize") and arch.startswith("sm_"):
+        size = ctypes.c_size_t()
+        _check_nvrtc(lib.nvrtcGetCUBINSize(program, ctypes.byref(size)), lib)
+        if size.value:
+            buffer = ctypes.create_string_buffer(size.value)
+            _check_nvrtc(lib.nvrtcGetCUBIN(program, buffer), lib)
+            return bytes(buffer.raw)
+
+    size = ctypes.c_size_t()
+    _check_nvrtc(lib.nvrtcGetPTXSize(program, ctypes.byref(size)), lib)
+    buffer = ctypes.create_string_buffer(size.value)
+    _check_nvrtc(lib.nvrtcGetPTX(program, buffer), lib)
+    return bytes(buffer.raw)
+
+
 @lru_cache(maxsize=None)
 def _compile_nvrtc_image(
     full_source: str,
@@ -271,51 +281,27 @@ def _compile_nvrtc_image(
     options: tuple[str, ...],
 ) -> bytes:
     lib = _load_nvrtc()
-    program = ctypes.c_void_p()
-    source = full_source.encode("utf-8")
-    name = f"{kernel_name}.cu".encode("utf-8")
-
-    _check_nvrtc(
-        lib.nvrtcCreateProgram(
-            ctypes.byref(program),
-            source,
-            name,
-            0,
-            None,
-            None,
+    return _run_rtc(
+        source=full_source,
+        program_name=f"{kernel_name}.cu",
+        options=options,
+        success_code=NVRTC_SUCCESS,
+        create_program=lib.nvrtcCreateProgram,
+        compile_program=lib.nvrtcCompileProgram,
+        get_program_log_size=lib.nvrtcGetProgramLogSize,
+        get_program_log=lib.nvrtcGetProgramLog,
+        destroy_program=lib.nvrtcDestroyProgram,
+        check=lambda code: _check_nvrtc(code, lib),
+        make_compile_error=lambda log: CudaJitError(
+            f"NVRTC failed compiling {kernel_name} for {arch}\n"
+            f"options: {' '.join(options)}\n{log}"
         ),
-        lib,
-    )
-
-    try:
-        encoded_options = _encode_c_strings(options)
-        result = lib.nvrtcCompileProgram(
+        extract_result=lambda program, _: _extract_nvrtc_image(
+            lib,
             program,
-            encoded_options.count,
-            encoded_options.pointers,
-        )
-        if result != NVRTC_SUCCESS:
-            log = _program_log(lib, program)
-            raise CudaJitError(
-                f"NVRTC failed compiling {kernel_name} for {arch}\n"
-                f"options: {' '.join(options)}\n{log}"
-            )
-
-        if hasattr(lib, "nvrtcGetCUBINSize") and arch.startswith("sm_"):
-            size = ctypes.c_size_t()
-            _check_nvrtc(lib.nvrtcGetCUBINSize(program, ctypes.byref(size)), lib)
-            if size.value:
-                buf = ctypes.create_string_buffer(size.value)
-                _check_nvrtc(lib.nvrtcGetCUBIN(program, buf), lib)
-                return bytes(buf.raw)
-
-        size = ctypes.c_size_t()
-        _check_nvrtc(lib.nvrtcGetPTXSize(program, ctypes.byref(size)), lib)
-        buf = ctypes.create_string_buffer(size.value)
-        _check_nvrtc(lib.nvrtcGetPTX(program, buf), lib)
-        return bytes(buf.raw)
-    finally:
-        _check_nvrtc(lib.nvrtcDestroyProgram(ctypes.byref(program)), lib)
+            arch=arch,
+        ),
+    )
 
 
 def _kernel_device(args: list[Any]) -> int:
