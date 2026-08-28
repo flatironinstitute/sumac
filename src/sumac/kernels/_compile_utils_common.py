@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import ctypes
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, ContextManager, Protocol, TypeVar
 
 
 _KernelArguments = list[Any] | tuple[Any, ...]
@@ -173,3 +174,229 @@ def _pack_kernel_args(
         values=values,
         pointers=pointers,
     )
+
+
+class _JitBackend(Protocol):
+    def initialize(self) -> None: ...
+
+    def validate_launch(
+        self,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: Any,
+    ) -> None: ...
+
+    def validate_dynamic_smem(self, shared_mem: Any) -> None: ...
+
+    def resolve_launch_device(
+        self,
+        arguments: list[Any],
+        *,
+        stream: Any | None,
+        requested_device: Any | None,
+        default_device: int | None,
+    ) -> int: ...
+
+    def device_guard(self, device: int) -> ContextManager[None]: ...
+
+    def runtime(self) -> Any: ...
+
+    def stream_ptr(self, stream: Any | None, device: int) -> int: ...
+
+    def convert_argument(self, argument: Any) -> Any: ...
+
+    def load_module(
+        self,
+        runtime: Any,
+        module: ctypes.c_void_p,
+        image_buffer: Any,
+    ) -> None: ...
+
+    def get_function(
+        self,
+        runtime: Any,
+        function: ctypes.c_void_p,
+        module: ctypes.c_void_p,
+        *,
+        image: bytes,
+        kernel_name: str,
+        symbol_name: str,
+    ) -> None: ...
+
+    def set_dynamic_smem(
+        self,
+        runtime: Any,
+        function: ctypes.c_void_p,
+        size: int,
+    ) -> None: ...
+
+    def unload_module(self, runtime: Any, module: ctypes.c_void_p) -> None: ...
+
+    def unload_module_unchecked(
+        self,
+        runtime: Any,
+        module: ctypes.c_void_p,
+    ) -> None: ...
+
+    def launch(
+        self,
+        runtime: Any,
+        function: ctypes.c_void_p,
+        *,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: int,
+        stream_ptr: int,
+        parameter_ptrs: Any,
+    ) -> None: ...
+
+    def make_close_error(self, failures: list[Exception]) -> Exception: ...
+
+
+class JitKernel:
+    """Backend-neutral state and orchestration for a runtime-compiled kernel."""
+
+    def __init__(
+        self,
+        image: bytes,
+        kernel_name: str,
+        *,
+        backend: _JitBackend,
+        default_device: int | None = None,
+        symbol_name: str | None = None,
+    ) -> None:
+        self.image = image
+        self.kernel_name = kernel_name
+        self.default_device = default_device
+        self.symbol_name = symbol_name
+        self._backend = backend
+        self._modules: dict[int, ctypes.c_void_p] = {}
+        self._functions: dict[int, ctypes.c_void_p] = {}
+        self._image_buffers: dict[int, Any] = {}
+        self._max_dynamic_smem = 0
+        self._lock = threading.Lock()
+
+    def _function_for_device(self, device: int) -> ctypes.c_void_p:
+        with self._lock:
+            if device in self._functions:
+                return self._functions[device]
+
+            runtime = self._backend.runtime()
+            with self._backend.device_guard(device):
+                module = ctypes.c_void_p()
+                image_buffer = ctypes.create_string_buffer(self.image)
+                self._backend.load_module(runtime, module, image_buffer)
+
+                try:
+                    function = ctypes.c_void_p()
+                    symbol_name = self.symbol_name or self.kernel_name
+                    self._backend.get_function(
+                        runtime,
+                        function,
+                        module,
+                        image=self.image,
+                        kernel_name=self.kernel_name,
+                        symbol_name=symbol_name,
+                    )
+                    if self._max_dynamic_smem:
+                        self._backend.set_dynamic_smem(
+                            runtime,
+                            function,
+                            int(self._max_dynamic_smem),
+                        )
+                except Exception:
+                    self._backend.unload_module_unchecked(runtime, module)
+                    raise
+
+            self._image_buffers[device] = image_buffer
+            self._modules[device] = module
+            self._functions[device] = function
+            return function
+
+    def close(self) -> None:
+        """Unload owned modules after callers have finished all kernel work.
+
+        The caller must ensure this does not race another launch and that any
+        outstanding work using these modules is safe to unload.
+        """
+        with self._lock:
+            runtime = self._backend.runtime()
+            failures: list[Exception] = []
+            for device, module in list(self._modules.items()):
+                try:
+                    with self._backend.device_guard(device):
+                        self._backend.unload_module(runtime, module)
+                except Exception as exc:
+                    failures.append(exc)
+                    continue
+
+                self._modules.pop(device, None)
+                self._functions.pop(device, None)
+                self._image_buffers.pop(device, None)
+
+            if failures:
+                raise self._backend.make_close_error(failures) from failures[0]
+
+    def set_shared_memory_config(self, shared_mem: int) -> None:
+        self._backend.validate_dynamic_smem(shared_mem)
+        with self._lock:
+            self._max_dynamic_smem = max(
+                self._max_dynamic_smem,
+                int(shared_mem),
+            )
+            runtime = self._backend.runtime()
+            for device, function in self._functions.items():
+                with self._backend.device_guard(device):
+                    self._backend.set_dynamic_smem(
+                        runtime,
+                        function,
+                        int(self._max_dynamic_smem),
+                    )
+
+    def __call__(
+        self,
+        *launch_args: Any,
+        grid: Any | None = None,
+        block: Any | None = None,
+        args: list[Any] | tuple[Any, ...] | None = None,
+        shared_mem: int = 0,
+        stream: Any | None = None,
+        device: Any | None = None,
+    ) -> None:
+        grid, block, args = _resolve_launch_args(
+            launch_args,
+            grid=grid,
+            block=block,
+            args=args,
+        )
+
+        grid3 = _as_3tuple(grid, "grid")
+        block3 = _as_3tuple(block, "block")
+        self._backend.validate_launch(grid3, block3, shared_mem)
+
+        argument_list = list(args)
+        self._backend.initialize()
+        launch_device = self._backend.resolve_launch_device(
+            argument_list,
+            stream=stream,
+            requested_device=device,
+            default_device=self.default_device,
+        )
+        with self._backend.device_guard(launch_device):
+            function = self._function_for_device(launch_device)
+            stream_pointer = self._backend.stream_ptr(stream, launch_device)
+            packed_args = _pack_kernel_args(
+                argument_list,
+                self._backend.convert_argument,
+            )
+
+            runtime = self._backend.runtime()
+            self._backend.launch(
+                runtime,
+                function,
+                grid=grid3,
+                block=block3,
+                shared_mem=int(shared_mem),
+                stream_ptr=stream_pointer,
+                parameter_ptrs=packed_args.pointers,
+            )

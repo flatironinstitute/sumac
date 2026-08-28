@@ -14,11 +14,9 @@ from typing import Any, Iterator, Optional
 import torch
 
 from ._compile_utils_common import (
-    _as_3tuple,
+    JitKernel,
     _decode,
-    _pack_kernel_args,
     _prepend_header,
-    _resolve_launch_args,
     _run_rtc,
 )
 
@@ -597,8 +595,173 @@ def _hip_device_guard(device: int) -> Iterator[None]:
             _check_hip(lib.hipSetDevice(previous.value), lib)
 
 
+class _HipBackend:
+    def initialize(self) -> None:
+        torch.cuda._lazy_init()
+
+    def validate_launch(
+        self,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: Any,
+    ) -> None:
+        uint32_limit = 2**32
+        for axis, (grid_dimension, block_dimension) in enumerate(
+            zip(grid, block, strict=True)
+        ):
+            if grid_dimension >= uint32_limit or block_dimension >= uint32_limit:
+                raise ValueError("HIP grid and block dimensions must fit in uint32")
+            if grid_dimension * block_dimension >= uint32_limit:
+                raise ValueError(
+                    "HIP gridDim * blockDim must be less than 2**32 on each axis; "
+                    f"axis {axis} is {grid_dimension} * {block_dimension}"
+                )
+        if not 0 <= shared_mem < uint32_limit:
+            raise ValueError("shared_mem must fit in uint32")
+
+    def validate_dynamic_smem(self, shared_mem: Any) -> None:
+        if not 0 <= shared_mem < 2**31:
+            raise ValueError("shared_mem must fit in a non-negative C int")
+
+    def resolve_launch_device(
+        self,
+        arguments: list[Any],
+        *,
+        stream: Any | None,
+        requested_device: Any | None,
+        default_device: int | None,
+    ) -> int:
+        return _launch_device(
+            arguments,
+            stream=stream,
+            requested_device=requested_device,
+            default_device=default_device,
+        )
+
+    def device_guard(self, device: int) -> Any:
+        return _hip_device_guard(device)
+
+    def runtime(self) -> ctypes.CDLL:
+        return _load_hip_runtime()
+
+    def stream_ptr(self, stream: Any | None, device: int) -> int:
+        return _stream_ptr(stream, device)
+
+    def convert_argument(self, argument: Any) -> ctypes._SimpleCData:
+        return _kernel_param(argument)
+
+    def load_module(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+        image_buffer: Any,
+    ) -> None:
+        _check_hip(
+            runtime.hipModuleLoadData(ctypes.byref(module), image_buffer),
+            runtime,
+        )
+
+    def get_function(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        module: ctypes.c_void_p,
+        *,
+        image: bytes,
+        kernel_name: str,
+        symbol_name: str,
+    ) -> None:
+        try:
+            _check_hip(
+                runtime.hipModuleGetFunction(
+                    ctypes.byref(function),
+                    module,
+                    symbol_name.encode("utf-8"),
+                ),
+                runtime,
+            )
+        except HipJitError as exc:
+            diagnostics = _module_lookup_diagnostics(
+                runtime,
+                module,
+                image,
+                kernel_name,
+                symbol_name,
+            )
+            raise HipJitError(
+                f"Failed to resolve HIP kernel {kernel_name!r} "
+                f"as lowered symbol {symbol_name!r}: {exc}\n"
+                f"{diagnostics}"
+            ) from exc
+
+    def set_dynamic_smem(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        size: int,
+    ) -> None:
+        _check_hip(
+            runtime.hipFuncSetAttribute(
+                function,
+                HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_MEMORY_SIZE,
+                size,
+            ),
+            runtime,
+        )
+
+    def unload_module(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+    ) -> None:
+        _check_hip(runtime.hipModuleUnload(module), runtime)
+
+    def unload_module_unchecked(
+        self,
+        runtime: ctypes.CDLL,
+        module: ctypes.c_void_p,
+    ) -> None:
+        runtime.hipModuleUnload(module)
+
+    def launch(
+        self,
+        runtime: ctypes.CDLL,
+        function: ctypes.c_void_p,
+        *,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        shared_mem: int,
+        stream_ptr: int,
+        parameter_ptrs: Any,
+    ) -> None:
+        _check_hip(
+            runtime.hipModuleLaunchKernel(
+                function,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_mem,
+                ctypes.c_void_p(stream_ptr),
+                parameter_ptrs,
+                None,
+            ),
+            runtime,
+        )
+
+    def make_close_error(self, failures: list[Exception]) -> Exception:
+        return HipJitError(
+            f"Failed to unload {len(failures)} HIP module(s): {failures[0]}"
+        )
+
+
+_HIP_BACKEND = _HipBackend()
+
+
 @dataclass
-class HipKernel:
+class HipKernel(JitKernel):
     image: bytes
     kernel_name: str
     gpu_arch: str
@@ -609,105 +772,7 @@ class HipKernel:
     _image_buffers: dict[int, Any] = field(default_factory=dict)
     _max_dynamic_smem: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def _function_for_device(self, device: int) -> ctypes.c_void_p:
-        with self._lock:
-            if device in self._functions:
-                return self._functions[device]
-
-            lib = _load_hip_runtime()
-            with _hip_device_guard(device):
-                module = ctypes.c_void_p()
-                image_buf = ctypes.create_string_buffer(self.image)
-                _check_hip(lib.hipModuleLoadData(ctypes.byref(module), image_buf), lib)
-
-                try:
-                    function = ctypes.c_void_p()
-                    symbol_name = self.symbol_name or self.kernel_name
-                    try:
-                        _check_hip(
-                            lib.hipModuleGetFunction(
-                                ctypes.byref(function),
-                                module,
-                                symbol_name.encode("utf-8"),
-                            ),
-                            lib,
-                        )
-                    except HipJitError as exc:
-                        diagnostics = _module_lookup_diagnostics(
-                            lib,
-                            module,
-                            self.image,
-                            self.kernel_name,
-                            symbol_name,
-                        )
-                        raise HipJitError(
-                            f"Failed to resolve HIP kernel {self.kernel_name!r} "
-                            f"as lowered symbol {symbol_name!r}: {exc}\n"
-                            f"{diagnostics}"
-                        ) from exc
-                    if self._max_dynamic_smem:
-                        _check_hip(
-                            lib.hipFuncSetAttribute(
-                                function,
-                                HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_MEMORY_SIZE,
-                                int(self._max_dynamic_smem),
-                            ),
-                            lib,
-                        )
-                except Exception:
-                    # Preserve the original lookup/attribute error. Unloading is
-                    # best effort on this partial-construction path.
-                    lib.hipModuleUnload(module)
-                    raise
-
-            self._image_buffers[device] = image_buf
-            self._modules[device] = module
-            self._functions[device] = function
-            return function
-
-    def close(self) -> None:
-        """Unload owned modules after callers have finished all kernel work.
-
-        The caller must ensure this does not race another launch and that any
-        outstanding work using these modules is safe to unload.
-        """
-        with self._lock:
-            lib = _load_hip_runtime()
-            failures: list[Exception] = []
-            for device, module in list(self._modules.items()):
-                try:
-                    with _hip_device_guard(device):
-                        _check_hip(lib.hipModuleUnload(module), lib)
-                except Exception as exc:
-                    failures.append(exc)
-                    continue
-
-                self._modules.pop(device, None)
-                self._functions.pop(device, None)
-                self._image_buffers.pop(device, None)
-
-            if failures:
-                raise HipJitError(
-                    f"Failed to unload {len(failures)} HIP module(s): {failures[0]}"
-                ) from failures[0]
-
-    def set_shared_memory_config(self, shared_mem: int) -> None:
-        if not 0 <= shared_mem < 2**31:
-            raise ValueError("shared_mem must fit in a non-negative C int")
-        with self._lock:
-            self._max_dynamic_smem = max(self._max_dynamic_smem, int(shared_mem))
-            lib = _load_hip_runtime()
-            for device, function in self._functions.items():
-                with _hip_device_guard(device):
-                    _check_hip(
-                        lib.hipFuncSetAttribute(
-                            function,
-                            HIP_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_MEMORY_SIZE,
-                            int(self._max_dynamic_smem),
-                        ),
-                        lib,
-                    )
+    _backend = _HIP_BACKEND
 
     def __call__(
         self,
@@ -726,59 +791,15 @@ class HipKernel:
         type. Raw integer stream handles have no device metadata; pair them with
         tensor arguments, a compile-time default device, or ``device=``.
         """
-        grid, block, args = _resolve_launch_args(
-            launch_args,
+        super().__call__(
+            *launch_args,
             grid=grid,
             block=block,
             args=args,
-        )
-
-        grid3 = _as_3tuple(grid, "grid")
-        block3 = _as_3tuple(block, "block")
-        uint32_limit = 2**32
-        for axis, (grid_dimension, block_dimension) in enumerate(
-            zip(grid3, block3, strict=True)
-        ):
-            if grid_dimension >= uint32_limit or block_dimension >= uint32_limit:
-                raise ValueError("HIP grid and block dimensions must fit in uint32")
-            if grid_dimension * block_dimension >= uint32_limit:
-                raise ValueError(
-                    "HIP gridDim * blockDim must be less than 2**32 on each axis; "
-                    f"axis {axis} is {grid_dimension} * {block_dimension}"
-                )
-        if not 0 <= shared_mem < uint32_limit:
-            raise ValueError("shared_mem must fit in uint32")
-
-        arg_list = list(args)
-        torch.cuda._lazy_init()
-        launch_device = _launch_device(
-            arg_list,
+            shared_mem=shared_mem,
             stream=stream,
-            requested_device=device,
-            default_device=self.default_device,
+            device=device,
         )
-        with _hip_device_guard(launch_device):
-            function = self._function_for_device(launch_device)
-            stream_ptr = _stream_ptr(stream, launch_device)
-            packed_args = _pack_kernel_args(arg_list, _kernel_param)
-
-            lib = _load_hip_runtime()
-            _check_hip(
-                lib.hipModuleLaunchKernel(
-                    function,
-                    grid3[0],
-                    grid3[1],
-                    grid3[2],
-                    block3[0],
-                    block3[1],
-                    block3[2],
-                    int(shared_mem),
-                    ctypes.c_void_p(stream_ptr),
-                    packed_args.pointers,
-                    None,
-                ),
-                lib,
-            )
 
 
 def compile_hip_kernel(
