@@ -13,6 +13,15 @@ from typing import Any, Optional
 
 import torch
 
+from ._compile_utils_common import (
+    _as_3tuple,
+    _decode,
+    _encode_c_strings,
+    _pack_kernel_args,
+    _prepend_header,
+    _resolve_launch_args,
+)
+
 
 CUDA_SUCCESS = 0
 NVRTC_SUCCESS = 0
@@ -22,10 +31,6 @@ _get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 class CudaJitError(RuntimeError):
     pass
-
-
-def _decode(value: bytes | None) -> str:
-    return value.decode("utf-8", errors="replace") if value else "<unknown>"
 
 
 def _find_library(candidates: list[str], names: list[str]) -> str:
@@ -283,9 +288,12 @@ def _compile_nvrtc_image(
     )
 
     try:
-        opt_bytes = [opt.encode("utf-8") for opt in options]
-        opt_array = (ctypes.c_char_p * len(opt_bytes))(*opt_bytes)
-        result = lib.nvrtcCompileProgram(program, len(opt_bytes), opt_array)
+        encoded_options = _encode_c_strings(options)
+        result = lib.nvrtcCompileProgram(
+            program,
+            encoded_options.count,
+            encoded_options.pointers,
+        )
         if result != NVRTC_SUCCESS:
             log = _program_log(lib, program)
             raise CudaJitError(
@@ -308,25 +316,6 @@ def _compile_nvrtc_image(
         return bytes(buf.raw)
     finally:
         _check_nvrtc(lib.nvrtcDestroyProgram(ctypes.byref(program)), lib)
-
-
-def _as_3tuple(value: Any, name: str) -> tuple[int, int, int]:
-    if isinstance(value, int):
-        out = (value, 1, 1)
-    else:
-        items = tuple(value)
-        if len(items) == 1:
-            out = (int(items[0]), 1, 1)
-        elif len(items) == 2:
-            out = (int(items[0]), int(items[1]), 1)
-        elif len(items) == 3:
-            out = (int(items[0]), int(items[1]), int(items[2]))
-        else:
-            raise ValueError(f"{name} must have 1, 2, or 3 dimensions")
-
-    if any(dim <= 0 for dim in out):
-        raise ValueError(f"{name} dimensions must be positive, got {out}")
-    return out
 
 
 def _kernel_device(args: list[Any]) -> int:
@@ -433,26 +422,12 @@ class CudaKernel:
         shared_mem: int = 0,
         stream: Any | None = None,
     ) -> None:
-        if launch_args:
-            if len(launch_args) > 3:
-                raise TypeError("kernel launch accepts at most grid, block, args")
-            if len(launch_args) >= 1:
-                if grid is not None:
-                    raise TypeError("kernel launch got multiple values for grid")
-                grid = launch_args[0]
-            if len(launch_args) >= 2:
-                if block is not None:
-                    raise TypeError("kernel launch got multiple values for block")
-                block = launch_args[1]
-            if len(launch_args) >= 3:
-                if args is not None:
-                    raise TypeError("kernel launch got multiple values for args")
-                args = launch_args[2]
-
-        if grid is None or block is None or args is None:
-            raise TypeError("kernel launch requires grid, block, and args")
-        if not isinstance(args, (list, tuple)):
-            raise TypeError("kernel launch args must be a list or tuple")
+        grid, block, args = _resolve_launch_args(
+            launch_args,
+            grid=grid,
+            block=block,
+            args=args,
+        )
 
         # torch.cuda.nvtx.range_push("kernel launch overhead")
         grid3 = _as_3tuple(grid, "grid")
@@ -464,10 +439,7 @@ class CudaKernel:
         func = self._function_for_device(device)
         stream_ptr = _stream_ptr(stream, device)
 
-        values = [_kernel_param(arg) for arg in arg_list]
-        param_ptrs = (ctypes.c_void_p * len(values))()
-        for i, value in enumerate(values):
-            param_ptrs[i] = ctypes.c_void_p(ctypes.addressof(value))
+        packed_args = _pack_kernel_args(arg_list, _kernel_param)
 
         lib = _load_driver()
         _check_cuda(
@@ -481,7 +453,7 @@ class CudaKernel:
                 block3[2],
                 int(shared_mem),
                 ctypes.c_void_p(stream_ptr),
-                param_ptrs,
+                packed_args.pointers,
                 None,
             )
         )
@@ -497,9 +469,7 @@ def compile_cuda_kernel(
     cuda_include_dirs: Optional[list[str]] = None,
     nvcc_options: Optional[list[str]] = None,
 ) -> CudaKernel:
-    if header_code:
-        sep = "" if header_code.endswith("\n") else "\n"
-        kernel_source = header_code + sep + kernel_source
+    kernel_source = _prepend_header(kernel_source, header_code)
 
     arch = _normalize_arch(compute_capability)
     options = tuple(

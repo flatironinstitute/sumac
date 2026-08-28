@@ -13,6 +13,15 @@ from typing import Any, Iterator, Optional
 
 import torch
 
+from ._compile_utils_common import (
+    _as_3tuple,
+    _decode,
+    _encode_c_strings,
+    _pack_kernel_args,
+    _prepend_header,
+    _resolve_launch_args,
+)
+
 
 HIP_SUCCESS = 0
 HIPRTC_SUCCESS = 0
@@ -22,10 +31,6 @@ _get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 class HipJitError(RuntimeError):
     pass
-
-
-def _decode(value: bytes | None) -> str:
-    return value.decode("utf-8", errors="replace") if value else "<unknown>"
 
 
 def _rocm_roots() -> list[Path]:
@@ -444,9 +449,12 @@ def _compile_hiprtc_image(
             lib.hiprtcAddNameExpression(program, name_expression),
             lib,
         )
-        option_bytes = [option.encode("utf-8") for option in options]
-        option_array = (ctypes.c_char_p * len(option_bytes))(*option_bytes)
-        result = lib.hiprtcCompileProgram(program, len(option_bytes), option_array)
+        encoded_options = _encode_c_strings(options)
+        result = lib.hiprtcCompileProgram(
+            program,
+            encoded_options.count,
+            encoded_options.pointers,
+        )
         if result != HIPRTC_SUCCESS:
             log = _hiprtc_program_log(lib, program)
             raise HipJitError(
@@ -480,25 +488,6 @@ def _compile_hiprtc_image(
         return bytes(buf.raw), symbol_name
     finally:
         _check_hiprtc(lib.hiprtcDestroyProgram(ctypes.byref(program)), lib)
-
-
-def _as_3tuple(value: Any, name: str) -> tuple[int, int, int]:
-    if isinstance(value, int):
-        result = (value, 1, 1)
-    else:
-        items = tuple(value)
-        if len(items) == 1:
-            result = (int(items[0]), 1, 1)
-        elif len(items) == 2:
-            result = (int(items[0]), int(items[1]), 1)
-        elif len(items) == 3:
-            result = (int(items[0]), int(items[1]), int(items[2]))
-        else:
-            raise ValueError(f"{name} must have 1, 2, or 3 dimensions")
-
-    if any(dimension <= 0 for dimension in result):
-        raise ValueError(f"{name} dimensions must be positive, got {result}")
-    return result
 
 
 def _kernel_device(args: list[Any]) -> int:
@@ -747,26 +736,12 @@ class HipKernel:
         type. Raw integer stream handles have no device metadata; pair them with
         tensor arguments, a compile-time default device, or ``device=``.
         """
-        if launch_args:
-            if len(launch_args) > 3:
-                raise TypeError("kernel launch accepts at most grid, block, args")
-            if len(launch_args) >= 1:
-                if grid is not None:
-                    raise TypeError("kernel launch got multiple values for grid")
-                grid = launch_args[0]
-            if len(launch_args) >= 2:
-                if block is not None:
-                    raise TypeError("kernel launch got multiple values for block")
-                block = launch_args[1]
-            if len(launch_args) >= 3:
-                if args is not None:
-                    raise TypeError("kernel launch got multiple values for args")
-                args = launch_args[2]
-
-        if grid is None or block is None or args is None:
-            raise TypeError("kernel launch requires grid, block, and args")
-        if not isinstance(args, (list, tuple)):
-            raise TypeError("kernel launch args must be a list or tuple")
+        grid, block, args = _resolve_launch_args(
+            launch_args,
+            grid=grid,
+            block=block,
+            args=args,
+        )
 
         grid3 = _as_3tuple(grid, "grid")
         block3 = _as_3tuple(block, "block")
@@ -795,10 +770,7 @@ class HipKernel:
         with _hip_device_guard(launch_device):
             function = self._function_for_device(launch_device)
             stream_ptr = _stream_ptr(stream, launch_device)
-            values = [_kernel_param(arg) for arg in arg_list]
-            param_ptrs = (ctypes.c_void_p * len(values))()
-            for index, value in enumerate(values):
-                param_ptrs[index] = ctypes.c_void_p(ctypes.addressof(value))
+            packed_args = _pack_kernel_args(arg_list, _kernel_param)
 
             lib = _load_hip_runtime()
             _check_hip(
@@ -812,7 +784,7 @@ class HipKernel:
                     block3[2],
                     int(shared_mem),
                     ctypes.c_void_p(stream_ptr),
-                    param_ptrs,
+                    packed_args.pointers,
                     None,
                 ),
                 lib,
@@ -829,9 +801,7 @@ def compile_hip_kernel(
     hip_include_dirs: Optional[list[str]] = None,
     hip_options: Optional[list[str]] = None,
 ) -> HipKernel:
-    if header_code:
-        separator = "" if header_code.endswith("\n") else "\n"
-        kernel_source = header_code + separator + kernel_source
+    kernel_source = _prepend_header(kernel_source, header_code)
 
     default_device = None
     if device is not None or gpu_arch is None:
