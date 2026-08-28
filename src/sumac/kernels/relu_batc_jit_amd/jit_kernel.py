@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from ..compile_utils_hip import compile_hip_kernel, hip_device_arch
+from ..compile_utils import compile_hip_kernel, hip_device_arch
 
 
 _KERNEL_PATH_MFMA = Path(__file__).with_name("kernel_mfma.cpp")
