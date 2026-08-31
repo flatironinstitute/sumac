@@ -30,8 +30,7 @@ python -m pip install -e ".[cuda]"
 ```
 
 For a ROCm install, first install a ROCm build of PyTorch together with the
-matching Triton package supplied by that PyTorch distribution. Then install the
-ROCm autotuning dependency and make the toolkit libraries discoverable:
+matching Triton package supplied by that PyTorch distribution. Then install SUMAC with the ROCm extra.
 
 ```bash
 export ROCM_HOME=/path/to/rocm
