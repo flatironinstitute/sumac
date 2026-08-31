@@ -94,7 +94,7 @@ __device__ __forceinline__ float round_f32_to_xf32_rna(float value)
     // "The XF32 instructions take 32-bit floats but round the mantissa to 10 bits
     // in order to perform reduced-precision multiplication."
     // However, page 264 says "... where mantissa is truncated to 10 bits".
-    // Numerical tests confirm the instruction uses truncation and not rounding. 
+    // Numerical tests confirm the instruction uses truncation and not rounding.
     // We can improve accuracy of the kernel by adding half an XF32 ULP so that
     // MFMA's final truncation implements round-to-nearest, ties-away-from-zero.
     // We then get numerical behavior very close to our mma.sync and wgmma kernels.

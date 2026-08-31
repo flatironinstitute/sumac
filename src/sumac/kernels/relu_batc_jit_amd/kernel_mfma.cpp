@@ -119,7 +119,7 @@ __device__ __forceinline__ void direct_copy_wave_dword(
         __builtin_amdgcn_readfirstlane(lds_address);
 
     // CDNA buffer_loads load directly into LDS, without staging through registers,
-    // similar to PTX's cp.async. 
+    // similar to PTX's cp.async.
     asm volatile(
         "s_mov_b32 m0, %0\n\t"
         "s_nop 0\n\t"
