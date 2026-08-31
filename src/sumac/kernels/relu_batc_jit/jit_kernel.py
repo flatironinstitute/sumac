@@ -42,7 +42,7 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
 
 
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_float4(BK, V, MS, *, device: int):
+def get_relu_bat_c_kernel_float4(BK, V, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
  
     header_code = (
@@ -60,14 +60,13 @@ def get_relu_bat_c_kernel_float4(BK, V, MS, *, device: int):
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_float4_sync",
         header_code=header_code,
-        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
 
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_mixed(BK, V, R, MS, *, device: int):
+def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
     header_code = (
         f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
@@ -84,7 +83,6 @@ def get_relu_bat_c_kernel_mixed(BK, V, R, MS, *, device: int):
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_mixed_sync",
         header_code= header_code,
-        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
@@ -123,11 +121,10 @@ def relu_bat_c_fused(
 
 
     Y = torch.empty((M, D), device=A.device, dtype=A.dtype)
-    device = int(A.device.index)
     kernel = (
-        get_relu_bat_c_kernel_float4(BK, V, MS, device=device)
+        get_relu_bat_c_kernel_float4(BK, V, MS)
         if R == 0
-        else get_relu_bat_c_kernel_mixed(BK, V, R, MS, device=device)
+        else get_relu_bat_c_kernel_mixed(BK, V, R, MS)
     )
     torch.cuda.nvtx.range_pop()
     

@@ -57,13 +57,11 @@ def test_vector_add_and_compile_caches():
     kernel = compile_kernel(
         VECTOR_ADD_SOURCE,
         kernel_name=kernel_name,
-        device=device,
     )
     cache_after_first_compile = compile_image_cache.cache_info()
     cached_kernel = compile_kernel(
         VECTOR_ADD_SOURCE,
         kernel_name=kernel_name,
-        device=device,
     )
     cache_after_second_compile = compile_image_cache.cache_info()
 
@@ -119,7 +117,6 @@ def test_syntax_error_includes_rtc_log():
         compile_kernel(
             INVALID_SOURCE,
             kernel_name=kernel_name,
-            device=torch.cuda.current_device(),
         )
 
     message = str(exc_info.value)

@@ -205,7 +205,6 @@ class _JitBackend(Protocol):
         *,
         stream: Any | None,
         requested_device: Any | None,
-        default_device: int | None,
     ) -> int: ...
 
     def device_guard(self, device: int) -> ContextManager[None]: ...
@@ -360,7 +359,6 @@ class JitKernel:
             argument_list,
             stream=stream,
             requested_device=device,
-            default_device=getattr(self, "default_device", None),
         )
         with self._backend.device_guard(launch_device):
             function = self._function_for_device(launch_device)

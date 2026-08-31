@@ -225,11 +225,10 @@ def _device_index(device: Any | None = None) -> int:
 
 def _normalize_arch(
     compute_capability: Optional[str],
-    device: Any | None = None,
 ) -> str:
     if compute_capability is None:
         torch.cuda._lazy_init()
-        major, minor = torch.cuda.get_device_capability(_device_index(device))
+        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
         return f"sm_{major}{minor}"
 
     cc = str(compute_capability).strip().lower()
@@ -361,23 +360,11 @@ def _launch_device(
     *,
     stream: Any | None,
     requested_device: Any | None,
-    default_device: int | None,
 ) -> int:
     tensor_device = _kernel_device(args)
     if stream is None and requested_device is None:
-        if (
-            tensor_device is not None
-            and default_device is not None
-            and tensor_device != default_device
-        ):
-            raise ValueError(
-                "CUDA launch tensors must use the device for which the kernel "
-                f"was compiled; got {tensor_device} and {default_device}"
-            )
         if tensor_device is not None:
             return tensor_device
-        if default_device is not None:
-            return default_device
         return int(torch.cuda.current_device())
 
     stream_device = _stream_device(stream)
@@ -391,20 +378,16 @@ def _launch_device(
             tensor_device,
             stream_device,
             explicit_device,
-            default_device,
         )
         if device is not None
     }
     if len(devices) > 1:
         raise ValueError(
-            "CUDA launch tensors, stream, explicit device, and compile device "
-            "must use the same "
+            "CUDA launch tensors, stream, and explicit device must use the same "
             f"device; got {sorted(devices)}"
         )
     if devices:
         return devices.pop()
-    if default_device is not None:
-        return default_device
     return int(torch.cuda.current_device())
 
 
@@ -464,14 +447,12 @@ class _CudaBackend:
         *,
         stream: Any | None,
         requested_device: Any | None,
-        default_device: int | None,
     ) -> int:
         torch.cuda._lazy_init()
         return _launch_device(
             arguments,
             stream=stream,
             requested_device=requested_device,
-            default_device=default_device,
         )
 
     def device_guard(self, device: int) -> Any:
@@ -570,7 +551,6 @@ _CUDA_BACKEND = _CudaBackend()
 class CudaKernel(JitKernel):
     image: bytes
     kernel_name: str
-    default_device: int | None = field(default=None, kw_only=True)
     _modules: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _functions: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _max_dynamic_smem: int = 0
@@ -604,24 +584,13 @@ def compile_cuda_kernel(
     kernel_name: str,
     header_code: str = "",
     compute_capability: Optional[str] = None,
-    device: Any | None = None,
     cuda_include_dirs: Optional[list[str]] = None,
     nvcc_options: Optional[list[str]] = None,
 ) -> CudaKernel:
-    """Compile a CUDA kernel for an explicit target or device.
-
-    A kernel whose target is inferred from a device, or which is given an
-    explicit ``device``, is bound to that device. An explicit
-    ``compute_capability`` without ``device`` may be loaded on any compatible
-    CUDA device.
-    """
+    """Compile for an explicit target, or the current device's target if omitted."""
     kernel_source = _prepend_header(kernel_source, header_code)
 
-    default_device = None
-    if device is not None or compute_capability is None:
-        default_device = _device_index(device)
-
-    arch = _normalize_arch(compute_capability, default_device)
+    arch = _normalize_arch(compute_capability)
     options = tuple(
         _nvrtc_options(
             arch=arch,
@@ -638,5 +607,4 @@ def compile_cuda_kernel(
     return CudaKernel(
         image=image,
         kernel_name=kernel_name,
-        default_device=default_device,
     )

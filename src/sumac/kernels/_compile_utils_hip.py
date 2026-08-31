@@ -359,9 +359,9 @@ def hip_device_arch(device: Any | None = None) -> str:
     return arch
 
 
-def _normalize_arch(gpu_arch: Optional[str], device: Any | None = None) -> str:
+def _normalize_arch(gpu_arch: Optional[str]) -> str:
     if gpu_arch is None:
-        return hip_device_arch(device)
+        return hip_device_arch()
 
     arch = str(gpu_arch).strip()
     for prefix in ("--gpu-architecture=", "--offload-arch="):
@@ -512,7 +512,6 @@ def _launch_device(
     *,
     stream: Any | None,
     requested_device: Any | None,
-    default_device: int | None,
 ) -> int:
     tensor_device = _kernel_device(args) if any(
         isinstance(arg, torch.Tensor) for arg in args
@@ -534,8 +533,6 @@ def _launch_device(
         )
     if devices:
         return devices.pop()
-    if default_device is not None:
-        return default_device
     return int(torch.cuda.current_device())
 
 
@@ -628,14 +625,12 @@ class _HipBackend:
         *,
         stream: Any | None,
         requested_device: Any | None,
-        default_device: int | None,
     ) -> int:
         torch.cuda._lazy_init()
         return _launch_device(
             arguments,
             stream=stream,
             requested_device=requested_device,
-            default_device=default_device,
         )
 
     def device_guard(self, device: int) -> Any:
@@ -753,7 +748,6 @@ class HipKernel(JitKernel):
     image: bytes
     kernel_name: str
     gpu_arch: str
-    default_device: int | None = None
     symbol_name: str | None = None
     _modules: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _functions: dict[int, ctypes.c_void_p] = field(default_factory=dict)
@@ -777,7 +771,8 @@ class HipKernel(JitKernel):
         Plain Python integers and floats map to 32-bit C ``int`` and ``float``
         arguments. Pass an explicit ``ctypes`` scalar for any other kernel ABI
         type. Raw integer stream handles have no device metadata; pair them with
-        tensor arguments, a compile-time default device, or ``device=``.
+        tensor arguments or ``device=`` when they do not belong to the current
+        device.
         """
         super().__call__(
             *launch_args,
@@ -796,17 +791,13 @@ def compile_hip_kernel(
     kernel_name: str,
     header_code: str = "",
     gpu_arch: Optional[str] = None,
-    device: Any | None = None,
     hip_include_dirs: Optional[list[str]] = None,
     hip_options: Optional[list[str]] = None,
 ) -> HipKernel:
+    """Compile for an explicit target, or the current device's target if omitted."""
     kernel_source = _prepend_header(kernel_source, header_code)
 
-    default_device = None
-    if device is not None or gpu_arch is None:
-        default_device = _device_index(device)
-
-    arch = _normalize_arch(gpu_arch, default_device)
+    arch = _normalize_arch(gpu_arch)
     options = tuple(
         _hiprtc_options(
             arch=arch,
@@ -824,7 +815,6 @@ def compile_hip_kernel(
         image=image,
         kernel_name=kernel_name,
         gpu_arch=arch,
-        default_device=default_device,
         symbol_name=symbol_name,
     )
 
