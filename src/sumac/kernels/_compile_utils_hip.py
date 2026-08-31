@@ -596,7 +596,6 @@ def _hip_device_guard(device: int) -> Iterator[None]:
 
 
 class _HipBackend:
-    cleanup_failed_module = True
     keep_image_alive = True
 
     def validate_launch(
@@ -710,13 +709,6 @@ class _HipBackend:
             runtime,
         )
 
-    def unload_module(
-        self,
-        runtime: ctypes.CDLL,
-        module: ctypes.c_void_p,
-    ) -> None:
-        _check_hip(runtime.hipModuleUnload(module), runtime)
-
     def unload_module_unchecked(
         self,
         runtime: ctypes.CDLL,
@@ -750,11 +742,6 @@ class _HipBackend:
                 None,
             ),
             runtime,
-        )
-
-    def make_close_error(self, failures: list[Exception]) -> Exception:
-        return HipJitError(
-            f"Failed to unload {len(failures)} HIP module(s): {failures[0]}"
         )
 
 

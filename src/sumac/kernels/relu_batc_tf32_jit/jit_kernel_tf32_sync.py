@@ -125,6 +125,8 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
     M_TILES: int,
     num_stages: int,
     padded_d: bool,
+    *,
+    device: int,
 ):
     kernel_name = _kernel_name_mma_sync_tf32(D_f)
     pack_kernel_name = _pack_kernel_name_mma_sync_tf32(D_f)
@@ -163,6 +165,7 @@ def get_relu_bat_c_kernel_mma_sync_tf32(
         kernel_source,
         kernel_name=kernel_name,
         header_code=header_code,
+        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options=["-lineinfo"],
     )
@@ -174,6 +177,8 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
     BN: int,
     D_f: int,
     M_TILES: int,
+    *,
+    device: int,
 ):
     kernel_name = _kernel_name_mma_sync_tf32(D_f)
     pack_kernel_name = _pack_kernel_name_mma_sync_tf32(D_f)
@@ -210,6 +215,7 @@ def get_relu_bat_c_pack_kernel_mma_sync_tf32(
         kernel_source,
         kernel_name=pack_kernel_name,
         header_code=header_code,
+        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options=["-lineinfo"],
     )
@@ -265,6 +271,7 @@ def relu_bat_c_tf32_mma_sync_impl(
     packed_shape = (num_tiles, _packed_tile_elems(BN=BN, D=D_f))
     A_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
     C_packed = torch.empty(packed_shape, device=A.device, dtype=torch.int32)
+    device = int(A.device.index)
 
     if num_tiles > 0:
         pack_kernel = get_relu_bat_c_pack_kernel_mma_sync_tf32(
@@ -272,6 +279,7 @@ def relu_bat_c_tf32_mma_sync_impl(
             BN,
             D_f,
             M_TILES,
+            device=device,
         )
         pack_threads = 256
         tile_pairs = _packed_tile_pairs(BN=BN, D=D_f)
@@ -300,6 +308,7 @@ def relu_bat_c_tf32_mma_sync_impl(
         M_TILES,
         num_stages,
         D != D_f,
+        device=device,
     )
     smem_bytes = _dynamic_smem_bytes(
         BM=BM,

@@ -42,7 +42,7 @@ def _split_kernel_file(path: Path) -> tuple[str, str]:
 
 
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_float4(BK, V, MS):
+def get_relu_bat_c_kernel_float4(BK, V, MS, *, device: int):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH)
  
     header_code = (
@@ -60,13 +60,14 @@ def get_relu_bat_c_kernel_float4(BK, V, MS):
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_float4_sync",
         header_code=header_code,
+        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
 
 
 @lru_cache(maxsize=None)
-def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
+def get_relu_bat_c_kernel_mixed(BK, V, R, MS, *, device: int):
     header_code, kernel_source = _split_kernel_file(_KERNEL_PATH_MIXED)
     header_code = (
         f'#line 1 "{_KERNEL_PATH_MIXED}"\n'
@@ -83,6 +84,7 @@ def get_relu_bat_c_kernel_mixed(BK, V, R, MS):
         kernel_source,
         kernel_name="relu_bat_c_fused_kernel_mixed_sync",
         header_code= header_code,
+        device=device,
         cuda_include_dirs=include_paths("cuda"),
         nvcc_options = ["-lineinfo"]
     )
@@ -99,6 +101,8 @@ def relu_bat_c_fused(
     torch.cuda.nvtx.range_push("Prep kernel")
     if not (A.is_cuda and B.is_cuda and C.is_cuda):
         raise ValueError("A, B, and C must be CUDA tensors")
+    if not (A.device == B.device == C.device):
+        raise ValueError("A, B, and C must be on the same CUDA device")
     if not (A.dtype == B.dtype == C.dtype == torch.float32):
         raise ValueError("A, B, and C must be float32")
     if not (A.is_contiguous() and B.is_contiguous() and C.is_contiguous()):
@@ -119,7 +123,12 @@ def relu_bat_c_fused(
 
 
     Y = torch.empty((M, D), device=A.device, dtype=A.dtype)
-    kernel = get_relu_bat_c_kernel_float4(BK, V, MS) if R==0 else get_relu_bat_c_kernel_mixed(BK, V, R, MS)
+    device = int(A.device.index)
+    kernel = (
+        get_relu_bat_c_kernel_float4(BK, V, MS, device=device)
+        if R == 0
+        else get_relu_bat_c_kernel_mixed(BK, V, R, MS, device=device)
+    )
     torch.cuda.nvtx.range_pop()
     
     grid = ((M + BM * MS - 1) // (BM * MS), 1, 1)  

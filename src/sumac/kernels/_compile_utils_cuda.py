@@ -6,7 +6,6 @@ import glob
 import os
 import sys
 import threading
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -94,16 +93,17 @@ def _load_driver() -> ctypes.CDLL:
     ]
     lib.cuFuncSetAttribute.restype = ctypes.c_int
 
-    _check_cuda(lib.cuInit(0))
+    _check_cuda(lib.cuInit(0), lib)
     return lib
 
 
-def _check_cuda(code: int) -> None:
+def _check_cuda(code: int, lib: ctypes.CDLL | None = None) -> None:
     if code == CUDA_SUCCESS:
         return
 
     msg = ctypes.c_char_p()
-    lib = _load_driver()
+    if lib is None:
+        lib = _load_driver()
     if lib.cuGetErrorString(code, ctypes.byref(msg)) == CUDA_SUCCESS:
         raise CudaJitError(f"CUDA driver error {code}: {_decode(msg.value)}")
     raise CudaJitError(f"CUDA driver error {code}")
@@ -209,10 +209,27 @@ def _check_nvrtc(code: int, lib: ctypes.CDLL | None = None) -> None:
     raise CudaJitError(f"NVRTC error {code}: {_decode(lib.nvrtcGetErrorString(code))}")
 
 
-def _normalize_arch(compute_capability: Optional[str]) -> str:
+def _device_index(device: Any | None = None) -> int:
+    if device is None:
+        return int(torch.cuda.current_device())
+    if isinstance(device, int):
+        return int(device)
+
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        raise CudaJitError(f"CUDA kernels require a CUDA device, got {resolved}")
+    if resolved.index is None:
+        return int(torch.cuda.current_device())
+    return int(resolved.index)
+
+
+def _normalize_arch(
+    compute_capability: Optional[str],
+    device: Any | None = None,
+) -> str:
     if compute_capability is None:
         torch.cuda._lazy_init()
-        major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+        major, minor = torch.cuda.get_device_capability(_device_index(device))
         return f"sm_{major}{minor}"
 
     cc = str(compute_capability).strip().lower()
@@ -240,11 +257,14 @@ def _nvrtc_options(
     nvcc_options: Optional[list[str]],
 ) -> list[str]:
     options = list(nvcc_options or [])
+    if _has_arch_option(options):
+        raise ValueError(
+            "Pass the CUDA target through compute_capability, not nvcc_options"
+        )
 
     if not any(opt.startswith("--std=") or opt.startswith("-std=") for opt in options):
         options.append("--std=c++17")
-    if not _has_arch_option(options):
-        options.append(f"--gpu-architecture={arch}")
+    options.append(f"--gpu-architecture={arch}")
 
     for inc in cuda_include_dirs or []:
         options.append(f"-I{inc}")
@@ -305,11 +325,87 @@ def _compile_nvrtc_image(
     )
 
 
-def _kernel_device(args: list[Any]) -> int:
+def _kernel_device(args: list[Any]) -> int | None:
+    device: int | None = None
     for arg in args:
-        if isinstance(arg, torch.Tensor) and arg.is_cuda:
-            return arg.device.index if arg.device.index is not None else torch.cuda.current_device()
-    return torch.cuda.current_device()
+        if not isinstance(arg, torch.Tensor):
+            continue
+        if not arg.is_cuda:
+            raise TypeError("CUDA kernel tensor arguments must reside on a CUDA device")
+        argument_device = (
+            int(arg.device.index)
+            if arg.device.index is not None
+            else int(torch.cuda.current_device())
+        )
+        if device is None:
+            device = argument_device
+        elif argument_device != device:
+            raise ValueError(
+                "CUDA kernel arguments span multiple devices: "
+                f"{sorted((device, argument_device))}"
+            )
+    return device
+
+
+def _stream_device(stream: Any | None) -> int | None:
+    if stream is None or isinstance(stream, int):
+        return None
+    stream_device = getattr(stream, "device", None)
+    if stream_device is None:
+        return None
+    return _device_index(stream_device)
+
+
+def _launch_device(
+    args: list[Any],
+    *,
+    stream: Any | None,
+    requested_device: Any | None,
+    default_device: int | None,
+) -> int:
+    tensor_device = _kernel_device(args)
+    if stream is None and requested_device is None:
+        if (
+            tensor_device is not None
+            and default_device is not None
+            and tensor_device != default_device
+        ):
+            raise ValueError(
+                "CUDA launch tensors must use the device for which the kernel "
+                f"was compiled; got {tensor_device} and {default_device}"
+            )
+        if tensor_device is not None:
+            return tensor_device
+        if default_device is not None:
+            return default_device
+        return int(torch.cuda.current_device())
+
+    stream_device = _stream_device(stream)
+    explicit_device = (
+        _device_index(requested_device) if requested_device is not None else None
+    )
+
+    devices = {
+        device
+        for device in (
+            tensor_device,
+            stream_device,
+            explicit_device,
+            default_device,
+        )
+        if device is not None
+    }
+    if len(devices) > 1:
+        raise ValueError(
+            "CUDA launch tensors, stream, explicit device, and compile device "
+            "must use the same "
+            f"device; got {sorted(devices)}"
+        )
+    if devices:
+        return devices.pop()
+    if default_device is not None:
+        return default_device
+    return int(torch.cuda.current_device())
 
 
 def _kernel_param(arg: Any) -> ctypes._SimpleCData:
@@ -349,7 +445,6 @@ def _stream_ptr(stream: Any | None, device: int) -> int:
 
 
 class _CudaBackend:
-    cleanup_failed_module = False
     keep_image_alive = False
 
     def validate_launch(
@@ -371,12 +466,16 @@ class _CudaBackend:
         requested_device: Any | None,
         default_device: int | None,
     ) -> int:
-        device = _kernel_device(arguments)
         torch.cuda._lazy_init()
-        return device
+        return _launch_device(
+            arguments,
+            stream=stream,
+            requested_device=requested_device,
+            default_device=default_device,
+        )
 
     def device_guard(self, device: int) -> Any:
-        return nullcontext()
+        return torch.cuda.device(device)
 
     def runtime(self) -> ctypes.CDLL:
         return _load_driver()
@@ -429,13 +528,6 @@ class _CudaBackend:
             )
         )
 
-    def unload_module(
-        self,
-        runtime: ctypes.CDLL,
-        module: ctypes.c_void_p,
-    ) -> None:
-        _check_cuda(runtime.cuModuleUnload(module))
-
     def unload_module_unchecked(
         self,
         runtime: ctypes.CDLL,
@@ -470,11 +562,6 @@ class _CudaBackend:
             )
         )
 
-    def make_close_error(self, failures: list[Exception]) -> Exception:
-        return CudaJitError(
-            f"Failed to unload {len(failures)} CUDA module(s): {failures[0]}"
-        )
-
 
 _CUDA_BACKEND = _CudaBackend()
 
@@ -483,6 +570,7 @@ _CUDA_BACKEND = _CudaBackend()
 class CudaKernel(JitKernel):
     image: bytes
     kernel_name: str
+    default_device: int | None = field(default=None, kw_only=True)
     _modules: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _functions: dict[int, ctypes.c_void_p] = field(default_factory=dict)
     _max_dynamic_smem: int = 0
@@ -497,6 +585,7 @@ class CudaKernel(JitKernel):
         args: list[Any] | tuple[Any, ...] | None = None,
         shared_mem: int = 0,
         stream: Any | None = None,
+        device: Any | None = None,
     ) -> None:
         super().__call__(
             *launch_args,
@@ -505,6 +594,7 @@ class CudaKernel(JitKernel):
             args=args,
             shared_mem=shared_mem,
             stream=stream,
+            device=device,
         )
 
 
@@ -514,12 +604,24 @@ def compile_cuda_kernel(
     kernel_name: str,
     header_code: str = "",
     compute_capability: Optional[str] = None,
+    device: Any | None = None,
     cuda_include_dirs: Optional[list[str]] = None,
     nvcc_options: Optional[list[str]] = None,
 ) -> CudaKernel:
+    """Compile a CUDA kernel for an explicit target or device.
+
+    A kernel whose target is inferred from a device, or which is given an
+    explicit ``device``, is bound to that device. An explicit
+    ``compute_capability`` without ``device`` may be loaded on any compatible
+    CUDA device.
+    """
     kernel_source = _prepend_header(kernel_source, header_code)
 
-    arch = _normalize_arch(compute_capability)
+    default_device = None
+    if device is not None or compute_capability is None:
+        default_device = _device_index(device)
+
+    arch = _normalize_arch(compute_capability, default_device)
     options = tuple(
         _nvrtc_options(
             arch=arch,
@@ -533,4 +635,8 @@ def compile_cuda_kernel(
         arch=arch,
         options=options,
     )
-    return CudaKernel(image=image, kernel_name=kernel_name)
+    return CudaKernel(
+        image=image,
+        kernel_name=kernel_name,
+        default_device=default_device,
+    )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager, Protocol, TypeVar
 
@@ -124,6 +123,7 @@ def _run_rtc(
         )
     )
 
+    primary_error: BaseException | None = None
     try:
         if expression_bytes is not None:
             if add_name_expression is None:
@@ -150,8 +150,19 @@ def _run_rtc(
             raise make_compile_error(log)
 
         return extract_result(program, expression_bytes)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        check(destroy_program(ctypes.byref(program)))
+        try:
+            check(destroy_program(ctypes.byref(program)))
+        except Exception as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "RTC program destruction also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
 
 @dataclass(slots=True)
@@ -177,7 +188,6 @@ def _pack_kernel_args(
 
 
 class _JitBackend(Protocol):
-    cleanup_failed_module: bool
     keep_image_alive: bool
 
     def validate_launch(
@@ -231,8 +241,6 @@ class _JitBackend(Protocol):
         size: int,
     ) -> None: ...
 
-    def unload_module(self, runtime: Any, module: ctypes.c_void_p) -> None: ...
-
     def unload_module_unchecked(
         self,
         runtime: Any,
@@ -251,31 +259,18 @@ class _JitBackend(Protocol):
         parameter_ptrs: Any,
     ) -> None: ...
 
-    def make_close_error(self, failures: list[Exception]) -> Exception: ...
-
 
 class JitKernel:
     """Backend-neutral state and orchestration for a runtime-compiled kernel."""
 
-    def __init__(
-        self,
-        image: bytes,
-        kernel_name: str,
-        *,
-        backend: _JitBackend,
-        default_device: int | None = None,
-        symbol_name: str | None = None,
-    ) -> None:
-        self.image = image
-        self.kernel_name = kernel_name
-        self.default_device = default_device
-        self.symbol_name = symbol_name
-        self._backend = backend
-        self._modules: dict[int, ctypes.c_void_p] = {}
-        self._functions: dict[int, ctypes.c_void_p] = {}
-        self._image_buffers: dict[int, Any] = {}
-        self._max_dynamic_smem = 0
-        self._lock = threading.Lock()
+    image: bytes
+    kernel_name: str
+    _backend: _JitBackend
+    _modules: dict[int, ctypes.c_void_p]
+    _functions: dict[int, ctypes.c_void_p]
+    _image_buffers: dict[int, Any]
+    _max_dynamic_smem: int
+    _lock: Any
 
     def _function_for_device(self, device: int) -> ctypes.c_void_p:
         with self._lock:
@@ -307,9 +302,14 @@ class JitKernel:
                             function,
                             int(self._max_dynamic_smem),
                         )
-                except Exception:
-                    if self._backend.cleanup_failed_module:
+                except BaseException as primary_error:
+                    try:
                         self._backend.unload_module_unchecked(runtime, module)
+                    except Exception as cleanup_error:
+                        primary_error.add_note(
+                            "JIT module cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
                     raise
 
             if self._backend.keep_image_alive:
@@ -317,31 +317,6 @@ class JitKernel:
             self._modules[device] = module
             self._functions[device] = function
             return function
-
-    def close(self) -> None:
-        """Unload owned modules after callers have finished all kernel work.
-
-        The caller must ensure this does not race another launch and that any
-        outstanding work using these modules is safe to unload.
-        """
-        with self._lock:
-            runtime = self._backend.runtime()
-            failures: list[Exception] = []
-            for device, module in list(self._modules.items()):
-                try:
-                    with self._backend.device_guard(device):
-                        self._backend.unload_module(runtime, module)
-                except Exception as exc:
-                    failures.append(exc)
-                    continue
-
-                self._modules.pop(device, None)
-                self._functions.pop(device, None)
-                if self._backend.keep_image_alive:
-                    self._image_buffers.pop(device, None)
-
-            if failures:
-                raise self._backend.make_close_error(failures) from failures[0]
 
     def set_shared_memory_config(self, shared_mem: int) -> None:
         self._backend.validate_dynamic_smem(shared_mem)

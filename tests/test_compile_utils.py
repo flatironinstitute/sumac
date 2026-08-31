@@ -52,10 +52,19 @@ extern "C" __global__ void sumac_test_compile_error(float* out) {
 
 def test_vector_add_and_compile_caches():
     kernel_name = "sumac_test_vector_add"
+    device = torch.cuda.current_device()
 
-    kernel = compile_kernel(VECTOR_ADD_SOURCE, kernel_name=kernel_name)
+    kernel = compile_kernel(
+        VECTOR_ADD_SOURCE,
+        kernel_name=kernel_name,
+        device=device,
+    )
     cache_after_first_compile = compile_image_cache.cache_info()
-    cached_kernel = compile_kernel(VECTOR_ADD_SOURCE, kernel_name=kernel_name)
+    cached_kernel = compile_kernel(
+        VECTOR_ADD_SOURCE,
+        kernel_name=kernel_name,
+        device=device,
+    )
     cache_after_second_compile = compile_image_cache.cache_info()
 
     assert cache_after_second_compile.misses == cache_after_first_compile.misses
@@ -63,7 +72,6 @@ def test_vector_add_and_compile_caches():
     assert kernel is not cached_kernel
     assert kernel.image == cached_kernel.image
 
-    device = torch.cuda.current_device()
     n = 257
     block_size = 128
     grid_size = (n + block_size - 1) // block_size
@@ -101,17 +109,18 @@ def test_vector_add_and_compile_caches():
         assert len(kernel._functions) == 1
         torch.testing.assert_close(out, a + b, rtol=0.0, atol=0.0)
     finally:
-        try:
-            torch.cuda.synchronize()
-        finally:
-            kernel.close()
+        torch.cuda.synchronize()
 
 
 def test_syntax_error_includes_rtc_log():
     kernel_name = "sumac_test_compile_error"
 
     with pytest.raises(JitError) as exc_info:
-        compile_kernel(INVALID_SOURCE, kernel_name=kernel_name)
+        compile_kernel(
+            INVALID_SOURCE,
+            kernel_name=kernel_name,
+            device=torch.cuda.current_device(),
+        )
 
     message = str(exc_info.value)
     assert f"{RTC_NAME} failed compiling {kernel_name} for " in message
