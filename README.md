@@ -33,7 +33,7 @@ For a ROCm install, first install a ROCm build of PyTorch together with the
 matching Triton package supplied by that PyTorch distribution. Then install SUMAC with the ROCm extra.
 
 ```bash
-export ROCM_HOME=/path/to/rocm
+python -m pip install "torch==2.13.0+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2
 python -m pip install -e ".[rocm]"
 ```
 
