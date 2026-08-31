@@ -30,7 +30,7 @@ python -m pip install -e ".[cuda]"
 ```
 
 For a ROCm install, first install a ROCm build of PyTorch together with the
-matching Triton package supplied by that PyTorch distribution. Then install SUMAC with the ROCm extra.
+matching Triton package supplied by that PyTorch distribution, then install SUMAC with the ROCm extra. For example, for ROCm 7.2:
 
 ```bash
 python -m pip install "torch==2.13.0+rocm7.2" --index-url https://download.pytorch.org/whl/rocm7.2
